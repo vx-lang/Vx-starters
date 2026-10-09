@@ -20,8 +20,9 @@ Format: the project, the toolchain version, what happened, and what we did inste
 
 - **wordcount, v0.0.3: `run-jit` and a built binary see different arguments.** Under `run-jit`
   the program's first argument is the `.vx` source path, then the user's arguments; a built
-  binary sees only the user's. wordcount takes its file from the last argument to work both ways,
-  and under `run-jit` with no file it counts its own source instead of printing its usage line.
+  binary sees only the user's ([vx-lang/Vx#1454](https://github.com/vx-lang/Vx/issues/1454)).
+  wordcount takes its file from the last argument to work both ways, and under `run-jit` with
+  no file it counts its own source instead of printing its usage line.
 
 ## Tools
 
