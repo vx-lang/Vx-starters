@@ -70,13 +70,16 @@ Format: the project, the toolchain version, what happened, and what we did inste
 ## Language
 
 - **textkit, v0.0.3: `unsafe { .. } as T` does not parse.** `let n = unsafe { f() } as i64;` is
-  a parse error (`Unexpected token As`); the cast goes inside: `unsafe { f() as i64 }`.
+  a parse error (`Unexpected token As`); the cast goes inside: `unsafe { f() as i64 }`
+  ([vx-lang/Vx#1462](https://github.com/vx-lang/Vx/issues/1462)).
 - **textkit, v0.0.3: no pointer arithmetic, and the error has no location.** `p + 2` on a
-  `*mut u8` is `Error[E3004] at 0:0: Type mismatch in binary operation`. `Runs::feed` takes a
+  `*mut u8` is `Error[E3004] at 0:0: Type mismatch in binary operation`, and `core::ptr` has no
+  `add` ([vx-lang/Vx#1463](https://github.com/vx-lang/Vx/issues/1463)). `Runs::feed` takes a
   start and an end index instead.
 - **textkit, v0.0.3: generic calls do not convert arguments.** Calling a generic function with
   a `*mut u8` where it takes `*const u8`, or the literal `7` where it takes `i64`, fails with
-  `Failed to deduce types for generic function`. The same calls to a non-generic function work.
+  `Failed to deduce types for generic function`. The same calls to a non-generic function work
+  ([vx-lang/Vx#1464](https://github.com/vx-lang/Vx/issues/1464)).
 
 ## Standard library
 
