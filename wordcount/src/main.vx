@@ -1,0 +1,70 @@
+// wordcount: count the lines, words and bytes in a file, like `wc`.
+//
+//   vxc -a run-jit src/main.vx -- <file>
+
+import std::fs;
+
+extern {
+  fn vx_env_args_count() -> i32;
+  fn vx_env_arg(idx : i32) -> *mut i8;
+}
+
+struct Counts {
+  lines : i64,
+  words : i64,
+  bytes : i64,
+}
+
+fn is_space(b : u8) -> bool {
+  return b == 32 || b == 9 || b == 10 || b == 13;
+}
+
+fn count_file(path : *const i8) -> Counts {
+  let mut file = unsafe { File::open(path, OpenMode::Read) };
+  let buf : Tensor<u8, [4096]> = Tensor<u8, [4096]>::new();
+  let p = buf.as_mut_ptr();
+  let mut lines : i64 = 0;
+  let mut words : i64 = 0;
+  let mut bytes : i64 = 0;
+  let mut in_word = false;
+  loop {
+    let n = unsafe { file.read(p, 4096) };
+    if n == 0 {
+      break;
+    }
+    bytes += n as i64;
+    for i in 0..(n as i64) {
+      let b = unsafe { p[i] };
+      if b == 10 {
+        lines += 1;
+      }
+      if is_space(b) {
+        in_word = false;
+      } else {
+        if !in_word {
+          words += 1;
+        }
+        in_word = true;
+      }
+    }
+  }
+  return Counts { lines: lines, words: words, bytes: bytes };
+}
+
+fn main() -> i32 {
+  // The file is the last argument: `vxc -a run-jit` passes the source path first.
+  let argc = unsafe { vx_env_args_count() };
+  if argc < 2 {
+    print!("usage: wordcount <file>\n");
+    return 1;
+  }
+  let path = unsafe { vx_env_arg(argc - 1) };
+  let c = count_file(path);
+  print!(c.lines);
+  print!(" ");
+  print!(c.words);
+  print!(" ");
+  print!(c.bytes);
+  print!("\n");
+  return 0;
+}
