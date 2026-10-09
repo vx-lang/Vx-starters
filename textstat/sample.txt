@@ -1,0 +1,3 @@
+In 1969, NASA sent Apollo 11 to the Moon.
+The crew came home after 8 days.
+CPU, GPU and NPU are three kinds of chip.

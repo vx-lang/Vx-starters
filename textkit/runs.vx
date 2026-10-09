@@ -1,0 +1,42 @@
+// textkit::runs: count the runs of bytes in a class, such as words or numbers.
+//
+// A run is one or more bytes in the class, with no byte outside it in between. Text can be fed
+// in pieces: a run that crosses the end of one piece and the start of the next counts once.
+
+import textkit::classes;
+
+struct Runs<C> {
+  class : C,
+  inside : bool,
+  count : i64,
+}
+
+impl<C : ByteClass> Runs<C> {
+  fn new(class : C) -> Runs<C> {
+    return Runs<C> { class: class, inside: false, count: 0 };
+  }
+
+  // Feed the bytes `p[start]` to `p[end - 1]`.
+  fn feed(self : &mut Runs<C>, p : *mut u8, start : i64, end : i64) -> void {
+    for i in start..end {
+      let b = unsafe { p[i] };
+      if self.class.has(b) {
+        if !self.inside {
+          self.count = self.count + 1;
+        }
+        self.inside = true;
+      } else {
+        self.inside = false;
+      }
+    }
+  }
+}
+
+// Words are runs of bytes that are not space.
+fn words() -> Runs<Not<Space>> {
+  return Runs<Not<Space>>::new(Not<Space> { inner: Space {} });
+}
+
+fn numbers() -> Runs<Digit> {
+  return Runs<Digit>::new(Digit {});
+}
