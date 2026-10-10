@@ -1,0 +1,264 @@
+// rational::rat: exact fractions of integers of any size.
+//
+// A `Rational` is always in lowest terms with a positive denominator, so two equal fractions
+// have the same numerator and denominator. Zero is 0/1.
+//
+// As with `BigInt`, the operators `+ - * /` use up their operands, and the methods `plus`,
+// `minus`, `times` and `over` take references.
+
+import core::cmp;
+import core::ops;
+import core::option;
+import bigint::int;
+
+struct Rational {
+  num : BigInt,
+  den : BigInt,
+}
+
+impl Rational {
+  // n / d in lowest terms. d must not be zero.
+  fn new(n : BigInt, d : BigInt) -> Rational {
+    if d.is_zero() {
+      panic("rational: zero denominator");
+    }
+    let g = n.gcd(&d);
+    let mut num = n.div(&g);
+    let mut den = d.div(&g);
+    if den.is_neg() {
+      num = num.negated();
+      den = den.negated();
+    }
+    return Rational { num: num, den: den };
+  }
+
+  fn from_int(n : BigInt) -> Rational {
+    return Rational { num: n, den: BigInt::from_i64(1) };
+  }
+
+  fn from_i64(n : i64) -> Rational {
+    return Rational::from_int(BigInt::from_i64(n));
+  }
+
+  // n / d for small n and d.
+  fn frac(n : i64, d : i64) -> Rational {
+    return Rational::new(BigInt::from_i64(n), BigInt::from_i64(d));
+  }
+
+  fn zero() -> Rational {
+    return Rational::from_i64(0);
+  }
+
+  // `n` or `n/d` in decimal, as in the C string `s`. None if it is not one.
+  fn parse(s : *const i8) -> Option<Rational> {
+    let mut slash : i64 = -1;
+    let mut n : i64 = 0;
+    while unsafe { s[n] as i32 } != 0 {
+      if unsafe { s[n] as i32 } == 47 {
+        slash = n;
+      }
+      n = n + 1;
+    }
+    if slash < 0 {
+      let whole = BigInt::parse_range(s, 0, n);
+      if whole.is_none() {
+        return Option<Rational>::None();
+      }
+      return Option<Rational>::Some(Rational::from_int(whole.unwrap()));
+    }
+    let a = BigInt::parse_range(s, 0, slash);
+    let b = BigInt::parse_range(s, slash + 1, n);
+    if a.is_none() || b.is_none() {
+      return Option<Rational>::None();
+    }
+    let d = b.unwrap();
+    if d.is_zero() {
+      return Option<Rational>::None();
+    }
+    return Option<Rational>::Some(Rational::new(a.unwrap(), d));
+  }
+
+  fn is_zero(self : &Rational) -> bool {
+    return self.num.is_zero();
+  }
+
+  // -1, 0 or 1.
+  fn sign(self : &Rational) -> i32 {
+    return self.num.sign();
+  }
+
+  fn is_int(self : &Rational) -> bool {
+    return self.den.compare(&BigInt::from_i64(1)) == 0;
+  }
+
+  fn negated(self : &Rational) -> Rational {
+    return Rational { num: self.num.negated(), den: self.den.clone() };
+  }
+
+  fn abs(self : &Rational) -> Rational {
+    return Rational { num: self.num.abs(), den: self.den.clone() };
+  }
+
+  // 1 / self. self must not be zero.
+  fn recip(self : &Rational) -> Rational {
+    return Rational::new(self.den.clone(), self.num.clone());
+  }
+
+  // -1, 0 or 1 as self is less than, equal to or greater than other.
+  fn compare(self : &Rational, other : &Rational) -> i32 {
+    // Denominators are positive, so cross-multiplying keeps the order.
+    return self.num.times(&other.den).compare(&other.num.times(&self.den));
+  }
+
+  fn plus(self : &Rational, other : &Rational) -> Rational {
+    let n = self.num.times(&other.den).plus(&other.num.times(&self.den));
+    return Rational::new(n, self.den.times(&other.den));
+  }
+
+  fn minus(self : &Rational, other : &Rational) -> Rational {
+    return self.plus(&other.negated());
+  }
+
+  fn times(self : &Rational, other : &Rational) -> Rational {
+    return Rational::new(self.num.times(&other.num), self.den.times(&other.den));
+  }
+
+  // self / other. other must not be zero.
+  fn over(self : &Rational, other : &Rational) -> Rational {
+    if other.is_zero() {
+      panic("rational: division by zero");
+    }
+    return Rational::new(self.num.times(&other.den), self.den.times(&other.num));
+  }
+
+  // self^e, for any e; e < 0 needs self != 0.
+  fn pow(self : &Rational, e : i32) -> Rational {
+    // Lowest terms stay lowest terms, so no gcd is needed. Not written as
+    // `self.recip().pow(-e)`: v0.0.3 overflows its stack compiling a method that calls itself.
+    if e < 0 {
+      let r = self.recip();
+      return Rational { num: r.num.pow((0 - e) as u32), den: r.den.pow((0 - e) as u32) };
+    }
+    return Rational { num: self.num.pow(e as u32), den: self.den.pow(e as u32) };
+  }
+
+  // The largest integer at most self.
+  fn floor(self : &Rational) -> BigInt {
+    return self.num.div_floor(&self.den);
+  }
+
+  // The smallest integer at least self.
+  fn ceil(self : &Rational) -> BigInt {
+    return self.num.div_ceil(&self.den);
+  }
+
+  // The largest multiple of 2^-k at most self, for k >= 0.
+  fn floor_bits(self : &Rational, k : i64) -> Rational {
+    let n = self.num.shl(k).div_floor(&self.den);
+    return Rational::new(n, BigInt::from_i64(1).shl(k));
+  }
+
+  // The smallest multiple of 2^-k at least self, for k >= 0.
+  fn ceil_bits(self : &Rational, k : i64) -> Rational {
+    let n = self.num.shl(k).div_ceil(&self.den);
+    return Rational::new(n, BigInt::from_i64(1).shl(k));
+  }
+
+  fn min(self : &Rational, other : &Rational) -> Rational {
+    if self.compare(other) <= 0 {
+      return self.clone();
+    }
+    return other.clone();
+  }
+
+  fn max(self : &Rational, other : &Rational) -> Rational {
+    if self.compare(other) >= 0 {
+      return self.clone();
+    }
+    return other.clone();
+  }
+
+  // Close to self, for printing and plotting. Not for proofs.
+  fn to_f64(self : &Rational) -> f64 {
+    // Scale so the quotient has about 64 bits, then divide.
+    let shift = self.den.bits() - self.num.bits() + 64;
+    if shift <= 0 {
+      return self.num.to_f64() / self.den.to_f64();
+    }
+    let q = self.num.shl(shift).div(&self.den);
+    let mut x = q.to_f64();
+    for i in 0..shift {
+      x = x / 2.0;
+    }
+    return x;
+  }
+
+  // Print as `n` or `n/d`.
+  fn print(self : &Rational) -> void {
+    self.num.print();
+    if !self.is_int() {
+      print!("/");
+      self.den.print();
+    }
+  }
+}
+
+impl Clone for Rational {
+  fn clone(self : &Rational) -> Rational {
+    return Rational { num: self.num.clone(), den: self.den.clone() };
+  }
+}
+
+impl PartialEq for Rational {
+  fn eq(self : &Rational, other : &Rational) -> bool {
+    return self.compare(other) == 0;
+  }
+}
+
+impl Ord for Rational {
+  fn cmp(self : &Rational, other : &Rational) -> Ordering {
+    let c = self.compare(other);
+    if c < 0 {
+      return Ordering::Less;
+    }
+    if c > 0 {
+      return Ordering::Greater;
+    }
+    return Ordering::Equal;
+  }
+}
+
+impl Add for Rational {
+  type Output = Rational;
+  fn add(self : Rational, rhs : Rational) -> Rational {
+    return self.plus(&rhs);
+  }
+}
+
+impl Sub for Rational {
+  type Output = Rational;
+  fn sub(self : Rational, rhs : Rational) -> Rational {
+    return self.minus(&rhs);
+  }
+}
+
+impl Mul for Rational {
+  type Output = Rational;
+  fn mul(self : Rational, rhs : Rational) -> Rational {
+    return self.times(&rhs);
+  }
+}
+
+impl Div for Rational {
+  type Output = Rational;
+  fn div(self : Rational, rhs : Rational) -> Rational {
+    return self.over(&rhs);
+  }
+}
+
+impl Neg for Rational {
+  type Output = Rational;
+  fn neg(self : Rational) -> Rational {
+    return self.negated();
+  }
+}
