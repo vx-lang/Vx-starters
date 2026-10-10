@@ -1,0 +1,191 @@
+// Tests for bigint. Prints some numbers for build.sh to compare, then "ok", and returns the
+// number of failed checks.
+//
+//   ./build.sh
+
+import bigint::int;
+
+fn big(s : *const i8) -> BigInt {
+  return BigInt::parse(s).unwrap();
+}
+
+fn check(name : *const i8, ok : bool) -> i32 {
+  if ok {
+    return 0;
+  }
+  print!("FAIL: ");
+  print!(name);
+  print!("\n");
+  return 1;
+}
+
+fn check_eq(name : *const i8, got : &BigInt, want : &BigInt) -> i32 {
+  if got.compare(want) == 0 {
+    return 0;
+  }
+  print!("FAIL: ");
+  print!(name);
+  print!(": got ");
+  got.print();
+  print!(", want ");
+  want.print();
+  print!("\n");
+  return 1;
+}
+
+// xorshift64: a small deterministic generator, so a failure can be run again.
+struct Rng {
+  s : u64,
+}
+
+impl Rng {
+  fn next(self : &mut Rng) -> u64 {
+    let mut x = self.s;
+    x = x ^ (x << 13);
+    x = x ^ (x >> 7);
+    x = x ^ (x << 17);
+    self.s = x;
+    return x;
+  }
+
+  fn below(self : &mut Rng, n : u64) -> u64 {
+    return self.next() % n;
+  }
+
+  // A number of up to `max_limbs` limbs, often made of 0, 2^31 and 2^32 - 1, which are the
+  // limbs that make long division correct its estimate.
+  fn big(self : &mut Rng, max_limbs : u64) -> BigInt {
+    let n = self.below(max_limbs + 1);
+    let mut s = BigInt::zero();
+    for i in 0..n {
+      let kind = self.below(4);
+      let mut limb : u64 = self.next() & 4294967295;
+      if kind == 0 {
+        limb = 0;
+      }
+      if kind == 1 {
+        limb = 4294967295;
+      }
+      if kind == 2 {
+        limb = 2147483648;
+      }
+      s = s.shl(32).plus(&BigInt::from_u64(limb));
+    }
+    if self.below(2) == 0 {
+      return s.negated();
+    }
+    return s;
+  }
+}
+
+// The identities that should hold for any a and b.
+fn check_pair(a : &BigInt, b : &BigInt) -> i32 {
+  let mut failed = 0;
+  let one = BigInt::from_i64(1);
+  failed += check_eq("a + b - b", &a.plus(b).minus(b), a);
+  failed += check_eq("a * b = b * a", &a.times(b), &b.times(a));
+  failed += check_eq("a * (b + 1)", &a.times(&b.plus(&one)), &a.times(b).plus(a));
+  if !b.is_zero() {
+    let mut q = BigInt::zero();
+    let mut r = BigInt::zero();
+    a.div_rem(b, &mut q, &mut r);
+    failed += check_eq("q * b + r", &q.times(b).plus(&r), a);
+    failed += check("|r| < |b|", r.abs().compare(&b.abs()) < 0);
+    failed += check("r has the sign of a", r.is_zero() || r.sign() == a.sign());
+    failed += check_eq("a * b / b", &a.times(b).div(b), a);
+
+    let mut fq = BigInt::zero();
+    let mut fr = BigInt::zero();
+    a.div_mod_floor(b, &mut fq, &mut fr);
+    failed += check_eq("floor: q * b + r", &fq.times(b).plus(&fr), a);
+    failed += check("floor: r has the sign of b", fr.is_zero() || fr.sign() == b.sign());
+    failed += check("floor: |r| < |b|", fr.abs().compare(&b.abs()) < 0);
+
+    let c = a.div_ceil(b);
+    failed += check("ceil: c * b >= a over b > 0", b.sign() < 0 || c.times(b).compare(a) >= 0);
+    failed += check("ceil is floor or floor + 1",
+                    c.minus(&fq).compare(&BigInt::zero()) >= 0 && c.minus(&fq).compare(&one) <= 0);
+  }
+  let g = a.gcd(b);
+  if !g.is_zero() {
+    failed += check("gcd divides a", a.rem(&g).is_zero());
+    failed += check("gcd divides b", b.rem(&g).is_zero());
+    failed += check_eq("gcd(a/g, b/g) = 1", &a.div(&g).gcd(&b.div(&g)), &one);
+  }
+  return failed;
+}
+
+fn check_one(a : &BigInt, k : i64) -> i32 {
+  let mut failed = 0;
+  let p = BigInt::from_i64(2).pow(k as u32);
+  failed += check_eq("a << k >> k", &a.shl(k).shr_floor(k), a);
+  failed += check_eq("a << k = a * 2^k", &a.shl(k), &a.times(&p));
+  failed += check_eq("a >> k = floor(a / 2^k)", &a.shr_floor(k), &a.div_floor(&p));
+  let m = a.abs();
+  let s = m.isqrt();
+  let s1 = s.plus(&BigInt::from_i64(1));
+  failed += check("isqrt^2 <= a", s.times(&s).compare(&m) <= 0);
+  failed += check("(isqrt + 1)^2 > a", s1.times(&s1).compare(&m) > 0);
+  return failed;
+}
+
+fn main() -> i32 {
+  let mut failed = 0;
+
+  // Fixed values, from Python.
+  let mut f = BigInt::from_i64(1);
+  for i in 1..31 {
+    f = f.times(&BigInt::from_i64(i as i64));
+  }
+  failed += check_eq("30!", &f, &big("265252859812191058636308480000000"));
+  failed += check_eq("2^100", &BigInt::from_i64(2).pow(100), &big("1267650600228229401496703205376"));
+  failed += check_eq("(-3)^41", &BigInt::from_i64(-3).pow(41), &big("-36472996377170786403"));
+  let a = big("-123456789012345678901234567890");
+  let b = big("987654321");
+  failed += check_eq("a / b", &a.div(&b), &big("-124999998873437499901"));
+  failed += check_eq("a % b", &a.rem(&b), &big("-574845669"));
+  failed += check_eq("a div_floor b", &a.div_floor(&b), &big("-124999998873437499902"));
+  failed += check_eq("a mod_floor b", &a.mod_floor(&b), &big("412808652"));
+  failed += check_eq("isqrt(2^201)", &BigInt::from_i64(2).pow(201).isqrt(),
+                     &big("1792728671193156477399422023278"));
+  failed += check_eq("gcd", &big("-1071").gcd(&big("462")), &big("21"));
+  failed += check_eq("-1 >> 5", &BigInt::from_i64(-1).shr_floor(5), &BigInt::from_i64(-1));
+  failed += check("parse rejects 12a", BigInt::parse("12a").is_none());
+  failed += check("parse rejects -", BigInt::parse("-").is_none());
+  failed += check("parse -0 is zero", big("-0").sign() == 0);
+  failed += check("i64 max round trip",
+                  big("9223372036854775807").to_i64().unwrap() == 9223372036854775807);
+  failed += check("i64 min round trip",
+                  big("-9223372036854775808").to_i64().unwrap() == -9223372036854775807i64 - 1i64);
+  failed += check("2^63 is not an i64", big("9223372036854775808").to_i64().is_none());
+  failed += check("to_f64 of a top-bit limb", BigInt::from_u64(3000000000u64).to_f64() == 3000000000.0);
+  failed += check("to_f64(-2^64)", big("-18446744073709551616").to_f64() == -18446744073709551616.0);
+
+  // Long division that has to add back once: the first estimate of a quotient digit is one
+  // too large (Hacker's Delight, divmnu, with 32-bit digits).
+  let u = BigInt::from_i64(2147483647).shl(96).plus(&BigInt::from_u64(2147483648u64).shl(64));
+  let v = BigInt::from_u64(2147483648u64).shl(64).plus(&BigInt::from_i64(1));
+  failed += check_pair(&u, &v);
+
+  // Random pairs, and random sizes.
+  let mut rng = Rng { s: 88172645463325252u64 };
+  for i in 0..3000 {
+    let x = rng.big(6);
+    let y = rng.big(4);
+    failed += check_pair(&x, &y);
+    failed += check_one(&x, rng.below(100) as i64);
+  }
+
+  // build.sh compares these with Python.
+  f.print();
+  print!("\n");
+  BigInt::from_i64(-7).pow(77).print();
+  print!("\n");
+  BigInt::from_i64(10).pow(45).plus(&BigInt::from_i64(7)).print();
+  print!("\n");
+
+  if failed == 0 {
+    print!("ok\n");
+  }
+  return failed;
+}

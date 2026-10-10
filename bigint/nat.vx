@@ -1,0 +1,335 @@
+// bigint::nat: whole numbers of any size, as vectors of base-2^32 digits.
+//
+// A number is a `Vec<u32>` of limbs, least significant first, with no zero limb at the top.
+// Zero has no limbs. Every function here takes and returns numbers in that form.
+//
+// Products of two limbs are done in u64: (2^32 - 1)^2 plus two more limbs still fits.
+// Literals are written in decimal, since Vx has no hex literals yet.
+
+import std::vec;
+
+// 2^32 - 1 and 2^32.
+fn nat_mask() -> u64 {
+  return 4294967295;
+}
+
+fn nat_base() -> u64 {
+  return 4294967296;
+}
+
+fn nat_from_u64(v : u64) -> Vec<u32> {
+  let mut out = Vec<u32>::new();
+  let mut x = v;
+  while x > 0 {
+    out.push((x & nat_mask()) as u32);
+    x = x >> 32;
+  }
+  return out;
+}
+
+fn nat_copy(a : &Vec<u32>) -> Vec<u32> {
+  let mut out = Vec<u32>::with_capacity(a.len() + 1);
+  for i in 0..a.len() {
+    out.push(a.get(i));
+  }
+  return out;
+}
+
+// `n` zero limbs. Not a normal number until trimmed.
+fn nat_zeros(n : i32) -> Vec<u32> {
+  let mut out = Vec<u32>::with_capacity(n + 1);
+  for i in 0..n {
+    out.push(0);
+  }
+  return out;
+}
+
+// Drop zero limbs from the top.
+//
+// The length test and the read are separate: in v0.0.3, `&&` and `||` evaluate both sides
+// when the program is compiled on the AST path, so `a.len() > 0 && a.get(..)` can read
+// index -1. Nothing in this library guards an index with `&&` or `||`.
+fn nat_trim(a : &mut Vec<u32>) -> void {
+  while a.len() > 0 {
+    if a.get(a.len() - 1) != 0 {
+      return;
+    }
+    a.pop();
+  }
+}
+
+// -1, 0 or 1 as a is less than, equal to or greater than b.
+fn nat_cmp(a : &Vec<u32>, b : &Vec<u32>) -> i32 {
+  if a.len() != b.len() {
+    if a.len() < b.len() {
+      return -1;
+    }
+    return 1;
+  }
+  let mut i = a.len() - 1;
+  while i >= 0 {
+    let x = a.get(i);
+    let y = b.get(i);
+    if x != y {
+      if x < y {
+        return -1;
+      }
+      return 1;
+    }
+    i = i - 1;
+  }
+  return 0;
+}
+
+fn nat_add(a : &Vec<u32>, b : &Vec<u32>) -> Vec<u32> {
+  let mut n = a.len();
+  if b.len() > n {
+    n = b.len();
+  }
+  let mut out = Vec<u32>::with_capacity(n + 1);
+  let mut carry : u64 = 0;
+  for i in 0..n {
+    let mut s = carry;
+    if i < a.len() {
+      s = s + (a.get(i) as u64);
+    }
+    if i < b.len() {
+      s = s + (b.get(i) as u64);
+    }
+    out.push((s & nat_mask()) as u32);
+    carry = s >> 32;
+  }
+  if carry > 0 {
+    out.push(carry as u32);
+  }
+  return out;
+}
+
+// a - b. a must be at least b.
+fn nat_sub(a : &Vec<u32>, b : &Vec<u32>) -> Vec<u32> {
+  let mut out = Vec<u32>::with_capacity(a.len());
+  let mut borrow : u64 = 0;
+  for i in 0..a.len() {
+    let x = a.get(i) as u64;
+    let mut y = borrow;
+    if i < b.len() {
+      y = y + (b.get(i) as u64);
+    }
+    if x >= y {
+      out.push((x - y) as u32);
+      borrow = 0;
+    } else {
+      out.push((x + nat_base() - y) as u32);
+      borrow = 1;
+    }
+  }
+  nat_trim(&mut out);
+  return out;
+}
+
+fn nat_mul(a : &Vec<u32>, b : &Vec<u32>) -> Vec<u32> {
+  if a.len() == 0 || b.len() == 0 {
+    return Vec<u32>::new();
+  }
+  let mut out = nat_zeros(a.len() + b.len());
+  for i in 0..a.len() {
+    let x = a.get(i) as u64;
+    let mut carry : u64 = 0;
+    for j in 0..b.len() {
+      let t = (out.get(i + j) as u64) + x * (b.get(j) as u64) + carry;
+      out.set(i + j, (t & nat_mask()) as u32);
+      carry = t >> 32;
+    }
+    out.set(i + b.len(), carry as u32);
+  }
+  nat_trim(&mut out);
+  return out;
+}
+
+// a * m + c, for one-limb m and c.
+fn nat_mul_add_small(a : &Vec<u32>, m : u32, c : u32) -> Vec<u32> {
+  let mut out = Vec<u32>::with_capacity(a.len() + 1);
+  let mut carry = c as u64;
+  for i in 0..a.len() {
+    let t = (a.get(i) as u64) * (m as u64) + carry;
+    out.push((t & nat_mask()) as u32);
+    carry = t >> 32;
+  }
+  if carry > 0 {
+    out.push(carry as u32);
+  }
+  nat_trim(&mut out);
+  return out;
+}
+
+// a / d, rounded down, for a one-limb d > 0. The remainder goes in `rem`.
+fn nat_div_small(a : &Vec<u32>, d : u32, rem : &mut u32) -> Vec<u32> {
+  let mut out = nat_zeros(a.len());
+  let mut r : u64 = 0;
+  let mut i = a.len() - 1;
+  while i >= 0 {
+    let t = (r << 32) | (a.get(i) as u64);
+    out.set(i, (t / (d as u64)) as u32);
+    r = t % (d as u64);
+    i = i - 1;
+  }
+  nat_trim(&mut out);
+  *rem = r as u32;
+  return out;
+}
+
+// How many bits a has: 0 for zero, 1 for one.
+fn nat_bits(a : &Vec<u32>) -> i64 {
+  if a.len() == 0 {
+    return 0;
+  }
+  let mut top = a.get(a.len() - 1);
+  let mut n : i64 = 0;
+  while top > 0 {
+    top = top >> 1;
+    n = n + 1;
+  }
+  return ((a.len() - 1) as i64) * 32 + n;
+}
+
+// a * 2^k, for k >= 0.
+fn nat_shl(a : &Vec<u32>, k : i64) -> Vec<u32> {
+  if a.len() == 0 {
+    return Vec<u32>::new();
+  }
+  let limbs = (k / 32) as i32;
+  let bits = (k % 32) as u64;
+  let mut out = nat_zeros(limbs);
+  let mut carry : u64 = 0;
+  for i in 0..a.len() {
+    let t = ((a.get(i) as u64) << bits) | carry;
+    out.push((t & nat_mask()) as u32);
+    carry = t >> 32;
+  }
+  if carry > 0 {
+    out.push(carry as u32);
+  }
+  return out;
+}
+
+// a / 2^k, rounded down, for k >= 0.
+fn nat_shr(a : &Vec<u32>, k : i64) -> Vec<u32> {
+  let limbs = (k / 32) as i32;
+  let bits = (k % 32) as u64;
+  if limbs >= a.len() {
+    return Vec<u32>::new();
+  }
+  let mut out = Vec<u32>::with_capacity(a.len() - limbs);
+  for i in limbs..a.len() {
+    let mut t = (a.get(i) as u64) >> bits;
+    if bits > 0 && i + 1 < a.len() {
+      t = t | (((a.get(i + 1) as u64) << (32 - bits)) & nat_mask());
+    }
+    out.push(t as u32);
+  }
+  nat_trim(&mut out);
+  return out;
+}
+
+// Whether the low k bits of a are all zero.
+fn nat_low_bits_zero(a : &Vec<u32>, k : i64) -> bool {
+  let limbs = (k / 32) as i32;
+  let bits = (k % 32) as u64;
+  for i in 0..limbs {
+    if i < a.len() {
+      if a.get(i) != 0 {
+        return false;
+      }
+    }
+  }
+  if bits > 0 && limbs < a.len() {
+    let low = (a.get(limbs) as u64) & ((1 << bits) - 1);
+    if low != 0 {
+      return false;
+    }
+  }
+  return true;
+}
+
+// a / b and a % b, both rounded down, for b > 0. The quotient goes in `q` and the remainder
+// in `r`. This is Knuth's algorithm D (The Art of Computer Programming, vol. 2, 4.3.1), in the
+// form Hacker's Delight gives it (divmnu).
+fn nat_divmod(a : &Vec<u32>, b : &Vec<u32>, q : &mut Vec<u32>, r : &mut Vec<u32>) -> void {
+  if nat_cmp(a, b) < 0 {
+    *q = Vec<u32>::new();
+    *r = nat_copy(a);
+    return;
+  }
+  let n = b.len();
+  if n == 1 {
+    let mut rem : u32 = 0;
+    *q = nat_div_small(a, b.get(0), &mut rem);
+    *r = nat_from_u64(rem as u64);
+    return;
+  }
+  let m = a.len() - n;
+
+  // Shift both so that the top limb of b has its top bit set.
+  let mut s : i64 = 0;
+  let mut top = b.get(n - 1);
+  while top < 2147483648 {
+    top = top << 1;
+    s = s + 1;
+  }
+  let bn = nat_shl(b, s);
+  let mut an = nat_shl(a, s);
+  while an.len() < a.len() + 1 {
+    an.push(0);
+  }
+
+  let base = nat_base();
+  let mask = nat_mask();
+  let b1 = bn.get(n - 1) as u64;
+  let b2 = bn.get(n - 2) as u64;
+  let mut out = nat_zeros(m + 1);
+  let mut j = m;
+  while j >= 0 {
+    // Estimate the quotient digit from the top two limbs, then correct it at most twice.
+    let num = ((an.get(j + n) as u64) << 32) | (an.get(j + n - 1) as u64);
+    let mut qhat = num / b1;
+    let mut rhat = num % b1;
+    while rhat < base && (qhat >= base || qhat * b2 > ((rhat << 32) | (an.get(j + n - 2) as u64))) {
+      qhat = qhat - 1;
+      rhat = rhat + b1;
+    }
+
+    // Subtract qhat * bn from the window of an.
+    let mut borrow : i64 = 0;
+    for i in 0..n {
+      let p = qhat * (bn.get(i) as u64);
+      let t = (an.get(i + j) as i64) - borrow - ((p & mask) as i64);
+      an.set(i + j, ((t as u64) & mask) as u32);
+      borrow = ((p >> 32) as i64) - (t >> 32);
+    }
+    let t = (an.get(j + n) as i64) - borrow;
+    an.set(j + n, ((t as u64) & mask) as u32);
+
+    // qhat was one too big: add bn back.
+    if t < 0 {
+      qhat = qhat - 1;
+      let mut carry : u64 = 0;
+      for i in 0..n {
+        let u = (an.get(i + j) as u64) + (bn.get(i) as u64) + carry;
+        an.set(i + j, (u & mask) as u32);
+        carry = u >> 32;
+      }
+      an.set(j + n, (((an.get(j + n) as u64) + carry) & mask) as u32);
+    }
+    out.set(j, qhat as u32);
+    j = j - 1;
+  }
+  nat_trim(&mut out);
+  *q = out;
+
+  let mut rem = Vec<u32>::with_capacity(n);
+  for i in 0..n {
+    rem.push(an.get(i));
+  }
+  nat_trim(&mut rem);
+  *r = nat_shr(&rem, s);
+}
