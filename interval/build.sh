@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Run interval's tests.
+#
+#   ./build.sh                 run the tests
+#   VX_HOME=<dir> ./build.sh   use a toolchain other than ~/.vx/current
+#
+# interval imports rational, which imports bigint; all three are found from the repository root, as in
+# ../textkit/build.sh. The tests print two intervals; the values below are from Python's
+# fractions.Fraction.
+
+set -euo pipefail
+
+cd "$(dirname "$0")"
+VX_HOME="${VX_HOME:-$HOME/.vx/current}"
+export VX_STD_PATH="$VX_HOME/stdlib/std:$VX_HOME/stdlib:.."
+
+want="[741455/524288, 1482911/1048576]
+[-1/6, 7/12]
+ok"
+# A failed check makes the program, and so the pipeline, exit non-zero; keep going so the
+# output is shown.
+got="$("$VX_HOME/bin/vxc" -a run-jit test.vx | grep -v '^\[JIT\]' || true)"
+if [ "$got" != "$want" ]; then
+  echo "$got" >&2
+  echo "FAIL: want" >&2
+  echo "$want" >&2
+  exit 1
+fi
+echo ok

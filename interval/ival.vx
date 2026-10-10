@@ -1,0 +1,203 @@
+// interval::ival: closed intervals [lo, hi] with exact rational ends.
+//
+// Every operation returns an interval that holds every result of the operation on points of
+// its operands: if x is in X and y is in Y, then x + y is in X.plus(&Y), and so on. That is
+// what lets a finite computation prove an inequality for a whole range of inputs. If
+// `X.is_pos()`, then every x in X is positive.
+//
+// The ends are exact fractions, so nothing is rounded and no rounding mode is needed. The
+// price is that the ends grow; `round_out(k)` widens an interval to ends that are multiples
+// of 2^-k, which keeps them small. `sqrt` rounds outward the same way.
+
+import core::option;
+import bigint::int;
+import rational::rat;
+
+struct Interval {
+  lo : Rational,
+  hi : Rational,
+}
+
+impl Interval {
+  // [lo, hi]. lo must be at most hi.
+  fn new(lo : Rational, hi : Rational) -> Interval {
+    if lo.compare(&hi) > 0 {
+      panic("interval: lo > hi");
+    }
+    return Interval { lo: lo, hi: hi };
+  }
+
+  // [x, x].
+  fn point(x : Rational) -> Interval {
+    return Interval { lo: x.clone(), hi: x };
+  }
+
+  fn from_i64(n : i64) -> Interval {
+    return Interval::point(Rational::from_i64(n));
+  }
+
+  // [a/b, c/d] for small integers.
+  fn fracs(a : i64, b : i64, c : i64, d : i64) -> Interval {
+    return Interval::new(Rational::frac(a, b), Rational::frac(c, d));
+  }
+
+  fn contains(self : &Interval, x : &Rational) -> bool {
+    return self.lo.compare(x) <= 0 && x.compare(&self.hi) <= 0;
+  }
+
+  // Whether every point of other is in self.
+  fn contains_interval(self : &Interval, other : &Interval) -> bool {
+    return self.lo.compare(&other.lo) <= 0 && other.hi.compare(&self.hi) <= 0;
+  }
+
+  fn contains_zero(self : &Interval) -> bool {
+    return self.lo.sign() <= 0 && self.hi.sign() >= 0;
+  }
+
+  // Every point is > 0, >= 0, < 0 or <= 0.
+  fn is_pos(self : &Interval) -> bool {
+    return self.lo.sign() > 0;
+  }
+
+  fn is_nonneg(self : &Interval) -> bool {
+    return self.lo.sign() >= 0;
+  }
+
+  fn is_neg(self : &Interval) -> bool {
+    return self.hi.sign() < 0;
+  }
+
+  fn is_nonpos(self : &Interval) -> bool {
+    return self.hi.sign() <= 0;
+  }
+
+  // Whether every point of self is less than every point of other.
+  fn below(self : &Interval, other : &Interval) -> bool {
+    return self.hi.compare(&other.lo) < 0;
+  }
+
+  fn width(self : &Interval) -> Rational {
+    return self.hi.minus(&self.lo);
+  }
+
+  fn mid(self : &Interval) -> Rational {
+    return self.lo.plus(&self.hi).times(&Rational::frac(1, 2));
+  }
+
+  fn negated(self : &Interval) -> Interval {
+    return Interval { lo: self.hi.negated(), hi: self.lo.negated() };
+  }
+
+  fn plus(self : &Interval, other : &Interval) -> Interval {
+    return Interval { lo: self.lo.plus(&other.lo), hi: self.hi.plus(&other.hi) };
+  }
+
+  fn minus(self : &Interval, other : &Interval) -> Interval {
+    return Interval { lo: self.lo.minus(&other.hi), hi: self.hi.minus(&other.lo) };
+  }
+
+  fn times(self : &Interval, other : &Interval) -> Interval {
+    // The ends of a product of intervals are products of ends.
+    let a = self.lo.times(&other.lo);
+    let b = self.lo.times(&other.hi);
+    let c = self.hi.times(&other.lo);
+    let d = self.hi.times(&other.hi);
+    return Interval { lo: a.min(&b).min(&c.min(&d)), hi: a.max(&b).max(&c.max(&d)) };
+  }
+
+  // self / other. other must not contain zero.
+  fn over(self : &Interval, other : &Interval) -> Interval {
+    if other.contains_zero() {
+      panic("interval: division by an interval that contains zero");
+    }
+    let r = Interval { lo: other.hi.recip(), hi: other.lo.recip() };
+    return self.times(&r);
+  }
+
+  // { |x| : x in self }.
+  fn abs(self : &Interval) -> Interval {
+    if self.lo.sign() >= 0 {
+      return self.clone();
+    }
+    if self.hi.sign() <= 0 {
+      return self.negated();
+    }
+    return Interval { lo: Rational::zero(), hi: self.lo.negated().max(&self.hi) };
+  }
+
+  // { x^n : x in self }. Tighter than multiplying self by itself: [-1, 2]^2 is [0, 4], while
+  // [-1, 2] times [-1, 2] is [-2, 4].
+  fn pow(self : &Interval, n : u32) -> Interval {
+    if n == 0 {
+      return Interval::from_i64(1);
+    }
+    if (n & 1) == 1 {
+      // Odd powers are increasing.
+      return Interval { lo: self.lo.pow(n as i32), hi: self.hi.pow(n as i32) };
+    }
+    let a = self.abs();
+    return Interval { lo: a.lo.pow(n as i32), hi: a.hi.pow(n as i32) };
+  }
+
+  // An interval holding { sqrt(x) : x in self }, with ends that are multiples of 2^-k.
+  // self must be >= 0.
+  fn sqrt(self : &Interval, k : i64) -> Interval {
+    if self.lo.sign() < 0 {
+      panic("interval: sqrt of an interval with negative points");
+    }
+    return Interval { lo: sqrt_floor_bits(&self.lo, k), hi: sqrt_ceil_bits(&self.hi, k) };
+  }
+
+  // The smallest interval with ends that are multiples of 2^-k and that holds self.
+  fn round_out(self : &Interval, k : i64) -> Interval {
+    return Interval { lo: self.lo.floor_bits(k), hi: self.hi.ceil_bits(k) };
+  }
+
+  // The smallest interval holding both.
+  fn hull(self : &Interval, other : &Interval) -> Interval {
+    return Interval { lo: self.lo.min(&other.lo), hi: self.hi.max(&other.hi) };
+  }
+
+  // The points in both, or None if there are none.
+  fn intersect(self : &Interval, other : &Interval) -> Option<Interval> {
+    let lo = self.lo.max(&other.lo);
+    let hi = self.hi.min(&other.hi);
+    if lo.compare(&hi) > 0 {
+      return Option<Interval>::None();
+    }
+    return Option<Interval>::Some(Interval { lo: lo, hi: hi });
+  }
+
+  // Print as `[lo, hi]`.
+  fn print(self : &Interval) -> void {
+    print!("[");
+    self.lo.print();
+    print!(", ");
+    self.hi.print();
+    print!("]");
+  }
+}
+
+impl Clone for Interval {
+  fn clone(self : &Interval) -> Interval {
+    return Interval { lo: self.lo.clone(), hi: self.hi.clone() };
+  }
+}
+
+// The largest multiple of 2^-k whose square is at most x, for x >= 0.
+fn sqrt_floor_bits(x : &Rational, k : i64) -> Rational {
+  // m / 2^k <= sqrt(x) exactly when m^2 <= x * 4^k, and m^2 is a whole number, so the best m
+  // is isqrt(floor(x * 4^k)).
+  let y = x.num.shl(2 * k).div_floor(&x.den);
+  return Rational::new(y.isqrt(), BigInt::from_i64(1).shl(k));
+}
+
+// The smallest multiple of 2^-k whose square is at least x, for x >= 0.
+fn sqrt_ceil_bits(x : &Rational, k : i64) -> Rational {
+  let y = x.num.shl(2 * k).div_ceil(&x.den);
+  let mut m = y.isqrt();
+  if m.times(&m).compare(&y) < 0 {
+    m = m.plus(&BigInt::from_i64(1));
+  }
+  return Rational::new(m, BigInt::from_i64(1).shl(k));
+}
