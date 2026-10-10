@@ -44,8 +44,36 @@ Format: the project, the toolchain version, what happened, and what we did inste
   ([vx-lang/Vx#1455](https://github.com/vx-lang/Vx/issues/1455)). Calling a `.vxlib` function
   that takes a `u8` with the literal `32` fails in codegen with `'i8' vs 'i32'`
   ([vx-lang/Vx#1456](https://github.com/vx-lang/Vx/issues/1456)). textkit is used from source.
+- **bigint, v0.0.3: nothing records that one library needs another.** `interval` imports
+  `rational`, which imports `bigint`. It works because all three sit under the repository root,
+  which `VX_STD_PATH` names; a program that copies `interval` alone gets an import error, and
+  nothing says which versions go together.
 - **textkit, v0.0.3: no test runner.** `textkit/test.vx` is a program that returns the number of
   failed checks; `run-jit` exits non-zero when it does, and `build.sh` runs it.
+
+## Wrong results and crashes
+
+Found while writing `bigint`, `rational` and `interval`. A whole program is compiled by one of
+two code generators. It uses the newer "flat" one unless any function in it is outside what that
+one handles; then the whole program goes through the older "AST" one, and the compiler prints
+`program outside the flat subset; using the AST path`. A program that uses `Option<BigInt>` is
+on the AST path, so these libraries are, and the same function can work in one program and
+fail in another.
+
+- **bigint, v0.0.3: `&&` and `||` evaluate both sides on the AST path.** In
+  `while a.len() > 0 && a.get(a.len() - 1) == 0`, the read runs when the vector is empty and
+  aborts with `index -1 out of bounds`. On the flat path it is fine. The libraries never guard
+  an index with `&&` or `||`.
+- **bigint, v0.0.3: `u32` and `u64` convert to `f64` as if they were signed, on the AST path.**
+  `3000000000u32 as f64` is `-1294967296`. `to_f64` converts through `i64`, and a test checks it.
+- **bigint, v0.0.3: a literal above `i64::MAX` in `u128` arithmetic is sign-extended.** With
+  `two : u128 = 2`, `two * 18446744073709551615` has high word 2^64 - 1, not 1. Written as
+  `let m : u128 = 18446744073709551615` first, it is right. The libraries use `u32` digits and
+  `u64` products, and no `u128`.
+- **rational, v0.0.3: a method that calls itself overflows the compiler's stack.** Even
+  `return self.down(n - 1) + 1;` kills `vxc` with `thread 'main' has overflowed its stack`, at
+  any action that compiles. A free function that calls itself works. `Rational::pow` uses no
+  recursion.
 
 ## Running
 
@@ -81,6 +109,22 @@ Format: the project, the toolchain version, what happened, and what we did inste
   `Failed to deduce types for generic function`. The same calls to a non-generic function work
   ([vx-lang/Vx#1464](https://github.com/vx-lang/Vx/issues/1464)).
 
+- **bigint, v0.0.3: no hex literals.** Masks such as 2^32 - 1 are written `4294967295`
+  ([vx-lang/Vx#783](https://github.com/vx-lang/Vx/issues/783)).
+- **bigint, v0.0.3: `print!` of a `u128` does not compile** (`unsupported print arg type i128`,
+  then `MLIR verification failed`). Cast to `u64` first.
+- **bigint, v0.0.3: the borrow checker treats a method's result as a borrow of its receiver.**
+  After `let y = x.plus(&d);`, the assignment `x = y;` is `E4007: x is moved while it is
+  borrowed`, though `y` is a new value. Using `&mut r` again after a call such as `r.abs()` in
+  the same function is `E4003`. `isqrt` loops on a flag, and the tests use fresh variables.
+- **bigint, v0.0.3: `loop { .. return x; .. }` counts as falling off the end**
+  (`E3028: body can finish without returning a value`), though the loop has no `break`.
+- **bigint, v0.0.3: a range's variable is `i32`, and is not converted to `i64`.** After
+  `for i in 1..31`, `BigInt::from_i64(i)` is `E3003`; it takes `i as i64`. Likewise
+  `-9223372036854775807 - 1` where an `i64` is expected is `E3004: i64 vs i32`, at `0:0`.
+- **bigint, v0.0.3: `panic!` does not exist.** It is the function `panic("..")`; `panic!(..)` is
+  `Macro panic not found`.
+
 ## Standard library
 
 - **wordcount, v0.0.3: no command-line arguments in `std`.** The runtime has `vx_env_args_count`
@@ -89,3 +133,7 @@ Format: the project, the toolchain version, what happened, and what we did inste
   failed open, so `wordcount nosuchfile` prints `0 0 0`.
 - **wordcount, v0.0.3: no string splitting and no map with string keys.** The first plan was "the
   ten most common words"; it became a `wc` clone. `HashMap` takes only `i32` keys.
+- **bigint, v0.0.3: no big integers, fractions, intervals or complex numbers, and no control of
+  the floating-point rounding mode.** Checkers for computer-assisted proofs need all of these;
+  `bigint`, `rational` and `interval` supply the first three. Exact fraction ends take the place
+  of outward rounding.
