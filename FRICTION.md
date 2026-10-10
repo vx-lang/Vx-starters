@@ -62,18 +62,22 @@ fail in another.
 
 - **bigint, v0.0.3: `&&` and `||` evaluate both sides on the AST path.** In
   `while a.len() > 0 && a.get(a.len() - 1) == 0`, the read runs when the vector is empty and
-  aborts with `index -1 out of bounds`. On the flat path it is fine. The libraries never guard
-  an index with `&&` or `||`.
+  aborts with `index -1 out of bounds`. On the flat path it is fine
+  ([vx-lang/Vx#1485](https://github.com/vx-lang/Vx/issues/1485)). The libraries never guard an
+  index with `&&` or `||`.
 - **bigint, v0.0.3: `u32` and `u64` convert to `f64` as if they were signed, on the AST path.**
-  `3000000000u32 as f64` is `-1294967296`. `to_f64` converts through `i64`, and a test checks it.
-- **bigint, v0.0.3: a literal above `i64::MAX` in `u128` arithmetic is sign-extended.** With
-  `two : u128 = 2`, `two * 18446744073709551615` has high word 2^64 - 1, not 1. Written as
-  `let m : u128 = 18446744073709551615` first, it is right. The libraries use `u32` digits and
-  `u64` products, and no `u128`.
+  `3000000000u32 as f64` is `-1294967296`
+  ([vx-lang/Vx#1486](https://github.com/vx-lang/Vx/issues/1486)). `to_f64` converts through
+  `i64`, and a test checks it.
+- **bigint, v0.0.3: a `u128` literal from 2^63 to 2^64 - 1 is sign-extended.**
+  `let m : u128 = 18446744073709551615;` gives `m >> 64` equal to 2^64 - 1, not 0. The same
+  value through a `u64` variable and `as u128` is right
+  ([vx-lang/Vx#1487](https://github.com/vx-lang/Vx/issues/1487)). The libraries use `u32` digits
+  and `u64` products, and no `u128`.
 - **rational, v0.0.3: a method that calls itself overflows the compiler's stack.** Even
   `return self.down(n - 1) + 1;` kills `vxc` with `thread 'main' has overflowed its stack`, at
-  any action that compiles. A free function that calls itself works. `Rational::pow` uses no
-  recursion.
+  any action that compiles ([vx-lang/Vx#1488](https://github.com/vx-lang/Vx/issues/1488)). A
+  free function that calls itself works. `Rational::pow` uses no recursion.
 
 ## Running
 
