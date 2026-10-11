@@ -1,0 +1,262 @@
+// gradcheck: check the certificate's derivative bounds against Vx's `grad`.
+//
+// The certificate proves a box from the value at its center and bounds on the derivatives over
+// the box, which it computes with jets (`J` in `hellinger::cert`). If those derivatives were
+// wrong, a proof could be wrong while the search still printed "pass".
+//
+// This runs the same expressions in f64, through a third implementation of the trait `Ar`, and
+// differentiates them with `grad` (Enzyme). For random boxes in every group and mode, and
+// random points in each box, it checks that each partial derivative, times the box's
+// half-width in that direction, lies in the jet's interval for it; and that the f64 value lies
+// in the jet's interval for the value. The f64 numbers are not proofs; a mismatch beyond
+// rounding means the jets and the expressions disagree.
+//
+//   ./build.sh   (runs this after the search)
+
+import core::libm;
+import core::num;
+import hellinger::cert;
+
+// An interval's midpoint, in real terms (the ends are multiples of 10^-12). The constants this
+// is used on are points.
+fn real(x : I) -> f64 {
+  let s : f64 = 1000000000000.0;
+  let two : f64 = 2.0;
+  return ((x.a as f64) / s + (x.b as f64) / s) / two;
+}
+
+impl Ar for f64 {
+  fn of(self : f64, c : I) -> f64 {
+    return real(c);
+  }
+  fn of_int(self : f64, k : i64) -> f64 {
+    return k as f64;
+  }
+  fn plus(self : f64, o : f64) -> f64 {
+    return self + o;
+  }
+  fn minus(self : f64, o : f64) -> f64 {
+    return self - o;
+  }
+  fn times(self : f64, o : f64) -> f64 {
+    return self * o;
+  }
+  fn over(self : f64, o : f64) -> f64 {
+    return self / o;
+  }
+  fn negated(self : f64) -> f64 {
+    let zero : f64 = 0.0;
+    return zero - self;
+  }
+  fn recip(self : f64) -> f64 {
+    let one : f64 = 1.0;
+    return one / self;
+  }
+  fn sqrt(self : f64) -> f64 {
+    return libm_sqrt_f64(self);
+  }
+  fn nsqrt(self : f64) -> f64 {
+    let zero : f64 = 0.0;
+    if self < zero {
+      return zero;
+    }
+    return libm_sqrt_f64(self);
+  }
+  // a * a / (a + b): the function whose enclosure the intervals' E clips to [0, a / 2], and
+  // whose derivatives the jets' E uses.
+  fn ee(self : f64, b : f64) -> f64 {
+    return self * self / (self + b);
+  }
+}
+
+// One output of the certificate's expression for mode p.mode (k picks which of expr3's three).
+fn value(u : f64, v : f64, j : f64, p : Params, k : i32) -> f64 {
+  if p.mode != 3 {
+    return expr(u, v, j, p);
+  }
+  let t = expr3(u, v, j, p);
+  if k == 0 {
+    return t.o0;
+  }
+  if k == 1 {
+    return t.o1;
+  }
+  return t.o2;
+}
+
+// `grad` differentiates with respect to the first parameter, so one function per direction.
+fn along_u(u : f64, v : f64, j : f64, p : Params, k : i32) -> f64 {
+  return value(u, v, j, p, k);
+}
+
+fn along_v(v : f64, u : f64, j : f64, p : Params, k : i32) -> f64 {
+  return value(u, v, j, p, k);
+}
+
+fn along_j(j : f64, u : f64, v : f64, p : Params, k : i32) -> f64 {
+  return value(u, v, j, p, k);
+}
+
+// Whether x lies in the interval c (in units of 10^-12), allowing for f64 rounding.
+fn inside(x : f64, c : I) -> bool {
+  let s : f64 = 1000000000000.0;
+  let lo = (c.a as f64) / s;
+  let hi = (c.b as f64) / s;
+  let mut big : f64 = 1.0;
+  if lo.abs() > big {
+    big = lo.abs();
+  }
+  if hi.abs() > big {
+    big = hi.abs();
+  }
+  let rel : f64 = 0.000000001;
+  let tol = rel * big;
+  return x >= lo - tol && x <= hi + tol;
+}
+
+// The jet for output k of the expression on the box.
+fn jet(u : Side, v : Side, j : Side, p : Params, k : i32) -> J {
+  if p.mode != 3 {
+    return expr(u.jet, v.jet, j.jet, p);
+  }
+  let t = expr3(u.jet, v.jet, j.jet, p);
+  if k == 0 {
+    return t.o0;
+  }
+  if k == 1 {
+    return t.o1;
+  }
+  return t.o2;
+}
+
+// A point of the interval x at fraction t (0 to 1), in real terms.
+fn at(x : I, t : f64) -> f64 {
+  let s : f64 = 1000000000000.0;
+  let lo = (x.a as f64) / s;
+  let hi = (x.b as f64) / s;
+  return lo + t * (hi - lo);
+}
+
+struct Rng {
+  s : u64,
+}
+
+impl Rng {
+  fn next(self : &mut Rng) -> u64 {
+    let mut x = self.s;
+    x = x ^ (x << 13);
+    x = x ^ (x >> 7);
+    x = x ^ (x << 17);
+    self.s = x;
+    return x;
+  }
+
+  fn below(self : &mut Rng, n : i64) -> i64 {
+    return (self.next() % (n as u64)) as i64;
+  }
+
+  fn unit(self : &mut Rng) -> f64 {
+    let scale : f64 = 1000000.0;
+    return ((self.next() % 1000001u64) as f64) / scale;
+  }
+}
+
+fn report(what : *const i8, g : i64, mode : i32, k : i32, got : f64, c : I) -> void {
+  print!("FAIL: ");
+  print!(what);
+  print!(" group ");
+  print!(g);
+  print!(" mode ");
+  print!(mode);
+  print!(" output ");
+  print!(k);
+  print!(": f64 ");
+  print!(got);
+  print!(", jet [");
+  let s : f64 = 1000000000000.0;
+  print!((c.a as f64) / s);
+  print!(", ");
+  print!((c.b as f64) / s);
+  print!("]\n");
+}
+
+fn main() -> i32 {
+  let mut rng = Rng { s: 2463534242u64 };
+  let mut checked : i64 = 0;
+  let mut failed : i64 = 0;
+  for g in 0..7 {
+    for mode in 1..4 {
+      let p = params(g as i64, mode as i32);
+      let mut outputs = 1;
+      if mode == 3 {
+        outputs = 3;
+      }
+      // Boxes at depths 2 to 7, at random places; the jets are only checked where they are
+      // defined (no value left its range).
+      for n in 0..60 {
+        let d = 2 + rng.below(6);
+        let one : i64 = 1;
+        let h = one << d;
+        let a = rng.below(h);
+        let b = rng.below(h);
+        let c = rng.below(h);
+        let mut uw : i64 = 1000;
+        let mut vw : i64 = 800;
+        let mut jlo : i64 = 0;
+        let mut jw = p.hi;
+        if p.mode == 3 {
+          uw = 600;
+          vw = 600;
+          jlo = p.lo;
+          jw = p.hi - p.lo;
+        }
+        let u = side(0, uw, a, h, 0);
+        let v = side(0, vw, b, h, 1);
+        let j = side(jlo, jw, c, h, 2);
+        // The half-widths that the jets' derivatives are scaled by.
+        let hu = real(u.jet.d0);
+        let hv = real(v.jet.d1);
+        let hj = real(j.jet.d2);
+        for k in 0..outputs {
+          let e = jet(u, v, j, p, k as i32);
+          if jok(e) {
+            for s in 0..3 {
+              let x = at(u.bounds, rng.unit());
+              let y = at(v.bounds, rng.unit());
+              let z = at(j.bounds, rng.unit());
+              let kk = k as i32;
+              let f = value(x, y, z, p, kk);
+              let du = grad(along_u, x, y, z, p, kk) * hu;
+              let dv = grad(along_v, y, x, z, p, kk) * hv;
+              let dj = grad(along_j, z, x, y, p, kk) * hj;
+              checked = checked + 1;
+              if !inside(f, e.x) {
+                report("value", g as i64, mode as i32, kk, f, e.x);
+                failed = failed + 1;
+              }
+              if !inside(du, e.d0) {
+                report("d/du", g as i64, mode as i32, kk, du, e.d0);
+                failed = failed + 1;
+              }
+              if !inside(dv, e.d1) {
+                report("d/dv", g as i64, mode as i32, kk, dv, e.d1);
+                failed = failed + 1;
+              }
+              if !inside(dj, e.d2) {
+                report("d/dj", g as i64, mode as i32, kk, dj, e.d2);
+                failed = failed + 1;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  if failed > 0 {
+    return 1;
+  }
+  print!("ok: ");
+  print!(checked);
+  print!(" points, value and three derivatives each\n");
+  return 0;
+}

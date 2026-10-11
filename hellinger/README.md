@@ -9,19 +9,23 @@ function" bound. The proof is "Hellinger contraction with arbitrary Boolean outp
 ```
 $ ./build.sh
 ok: pass (798493 boxes)
+ok: 6282 points, value and three derivatives each
 ```
 
-`src/main.vx` is a port of the paper's `verification/interval_certificate.cpp` (Apache License
-2.0). For seven groups of constants and three modes, it shows that certain functions of three
-variables are positive on boxes. A box is proved by interval arithmetic, or by the value at its
-center and bounds on the derivatives; otherwise it is split into eight, down to a depth limit.
-Numbers are multiples of 10^-12 held in `i64`, products are taken in `i128`, and every result is
-rounded outward.
+`cert.vx` is a port of the paper's `verification/interval_certificate.cpp` (Apache License
+2.0): the arithmetic, the functions and the boxes. `src/main.vx` runs the search. For seven
+groups of constants and three modes, it shows that certain functions of three variables are
+positive on boxes. A box is proved by interval arithmetic, or by the value at its center and
+bounds on the derivatives; otherwise it is split into eight, down to a depth limit. Numbers are
+multiples of 10^-12 held in `i64`, products are taken in `i128`, and every result is rounded
+outward. `src/gradcheck.vx` checks the derivative bounds with `grad` (below).
 
 The port keeps the C++ step for step:
 
 - The C++ template over intervals and "jets" (a value with three derivatives) is a trait, `Ar`,
-  with two implementations.
+  with two implementations, and a third in `src/gradcheck.vx` for plain `f64`.
+- Products of the constants, which the C++ recomputes in each call, are computed once in
+  `params`, with the same operations and so the same values.
 - The C++ throws when a number leaves [-10^18, 10^18], and the box counts as not proved. Here
   each interval carries an `ok` flag that every operation passes on.
 - Every expression keeps the grouping and order of the C++, since outward rounding makes the
@@ -56,6 +60,34 @@ Two checks guard against a port that only looks right:
   Rounding a bound the wrong way by one unit (10^-12) does not change the box count, so this is
   what catches it: rounding the top of a product down, the bottom of `1 / x` up, or never
   rounding a root up each make the self-test fail.
+
+## Checking the derivatives with `grad`
+
+A box can be proved from its center value and bounds on the derivatives over the box. The jets
+compute those bounds. If a derivative formula were wrong, the search could print "pass" for a
+proof that is not one: with a wrong partial derivative in the `E` step, it prints
+`pass (794885 boxes)`, and only the comparison with the C++ count shows anything is off. A proof
+with no reference program would have nothing to compare with.
+
+`src/gradcheck.vx` checks the jets against Vx's automatic differentiation. It implements `Ar`
+for `f64`, so the same expressions run in floating point, and differentiates them with `grad`
+(Enzyme) in each of the three directions. For 60 random boxes in each group and mode, at
+depths 2 to 7, and 3 random points in each box, it checks that the value and each derivative,
+times the box's half-width, lie in the jet's intervals, allowing 10^-9 relative for floating
+point. That is 6282 points, in about 2 s. Floating point proves nothing here; the point is that
+an independent derivative agrees with the one the proof uses.
+
+It catches each of these, at hundreds of points: the product rule with its factors swapped,
+the derivative of a square root off by a factor, and the wrong partial derivative of `E` above.
+
+Two things were needed to make `grad` work here:
+
+- Enzyme fails ("Cannot deduce type of phi") when the function it differentiates calls the
+  integer interval code, even only to build constants. So the expressions get small integers
+  through the trait (`of_int`), and products of constants come precomputed in `Params`.
+- A program that uses `grad` runs only under `vxc -a run-jit`
+  ([vx-lang/Vx#1594](https://github.com/vx-lang/Vx/issues/1594)), so the cross-check is a second
+  program, not part of the built one.
 
 Not done yet:
 

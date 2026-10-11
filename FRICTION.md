@@ -28,6 +28,11 @@ Format: the project, the toolchain version, what happened, and what we did inste
   gives code within 20% of the C++ original. `-a emit-llvm` writes MLIR's LLVM dialect to
   standard output and ignores `-o`; a build tool has to know that `mlir-translate` comes next.
 
+- **hellinger, v0.0.3: a program that uses `grad` runs only under `run-jit`.** `-a emit-obj`
+  fails with `Symbols not found: [ __enzyme_autodiff_grad_f ]`, and `-a emit-llvm` leaves that
+  call undefined ([vx-lang/Vx#1594](https://github.com/vx-lang/Vx/issues/1594)). The derivative
+  cross-check is a second program that `build.sh` runs with `run-jit`, next to the built search.
+
 ## Libraries
 
 - **textkit, v0.0.3: a library is found only through `VX_STD_PATH`.** `import textkit::runs`
@@ -161,6 +166,13 @@ fail in another.
 - **cycle-clique, v0.0.3: `print!` of a range's variable can fail to compile.** In
   `for k in 5..18 { print!(k); }`, `k` has the internal type `index`: `unsupported print arg type
   index`, then `MLIR verification failed`. `print!(k as i32)` works.
+- **hellinger, v0.0.3: `grad` fails on integer struct code in what it differentiates.** When the
+  function calls code that builds an `i64` interval struct, even only for constants, Enzyme stops
+  with `opt failed`, `Cannot deduce type of phi`, and a page of IR. The constants are made
+  through the number trait (`of_int`) or computed beforehand.
+- **hellinger, v0.0.3: a float literal is `f32`.** `let s = 1000000000000.0;` next to an `f64`
+  is `E3004: f64 vs f32`, at `0:0`. Every literal in `gradcheck.vx` has a typed `let`
+  (the book's autodiff chapter mentions it, vx-lang/Vx#1446).
 - **bigint, v0.0.3: `panic!` does not exist.** It is the function `panic("..")`; `panic!(..)` is
   `Macro panic not found`.
 
