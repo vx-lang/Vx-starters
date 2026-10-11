@@ -16,11 +16,12 @@ toolchain. They have two jobs:
 | [`textkit`](textkit) + [`textstat`](textstat) | Modules, traits, generics | A local library dependency; two packages with the same function name |
 | [`bigint`](bigint), [`rational`](rational), [`interval`](interval) | Operators on user types, `Vec`, exact arithmetic | A chain of libraries: `interval` needs `rational`, which needs `bigint` |
 | [`cycle-clique`](cycle-clique) | A published proof's computer check, ported and run natively | Optimization level as a build setting; expected output that comes from another project |
+| [`hellinger`](hellinger) | Traits over two number types, `i128`, an interval proof by branch and bound | A build that goes through LLVM IR and the bundled `clang`, because `vxc -O1` is too slow |
 
 The three number libraries are for checking the computer-assisted parts of proofs, such as those
 in [openai/math](https://github.com/openai/math), where the checkers need integers of any size,
-exact fractions and interval bounds, and Vx's `std` has none of them. `cycle-clique` is the first
-such check ([vx-lang/Vx#1489](https://github.com/vx-lang/Vx/issues/1489)).
+exact fractions and interval bounds, and Vx's `std` has none of them. `cycle-clique` and `hellinger` are the
+first such checks ([vx-lang/Vx#1489](https://github.com/vx-lang/Vx/issues/1489)).
 
 Planned, each adding one new question:
 

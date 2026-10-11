@@ -1,0 +1,861 @@
+// hellinger: the interval certificate in the proof of the Hellinger contraction conjecture
+// for Boolean functions of any output bias, which implies the Courtade-Kumar bound.
+//
+// A port of `verification/interval_certificate.cpp` from "Hellinger contraction with
+// arbitrary Boolean output bias" (openai/math, preprints/Hellinger-contraction-with-arbitrary-
+// Boolean-output-bias-September-24-2026), Apache License 2.0. It checks that certain functions
+// of three variables are positive on boxes, splitting each box into eight until a check
+// succeeds or a depth limit is hit. It prints "pass" if every box is proved.
+//
+// Changes from the C++, which keep its results:
+// - The interval and jet code, a C++ template, is a trait `Ar` with two implementations.
+// - C++ throws when a number leaves the allowed range, and the box counts as not proved. Here
+//   every value carries `ok`, every operation passes a false `ok` on, and a box whose result
+//   is not `ok` counts as not proved.
+// - Each expression is written with the grouping and order C++ gives it, because rounding an
+//   interval outward makes the result depend on the order of operations.
+//
+//   ./build.sh
+
+import core::marker;
+
+// Numbers are multiples of 10^-12, held as i64; products are taken in i128.
+fn unit() -> i64 {
+  return 1000000000000;
+}
+
+// Ends must stay within [-10^18, 10^18].
+fn limit() -> i64 {
+  return 1000000000000000000;
+}
+
+fn wide(x : i64) -> i128 {
+  return x as i128;
+}
+
+fn min64(a : i64, b : i64) -> i64 {
+  if a < b {
+    return a;
+  }
+  return b;
+}
+
+fn max64(a : i64, b : i64) -> i64 {
+  if a > b {
+    return a;
+  }
+  return b;
+}
+
+fn min128(a : i128, b : i128) -> i128 {
+  if a < b {
+    return a;
+  }
+  return b;
+}
+
+fn max128(a : i128, b : i128) -> i128 {
+  if a > b {
+    return a;
+  }
+  return b;
+}
+
+// a / b rounded down and up, for b > 0.
+fn flo(a : i128, b : i128) -> i128 {
+  let zero : i128 = 0;
+  let one : i128 = 1;
+  if a < zero {
+    return zero - one - ((zero - a - one) / b);
+  }
+  return a / b;
+}
+
+fn cei(a : i128, b : i128) -> i128 {
+  let zero : i128 = 0;
+  return zero - flo(zero - a, b);
+}
+
+// The interval [a, b] (in units of 10^-12), or a failed value when ok is false.
+struct I {
+  a : i64,
+  b : i64,
+  ok : bool,
+}
+
+impl Copy for I {}
+
+fn failed() -> I {
+  return I { a: 0, b: 0, ok: false };
+}
+
+// The C++ `I::bounds`: [a, b] if it is in range and a <= b, else failed.
+fn bounds(a : i128, b : i128) -> I {
+  let lim = wide(limit());
+  let zero : i128 = 0;
+  let in_range = a >= zero - lim && b <= lim && a <= b;
+  if in_range {
+    return I { a: a as i64, b: b as i64, ok: true };
+  }
+  return failed();
+}
+
+// The C++ `I(k)`: the integer k, with no range check.
+fn int(k : i64) -> I {
+  return I { a: unit() * k, b: unit() * k, ok: true };
+}
+
+// k / 1000.
+fn frac(k : i64) -> I {
+  let j = wide((unit() / 1000) * k);
+  return bounds(j, j);
+}
+
+fn add(x : I, y : I) -> I {
+  if !x.ok || !y.ok {
+    return failed();
+  }
+  return bounds(wide(x.a + y.a), wide(x.b + y.b));
+}
+
+fn sub(x : I, y : I) -> I {
+  if !x.ok || !y.ok {
+    return failed();
+  }
+  return bounds(wide(x.a - y.b), wide(x.b - y.a));
+}
+
+fn neg(x : I) -> I {
+  if !x.ok {
+    return failed();
+  }
+  return bounds(wide(0 - x.b), wide(0 - x.a));
+}
+
+fn mul(x : I, y : I) -> I {
+  if !x.ok || !y.ok {
+    return failed();
+  }
+  let p = wide(x.a) * wide(y.a);
+  let q = wide(x.a) * wide(y.b);
+  let r = wide(x.b) * wide(y.a);
+  let h = wide(x.b) * wide(y.b);
+  let lo = min128(min128(p, q), min128(r, h));
+  let hi = max128(max128(p, q), max128(r, h));
+  return bounds(flo(lo, wide(unit())), cei(hi, wide(unit())));
+}
+
+// 1 / x, for x > 0.
+fn inv(x : I) -> I {
+  if !x.ok {
+    return failed();
+  }
+  if x.a <= 0 {
+    return failed();
+  }
+  let s = wide(unit()) * wide(unit());
+  return bounds(flo(s, wide(x.b)), cei(s, wide(x.a)));
+}
+
+fn div(x : I, y : I) -> I {
+  return mul(x, inv(y));
+}
+
+// The largest c with c * c <= n, for 0 <= n <= 10^30.
+fn isqrt(n : i128) -> i64 {
+  let mut a : i64 = 0;
+  let mut b : i64 = 1000 * unit() + 1;
+  while b - a > 1 {
+    let c = (a + b) / 2;
+    if wide(c) * wide(c) <= n {
+      a = c;
+    } else {
+      b = c;
+    }
+  }
+  return a;
+}
+
+// The square root, for x >= 0.
+fn root(x : I) -> I {
+  if !x.ok {
+    return failed();
+  }
+  if x.a < 0 {
+    return failed();
+  }
+  let b = wide(x.b) * wide(unit());
+  let k = isqrt(b);
+  let mut up = wide(k);
+  if wide(k) * wide(k) < b {
+    up = up + wide(1);
+  }
+  return bounds(wide(isqrt(wide(x.a) * wide(unit()))), up);
+}
+
+fn mag(x : I) -> i64 {
+  return max64(0 - x.a, x.b);
+}
+
+fn rat(a : I, b : I) -> I {
+  let z = add(a, b);
+  if !z.ok {
+    return failed();
+  }
+  if z.a <= 0 {
+    return bounds(wide(0), wide(unit() / 2));
+  }
+  let h = div(a, z);
+  if !h.ok {
+    return failed();
+  }
+  return bounds(wide(max64(0, h.a)), wide(min64(unit() / 2, h.b)));
+}
+
+// A value and its derivatives along the three box directions.
+struct J {
+  x : I,
+  d0 : I,
+  d1 : I,
+  d2 : I,
+}
+
+impl Copy for J {}
+
+fn lift(x : I) -> J {
+  return J { x: x, d0: int(0), d1: int(0), d2: int(0) };
+}
+
+fn jadd(a : J, b : J) -> J {
+  return J { x: add(a.x, b.x), d0: add(a.d0, b.d0), d1: add(a.d1, b.d1), d2: add(a.d2, b.d2) };
+}
+
+fn jneg(a : J) -> J {
+  return J { x: neg(a.x), d0: neg(a.d0), d1: neg(a.d1), d2: neg(a.d2) };
+}
+
+fn jsub(a : J, b : J) -> J {
+  return jadd(a, jneg(b));
+}
+
+// The C++ `with(x, a, b, y, z)`: value x, derivatives a' * y + b' * z.
+fn with2(x : I, a : J, b : J, y : I, z : I) -> J {
+  return J {
+    x: x,
+    d0: add(mul(a.d0, y), mul(b.d0, z)),
+    d1: add(mul(a.d1, y), mul(b.d1, z)),
+    d2: add(mul(a.d2, y), mul(b.d2, z)),
+  };
+}
+
+fn with1(x : I, a : J, y : I) -> J {
+  return with2(x, a, lift(int(0)), y, int(0));
+}
+
+fn jmul(a : J, b : J) -> J {
+  return with2(mul(a.x, b.x), a, b, b.x, a.x);
+}
+
+fn jinv(a : J) -> J {
+  let q = inv(a.x);
+  return with1(q, a, neg(mul(q, q)));
+}
+
+fn jdiv(a : J, b : J) -> J {
+  return jmul(a, jinv(b));
+}
+
+fn jroot(a : J) -> J {
+  let q = root(a.x);
+  return with1(q, a, mul(frac(500), inv(q)));
+}
+
+fn jok(a : J) -> bool {
+  return a.x.ok && a.d0.ok && a.d1.ok && a.d2.ok;
+}
+
+// What the C++ template needs from its number type: intervals (I) and jets (J).
+trait Ar {
+  // The constant c as this type. `self` only picks the type.
+  fn of(self : Self, c : I) -> Self;
+  fn plus(self : Self, o : Self) -> Self;
+  fn minus(self : Self, o : Self) -> Self;
+  fn times(self : Self, o : Self) -> Self;
+  fn over(self : Self, o : Self) -> Self;
+  fn negated(self : Self) -> Self;
+  fn recip(self : Self) -> Self;
+  fn sqrt(self : Self) -> Self;
+  // The C++ `nroot`: for intervals, the root of the part >= 0.
+  fn nsqrt(self : Self) -> Self;
+  // The C++ `E(a, b)`.
+  fn ee(self : Self, b : Self) -> Self;
+}
+
+impl Ar for I {
+  fn of(self : I, c : I) -> I {
+    return c;
+  }
+  fn plus(self : I, o : I) -> I {
+    return add(self, o);
+  }
+  fn minus(self : I, o : I) -> I {
+    return sub(self, o);
+  }
+  fn times(self : I, o : I) -> I {
+    return mul(self, o);
+  }
+  fn over(self : I, o : I) -> I {
+    return div(self, o);
+  }
+  fn negated(self : I) -> I {
+    return neg(self);
+  }
+  fn recip(self : I) -> I {
+    return inv(self);
+  }
+  fn sqrt(self : I) -> I {
+    return root(self);
+  }
+  fn nsqrt(self : I) -> I {
+    if !self.ok {
+      return failed();
+    }
+    return root(bounds(wide(max64(self.a, 0)), wide(max64(self.b, 0))));
+  }
+  fn ee(self : I, b : I) -> I {
+    return mul(self, rat(self, b));
+  }
+}
+
+impl Ar for J {
+  fn of(self : J, c : I) -> J {
+    return lift(c);
+  }
+  fn plus(self : J, o : J) -> J {
+    return jadd(self, o);
+  }
+  fn minus(self : J, o : J) -> J {
+    return jsub(self, o);
+  }
+  fn times(self : J, o : J) -> J {
+    return jmul(self, o);
+  }
+  fn over(self : J, o : J) -> J {
+    return jdiv(self, o);
+  }
+  fn negated(self : J) -> J {
+    return jneg(self);
+  }
+  fn recip(self : J) -> J {
+    return jinv(self);
+  }
+  fn sqrt(self : J) -> J {
+    return jroot(self);
+  }
+  fn nsqrt(self : J) -> J {
+    return jroot(self);
+  }
+  fn ee(self : J, b : J) -> J {
+    let h = rat(self.x, b.x);
+    return with2(mul(self.x, h), self, b, mul(h, sub(int(2), h)), neg(mul(h, h)));
+  }
+}
+
+fn sq<T : Ar + Copy>(a : T) -> T {
+  return a.times(a);
+}
+
+// The C++ `A<T>`: a value at three points 0, 1, 2 and divided differences 01, 02, 12, 012.
+struct A<T> {
+  x : T,
+  y : T,
+  z : T,
+  i : T,
+  j : T,
+  k : T,
+  h : T,
+}
+
+impl<T : Copy> Copy for A<T> {}
+
+fn aadd<T : Ar + Copy>(a : A<T>, b : A<T>) -> A<T> {
+  return A<T> {
+    x: a.x.plus(b.x), y: a.y.plus(b.y), z: a.z.plus(b.z),
+    i: a.i.plus(b.i), j: a.j.plus(b.j), k: a.k.plus(b.k), h: a.h.plus(b.h),
+  };
+}
+
+fn amul<T : Ar + Copy>(a : A<T>, b : A<T>) -> A<T> {
+  return A<T> {
+    x: a.x.times(b.x),
+    y: a.y.times(b.y),
+    z: a.z.times(b.z),
+    i: a.x.times(b.i).plus(a.i.times(b.y)),
+    j: a.x.times(b.j).plus(a.j.times(b.z)),
+    k: a.y.times(b.k).plus(a.k.times(b.z)),
+    h: a.x.times(b.h).plus(a.i.times(b.k)).plus(a.h.times(b.z)),
+  };
+}
+
+// c * b and c + b for a constant c.
+fn cmul<T : Ar + Copy>(c : I, b : A<T>) -> A<T> {
+  let v = b.x.of(c);
+  return A<T> {
+    x: v.times(b.x), y: v.times(b.y), z: v.times(b.z),
+    i: v.times(b.i), j: v.times(b.j), k: v.times(b.k), h: v.times(b.h),
+  };
+}
+
+fn cadd<T : Ar + Copy>(c : I, b : A<T>) -> A<T> {
+  let v = b.x.of(c);
+  return A<T> { x: v.plus(b.x), y: v.plus(b.y), z: v.plus(b.z), i: b.i, j: b.j, k: b.k, h: b.h };
+}
+
+// c - b, which C++ computes as c + (-1) * b.
+fn csub<T : Ar + Copy>(c : I, b : A<T>) -> A<T> {
+  return cadd(c, cmul(int(-1), b));
+}
+
+fn ainv<T : Ar + Copy>(a : A<T>) -> A<T> {
+  let x = a.x.recip();
+  let y = a.y.recip();
+  let z = a.z.recip();
+  let i = a.i.negated().times(x).times(y);
+  let j = a.j.negated().times(x).times(z);
+  let k = a.k.negated().times(y).times(z);
+  let h = x.negated().times(a.h.times(z).plus(a.i.times(k)));
+  return A<T> { x: x, y: y, z: z, i: i, j: j, k: k, h: h };
+}
+
+fn aroot<T : Ar + Copy>(a : A<T>) -> A<T> {
+  let x = a.x.sqrt();
+  let y = a.y.sqrt();
+  let z = a.z.sqrt();
+  let i = a.i.over(x.plus(y));
+  let j = a.j.over(x.plus(z));
+  let k = a.k.over(y.plus(z));
+  let h = a.h.minus(i.times(k)).over(x.plus(z));
+  return A<T> { x: x, y: y, z: z, i: i, j: j, k: k, h: h };
+}
+
+// The constants of one group, and the current mode and range (C++ globals).
+struct Params {
+  l : I,
+  u : I,
+  v : I,
+  alpha : I,
+  lambda : I,
+  mu : I,
+  lo : i64,
+  hi : i64,
+  mode : i32,
+  depth : i32,
+}
+
+impl Copy for Params {}
+
+fn table<T : Ar + Copy>(a : T, b : T, c : T, k : T, mode : i32, p : Params) -> A<T> {
+  let x = A<T> { x: a, y: b, z: c, i: k, j: k, k: k, h: a.of(int(0)) };
+  let q2 = csub(int(1), amul(x, x));
+  let q = aroot(q2);
+  let h = cmul(int(2), amul(q, x));
+  // y = L + h * (U + V * h); e = 1 / (1 + h * y).
+  let y = cadd(p.l, amul(h, cadd(p.u, cmul(p.v, h))));
+  let e = ainv(cadd(int(1), amul(h, y)));
+  if mode == 1 {
+    // 4 * (L*x + q*(I(2)*sq(L) - 1 - (2*U)*q2 + h*(2*L*U - (2*V)*q2 + (2*L*V)*h))) * e
+    let c1 = sub(mul(int(2), mul(p.l, p.l)), int(1));
+    let left = csub(c1, cmul(mul(int(2), p.u), q2));
+    let lu = mul(mul(int(2), p.l), p.u);
+    let inner = aadd(csub(lu, cmul(mul(int(2), p.v), q2)), cmul(mul(mul(int(2), p.l), p.v), h));
+    let bracket = aadd(left, amul(h, inner));
+    let sum = aadd(cmul(p.l, x), amul(q, bracket));
+    return amul(cmul(int(4), sum), e);
+  }
+  if mode == 2 {
+    // 4 * (q2 * (q + x*y)) * e
+    return amul(cmul(int(4), amul(q2, aadd(q, amul(x, y)))), e);
+  }
+  // 4 * (q * (x + q*y)) * e
+  return amul(cmul(int(4), amul(q, aadd(x, amul(q, y)))), e);
+}
+
+fn term<T : Ar + Copy>(m : A<T>, u : T, w : T) -> T {
+  let e = u.ee(w);
+  let o = u.of(int(1)).plus(u).recip();
+  // ((1 - o*e)*m.z + (w + e)*m.k + e*u*(m.h - o*m.j)) / (1 + w)
+  let one = u.of(int(1));
+  let s1 = one.minus(o.times(e)).times(m.z);
+  let s2 = w.plus(e).times(m.k);
+  let s3 = e.times(u).times(m.h.minus(o.times(m.j)));
+  return s1.plus(s2).plus(s3).over(one.plus(w));
+}
+
+fn expr<T : Ar + Copy>(u : T, v : T, j : T, p : Params) -> T {
+  let one = u.of(int(1));
+  let two = u.of(int(2));
+  // d = j*(2*u + (1-u)*j); w = u + (1-u)*j; t = root(1 - (1-u)*d)
+  let d = j.times(two.times(u).plus(one.minus(u).times(j)));
+  let w = u.plus(one.minus(u).times(j));
+  let t = one.minus(one.minus(u).times(d)).sqrt();
+  let m = table(v.times(u), v.times(w), v, v, p.mode, p);
+  let n = table(v.times(u), v.times(t), v, v, p.mode, p);
+  let four_l = mul(int(4), p.l);
+  if p.mode == 1 {
+    // F = (1 + u*u/(1+u))*m.z + u*u*u*m.j/(1+u)
+    let f = one.plus(u.times(u).over(one.plus(u))).times(m.z)
+      .plus(u.times(u).times(u).times(m.j).over(one.plus(u)));
+    let z = u.of(frac(125)).times(term(m, u, w).plus(term(n, u, t)));
+    // H0 = alpha*(4*L - v*m.z) + (1-alpha)*u*u*(4*L - v*u*m.x)
+    let h0a = u.of(p.alpha).times(u.of(four_l).minus(v.times(m.z)));
+    let h0b = u.of(sub(int(1), p.alpha)).times(u).times(u)
+      .times(u.of(four_l).minus(v.times(u).times(m.x)));
+    let h0 = h0a.plus(h0b);
+    let di = d.times(one.minus(u));
+    let wi = one.minus(sq(w));
+    // Z*H0 + (4*lambda)*di*wi*v*sq(Z) - mu*v*sq(F)/sq(4*L)
+    let s1 = z.times(h0);
+    let s2 = u.of(mul(int(4), p.lambda)).times(di).times(wi).times(v).times(sq(z));
+    let s3 = u.of(p.mu).times(v).times(sq(f)).over(u.of(mul(four_l, four_l)));
+    return s1.plus(s2).minus(s3);
+  }
+  let half = mul(frac(500), p.lambda);
+  // F = (m.z + u*m.j)/(1+u)
+  let f = m.z.plus(u.times(m.j)).over(one.plus(u));
+  // Z = frac(125)*((F - m.k - u*m.h)/(1+w) + (u+w)/(u+t)*(F - n.k - u*n.h)/(1+t))
+  let za = f.minus(m.k).minus(u.times(m.h)).over(one.plus(w));
+  let zb = u.plus(w).over(u.plus(t)).times(f.minus(n.k).minus(u.times(n.h))).over(one.plus(t));
+  let z = u.of(frac(125)).times(za.plus(zb));
+  // H0 = (alpha-half)*u*m.x + (1-alpha-half)*m.z + half*(w*m.y + t*n.y)
+  let h0 = u.of(sub(p.alpha, half)).times(u).times(m.x)
+    .plus(u.of(sub(sub(int(1), p.alpha), half)).times(m.z))
+    .plus(u.of(half).times(w.times(m.y).plus(t.times(n.y))));
+  // Z*H0 - mu*(u+w)*sq(v + F/(4*L))
+  let last = sq(v.plus(f.over(u.of(four_l))));
+  return z.times(h0).minus(u.of(p.mu).times(u.plus(w)).times(last));
+}
+
+// The three results of the C++ `expr3`.
+struct Three<T> {
+  o0 : T,
+  o1 : T,
+  o2 : T,
+}
+
+impl<T : Copy> Copy for Three<T> {}
+
+fn expr3<T : Ar + Copy>(l : T, u : T, r : T, p : Params) -> Three<T> {
+  let one = u.of(int(1));
+  // z = 1 - sq(l) - sq(u); b = sq(r)*z
+  let z = one.minus(sq(l)).minus(sq(u));
+  let b = sq(r).times(z);
+  let lp = sq(l).plus(b).nsqrt();
+  let up = sq(u).plus(b).nsqrt();
+  let n = table(l, l, lp, one, 3, p);
+  let a = table(u, u, up, one, 2, p);
+  let pp = n.z.plus(l.ee(lp).times(n.j));
+  let qq = a.z.plus(u.times(a.j));
+  // Z = (Q + (u+up)*P)/(8*(1-sq(r))*z)
+  let zz = qq.plus(u.plus(up).times(pp)).over(u.of(int(8)).times(one.minus(sq(r))).times(z));
+  // W2 = sq(1 - (u*a.x - l*l*n.x)/(4*L*z))
+  let four_l = mul(int(4), p.l);
+  let w2 = sq(one.minus(u.times(a.x).minus(l.times(l).times(n.x)).over(u.of(four_l).times(z))));
+  let half = mul(frac(500), p.lambda);
+  // out0 = Z*((alpha-half)*u*a.x + half*up*a.z + (1-alpha)*l*l*n.x + half*b*P) - mu*(u+up)*W2
+  let inner = u.of(sub(p.alpha, half)).times(u).times(a.x)
+    .plus(u.of(half).times(up).times(a.z))
+    .plus(u.of(sub(int(1), p.alpha)).times(l).times(l).times(n.x))
+    .plus(u.of(half).times(b).times(pp));
+  let o0 = zz.times(inner).minus(u.of(p.mu).times(u.plus(up)).times(w2));
+  // rest = half*(up-u)*P
+  let rest = u.of(half).times(up.minus(u)).times(pp);
+  // out1 = Z*((frac(500)*alpha)*a.x + rest) - mu*W2
+  let o1 = zz.times(u.of(mul(frac(500), p.alpha)).times(a.x).plus(rest)).minus(u.of(p.mu).times(w2));
+  // out2 = Z*(half*Q + rest) - mu*W2
+  let o2 = zz.times(u.of(half).times(qq).plus(rest)).minus(u.of(p.mu).times(w2));
+  return Three<T> { o0: o0, o1: o1, o2: o2 };
+}
+
+// One side of a box: [a, a + b] / 1000 split into H pieces, piece i, as bounds, center and a
+// jet whose derivative is along direction k.
+struct Side {
+  bounds : I,
+  center : I,
+  jet : J,
+}
+
+impl Copy for Side {}
+
+fn side(a : i64, b : i64, i : i64, hh : i64, k : i32) -> Side {
+  let scale = wide(unit() / 1000);
+  let n = (wide(a) * wide(hh) + wide(b) * wide(i)) * scale;
+  let v = wide(b) * scale;
+  let h = wide(hh);
+  let two = wide(2);
+  let bnds = bounds(flo(n, h), cei(n + v, h));
+  let center = bounds(flo(two * n + v, two * h), cei(two * n + v, two * h));
+  let dv = bounds(flo(v, two * h), cei(v, two * h));
+  let mut jet = lift(bnds);
+  if k == 0 {
+    jet.d0 = dv;
+  }
+  if k == 1 {
+    jet.d1 = dv;
+  }
+  if k == 2 {
+    jet.d2 = dv;
+  }
+  return Side { bounds: bnds, center: center, jet: jet };
+}
+
+fn delta(a : i64, b : i64) -> I {
+  let u = bounds(wide(a), wide(a));
+  let j = bounds(wide(b), wide(b));
+  return div(mul(j, add(mul(int(2), u), mul(sub(int(1), u), j))), add(int(1), u));
+}
+
+// Positive on the whole box, from the value at the center and bounds on the derivatives.
+fn derivative(c : I, a : J) -> bool {
+  return c.a > mag(a.d0) + mag(a.d1) + mag(a.d2);
+}
+
+// Whether the box is proved. Any failed value means not proved, as when the C++ throws.
+fn good(u : Side, v : Side, j : Side, p : Params) -> bool {
+  if p.mode != 3 {
+    let d1 = delta(u.bounds.a, j.bounds.a);
+    if !d1.ok {
+      return false;
+    }
+    let hi2 = sq(frac(p.hi));
+    if !hi2.ok {
+      return false;
+    }
+    if d1.a > hi2.b {
+      return true;
+    }
+    let d2 = delta(u.bounds.b, j.bounds.b);
+    let lo2 = sq(frac(p.lo));
+    if !d2.ok || !lo2.ok {
+      return false;
+    }
+    if d2.b < lo2.a {
+      return true;
+    }
+    let e = expr(u.bounds, v.bounds, j.bounds, p);
+    if !e.ok {
+      return false;
+    }
+    if e.a > 0 {
+      return true;
+    }
+    let ec = expr(u.center, v.center, j.center, p);
+    let ej = expr(u.jet, v.jet, j.jet, p);
+    if !ec.ok || !jok(ej) {
+      return false;
+    }
+    return derivative(ec, ej);
+  }
+  let a = expr3(u.bounds, v.bounds, j.bounds, p);
+  if !a.o0.ok || !a.o1.ok || !a.o2.ok {
+    return false;
+  }
+  let mut p0 = a.o0.a > 0;
+  let mut p1 = a.o1.a > 0;
+  let mut p2 = a.o2.a > 0;
+  if p0 || (p1 && p2) {
+    return true;
+  }
+  let b = expr3(u.center, v.center, j.center, p);
+  let c = expr3(u.jet, v.jet, j.jet, p);
+  if !b.o0.ok || !b.o1.ok || !b.o2.ok || !jok(c.o0) || !jok(c.o1) || !jok(c.o2) {
+    return false;
+  }
+  if derivative(b.o0, c.o0) {
+    p0 = true;
+  }
+  if derivative(b.o1, c.o1) {
+    p1 = true;
+  }
+  if derivative(b.o2, c.o2) {
+    p2 = true;
+  }
+  return p0 || (p1 && p2);
+}
+
+// The C++ `verify`: prove the box (a, b, c) at depth d, or split it into eight.
+fn verify(d : i32, a : i64, b : i64, c : i64, p : Params, boxes : &mut i64) -> bool {
+  *boxes = *boxes + 1;
+  let one : i64 = 1;
+  let h = one << (d as i64);
+  let mut uw : i64 = 1000;
+  let mut vw : i64 = 800;
+  let mut jlo : i64 = 0;
+  let mut jw = p.hi;
+  if p.mode == 3 {
+    uw = 600;
+    vw = 600;
+    jlo = p.lo;
+    jw = p.hi - p.lo;
+  }
+  let u = side(0, uw, a, h, 0);
+  let v = side(0, vw, b, h, 1);
+  let j = side(jlo, jw, c, h, 2);
+  if good(u, v, j, p) {
+    return true;
+  }
+  if d == p.depth {
+    return false;
+  }
+  for i in 0..8 {
+    let k = i as i64;
+    if !verify(d + 1, 2 * a + k / 4, 2 * b + (k / 2) % 2, 2 * c + k % 2, p, boxes) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// A check that the arithmetic rounds outward, run before the search. Rounding a bound the
+// wrong way by one unit rarely changes which boxes are proved, so the box count alone would
+// not notice it.
+//
+// For pseudo-random intervals x, y with ends of up to 10^15 (1000 in real terms), it checks
+// with exact i128 products that the results hold the exact values: x * y holds every product of
+// ends, 1 / x holds 1 / x.a and 1 / x.b, root(x) holds the roots of its ends, and x + y, x - y
+// hold the sums and differences of ends.
+fn self_test() -> bool {
+  let mut s : u64 = 88172645463325252u64;
+  let u = wide(unit());
+  for n in 0..20000 {
+    let mut e : Tensor<i64, [4]> = Tensor<i64, [4]>::new();
+    let ep = e.as_mut_ptr();
+    for k in 0..4 {
+      s = s ^ (s << 13);
+      s = s ^ (s >> 7);
+      s = s ^ (s << 17);
+      // Up to 10^15 in units, about half of them negative.
+      let r = (s % 2000000000000000u64) as i64 - 1000000000000000;
+      unsafe { ep[k] = r; }
+    }
+    let a1 = unsafe { ep[0] };
+    let a2 = unsafe { ep[1] };
+    let b1 = unsafe { ep[2] };
+    let b2 = unsafe { ep[3] };
+    let x = bounds(wide(min64(a1, a2)), wide(max64(a1, a2)));
+    let y = bounds(wide(min64(b1, b2)), wide(max64(b1, b2)));
+    // Products of ends, in units^2: the result's ends times unit must enclose them.
+    let m = mul(x, y);
+    let ends : Tensor<i128, [4]> = Tensor<i128, [4]>::new();
+    let pp = ends.as_mut_ptr();
+    unsafe {
+      pp[0] = wide(x.a) * wide(y.a);
+      pp[1] = wide(x.a) * wide(y.b);
+      pp[2] = wide(x.b) * wide(y.a);
+      pp[3] = wide(x.b) * wide(y.b);
+    }
+    for k in 0..4 {
+      let p = unsafe { pp[k] };
+      if wide(m.a) * u > p || wide(m.b) * u < p {
+        return false;
+      }
+    }
+    let sum = add(x, y);
+    let dif = sub(x, y);
+    if sum.a != x.a + y.a || sum.b != x.b + y.b || dif.a != x.a - y.b || dif.b != x.b - y.a {
+      return false;
+    }
+    // 1 / x for x > 0: lo * x.b <= unit^2 <= hi * x.a.
+    if x.a > 0 {
+      let r = inv(x);
+      if wide(r.a) * wide(x.b) > u * u || wide(r.b) * wide(x.a) < u * u {
+        return false;
+      }
+    }
+    // root(x) for x >= 0: lo^2 <= x.a * unit and hi^2 >= x.b * unit.
+    if x.a >= 0 {
+      let r = root(x);
+      if wide(r.a) * wide(r.a) > wide(x.a) * u || wide(r.b) * wide(r.b) < wide(x.b) * u {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+fn main() -> i32 {
+  // lo, hi, L, U, V, alpha, lambda, mu (thousandths), one row per group, from the C++.
+  if !self_test() {
+    print!("fail: the self-test of the interval arithmetic\n");
+    return 1;
+  }
+  let values : Tensor<i64, [56]> = Tensor<i64, [56]>::new();
+  let t = values.as_mut_ptr();
+  fill(t);
+  let mut boxes : i64 = 0;
+  for g in 0..7 {
+    let r = (g * 8) as i64;
+    let mut p = Params {
+      l: frac(unsafe { t[r + 2] }),
+      u: frac(unsafe { t[r + 3] }),
+      v: frac(unsafe { t[r + 4] }),
+      alpha: frac(unsafe { t[r + 5] }),
+      lambda: frac(unsafe { t[r + 6] }),
+      mu: frac(unsafe { t[r + 7] }),
+      lo: unsafe { t[r] },
+      hi: unsafe { t[r + 1] },
+      mode: 1,
+      depth: 8,
+    };
+    for mode in 1..4 {
+      p.mode = mode as i32;
+      p.depth = 8;
+      if mode == 3 {
+        p.depth = 7;
+        if g == 0 {
+          p.depth = 14;
+        }
+      } else {
+        if g == 3 {
+          p.depth = 7;
+        }
+      }
+      if !verify(0, 0, 0, 0, p, &mut boxes) {
+        print!("fail: group ");
+        print!(g as i32);
+        print!(", mode ");
+        print!(mode as i32);
+        print!("\n");
+        return 1;
+      }
+    }
+  }
+  print!("pass (");
+  print!(boxes);
+  print!(" boxes)\n");
+  return 0;
+}
+
+fn fill(t : *mut i64) -> void {
+  set_row(t, 0, 0, 36, 940, -440, 300, 960, 1000, 956);
+  set_row(t, 1, 35, 81, 940, -440, 300, 930, 1050, 953);
+  set_row(t, 2, 80, 152, 886, -398, 250, 860, 1150, 985);
+  set_row(t, 3, 151, 254, 842, -335, 180, 770, 1150, 1024);
+  set_row(t, 4, 253, 335, 842, -335, 180, 690, 1150, 1058);
+  set_row(t, 5, 334, 412, 842, -335, 180, 632, 1160, 1087);
+  set_row(t, 6, 411, 479, 842, -335, 180, 583, 1160, 1111);
+}
+
+fn set_row(t : *mut i64, g : i64, a : i64, b : i64, c : i64, d : i64, e : i64, f : i64,
+           h : i64, k : i64) -> void {
+  let r = g * 8;
+  unsafe {
+    t[r] = a;
+    t[r + 1] = b;
+    t[r + 2] = c;
+    t[r + 3] = d;
+    t[r + 4] = e;
+    t[r + 5] = f;
+    t[r + 6] = h;
+    t[r + 7] = k;
+  }
+}

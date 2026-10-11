@@ -20,6 +20,14 @@ Format: the project, the toolchain version, what happened, and what we did inste
   `build.sh` passes `-O3`, which makes the check several times faster. A build tool needs a
   debug and a release setting, and a way to set it per project.
 
+- **hellinger, v0.0.3: optimized builds take minutes.** `vxc -O1`, `-O2` and `-O3` did not
+  finish in 250 s on a 700-line program that `-O0` compiles in 1 s. Compile time grows about
+  threefold with each level of nested calls, as if every call were inlined
+  ([vx-lang/Vx#1589](https://github.com/vx-lang/Vx/issues/1589)). `build.sh` runs
+  `vxc -a emit-llvm`, the bundled `mlir-translate` and `clang -O2` instead, which takes 3 s and
+  gives code within 20% of the C++ original. `-a emit-llvm` writes MLIR's LLVM dialect to
+  standard output and ignores `-o`; a build tool has to know that `mlir-translate` comes next.
+
 ## Libraries
 
 - **textkit, v0.0.3: a library is found only through `VX_STD_PATH`.** `import textkit::runs`
@@ -97,6 +105,11 @@ fail in another.
   parse, and `core::mem::replace`, the usual way out, does not compile for a `Vec`
   ([vx-lang/Vx#1585](https://github.com/vx-lang/Vx/issues/1585)). So a function cannot hand back
   two vectors without a copy: `div_rem` returns a struct, and its callers `clone()` the fields.
+
+- **hellinger, v0.0.3: the prover cannot prove anything about a returned struct.** It ignores
+  struct construction, so `ensures !return.ok || return.a <= return.b` fails on every `return`
+  ([vx-lang/Vx#1590](https://github.com/vx-lang/Vx/issues/1590)). The checker's intervals have no
+  contracts.
 
 ## Running
 
