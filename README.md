@@ -14,6 +14,11 @@ toolchain. They have two jobs:
 | --- | --- | --- |
 | [`wordcount`](wordcount) | Files, structs, loops, raw buffers | One package, one binary: how to build, run and test it |
 | [`textkit`](textkit) + [`textstat`](textstat) | Modules, traits, generics | A local library dependency; two packages with the same function name |
+| [`bigint`](bigint), [`rational`](rational), [`interval`](interval) | Operators on user types, `Vec`, exact arithmetic | A chain of libraries: `interval` needs `rational`, which needs `bigint` |
+
+The three number libraries are for checking the computer-assisted parts of proofs, such as those
+in [openai/math](https://github.com/openai/math), where the checkers need integers of any size,
+exact fractions and interval bounds, and Vx's `std` has none of them.
 
 Planned, each adding one new question:
 

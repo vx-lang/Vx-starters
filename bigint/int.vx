@@ -1,0 +1,422 @@
+// bigint::int: integers of any size.
+//
+// `BigInt` is a sign and a magnitude (see `bigint::nat`). Zero is never negative.
+//
+// The operators `+ - * / %` take their operands by value, as every Vx operator on a struct
+// does, so `a + b` uses up `a` and `b`. The methods `plus`, `minus`, `times`, `div` and `rem`
+// take references and leave their operands alone:
+//
+//   let c = a.times(&b).plus(&BigInt::from_i64(1));
+//
+// `/` and `%` round toward zero, as they do on i64. `div_floor` and `mod_floor` round down.
+
+import core::cmp;
+import core::ops;
+import core::option;
+import std::vec;
+import bigint::nat;
+
+struct BigInt {
+  neg : bool,
+  mag : Vec<u32>,
+}
+
+impl BigInt {
+  fn zero() -> BigInt {
+    return BigInt { neg: false, mag: Vec<u32>::new() };
+  }
+
+  fn from_i64(v : i64) -> BigInt {
+    if v >= 0 {
+      return BigInt { neg: false, mag: nat_from_u64(v as u64) };
+    }
+    // -v overflows for the smallest i64; 0 - (v + 1) + 1 does not.
+    let m = ((0 - (v + 1)) as u64) + 1;
+    return BigInt { neg: true, mag: nat_from_u64(m) };
+  }
+
+  fn from_u64(v : u64) -> BigInt {
+    return BigInt { neg: false, mag: nat_from_u64(v) };
+  }
+
+  // A sign and a magnitude, with a negative zero turned into zero.
+  fn from_parts(neg : bool, mag : Vec<u32>) -> BigInt {
+    let n = mag.len();
+    return BigInt { neg: neg && n > 0, mag: mag };
+  }
+
+  // The decimal number in the C string `s`, with an optional leading `-`. None if `s` is
+  // empty or has anything else in it.
+  fn parse(s : *const i8) -> Option<BigInt> {
+    let mut n : i64 = 0;
+    while unsafe { s[n] as i32 } != 0 {
+      n = n + 1;
+    }
+    return BigInt::parse_range(s, 0, n);
+  }
+
+  // As `parse`, for the bytes `s[start]` to `s[end - 1]`.
+  fn parse_range(s : *const i8, start : i64, end : i64) -> Option<BigInt> {
+    let mut i = start;
+    let mut neg = false;
+    if i < end {
+      if unsafe { s[i] as i32 } == 45 {
+        neg = true;
+        i = i + 1;
+      }
+    }
+    if i == end {
+      return Option<BigInt>::None();
+    }
+    let mut mag = Vec<u32>::new();
+    // Up to nine digits at a time, so each step is one multiply-add by a limb.
+    let mut chunk : u32 = 0;
+    let mut scale : u32 = 1;
+    while i < end {
+      let c = unsafe { s[i] as i32 };
+      if c < 48 || c > 57 {
+        return Option<BigInt>::None();
+      }
+      chunk = chunk * 10 + ((c - 48) as u32);
+      scale = scale * 10;
+      if scale == 1000000000 {
+        mag = nat_mul_add_small(&mag, scale, chunk);
+        chunk = 0;
+        scale = 1;
+      }
+      i = i + 1;
+    }
+    if scale > 1 {
+      mag = nat_mul_add_small(&mag, scale, chunk);
+    }
+    return Option<BigInt>::Some(BigInt::from_parts(neg, mag));
+  }
+
+  fn is_zero(self : &BigInt) -> bool {
+    return self.mag.len() == 0;
+  }
+
+  fn is_neg(self : &BigInt) -> bool {
+    return self.neg;
+  }
+
+  // -1, 0 or 1.
+  fn sign(self : &BigInt) -> i32 {
+    if self.mag.len() == 0 {
+      return 0;
+    }
+    if self.neg {
+      return -1;
+    }
+    return 1;
+  }
+
+  fn negated(self : &BigInt) -> BigInt {
+    return BigInt::from_parts(!self.neg, nat_copy(&self.mag));
+  }
+
+  fn abs(self : &BigInt) -> BigInt {
+    return BigInt { neg: false, mag: nat_copy(&self.mag) };
+  }
+
+  // -1, 0 or 1 as self is less than, equal to or greater than other.
+  fn compare(self : &BigInt, other : &BigInt) -> i32 {
+    if self.neg != other.neg {
+      if self.neg {
+        return -1;
+      }
+      return 1;
+    }
+    let c = nat_cmp(&self.mag, &other.mag);
+    if self.neg {
+      return 0 - c;
+    }
+    return c;
+  }
+
+  fn plus(self : &BigInt, other : &BigInt) -> BigInt {
+    if self.neg == other.neg {
+      return BigInt::from_parts(self.neg, nat_add(&self.mag, &other.mag));
+    }
+    // Different signs: subtract the smaller magnitude from the larger.
+    if nat_cmp(&self.mag, &other.mag) >= 0 {
+      return BigInt::from_parts(self.neg, nat_sub(&self.mag, &other.mag));
+    }
+    return BigInt::from_parts(other.neg, nat_sub(&other.mag, &self.mag));
+  }
+
+  fn minus(self : &BigInt, other : &BigInt) -> BigInt {
+    return self.plus(&other.negated());
+  }
+
+  fn times(self : &BigInt, other : &BigInt) -> BigInt {
+    return BigInt::from_parts(self.neg != other.neg, nat_mul(&self.mag, &other.mag));
+  }
+
+  // The quotient rounded toward zero, and the remainder, which has the sign of self.
+  // other must not be zero.
+  fn div_rem(self : &BigInt, other : &BigInt, q : &mut BigInt, r : &mut BigInt) -> void {
+    if other.is_zero() {
+      panic("bigint: division by zero");
+    }
+    let mut qm = Vec<u32>::new();
+    let mut rm = Vec<u32>::new();
+    nat_divmod(&self.mag, &other.mag, &mut qm, &mut rm);
+    *q = BigInt::from_parts(self.neg != other.neg, qm);
+    *r = BigInt::from_parts(self.neg, rm);
+  }
+
+  fn div(self : &BigInt, other : &BigInt) -> BigInt {
+    let mut q = BigInt::zero();
+    let mut r = BigInt::zero();
+    self.div_rem(other, &mut q, &mut r);
+    return q;
+  }
+
+  fn rem(self : &BigInt, other : &BigInt) -> BigInt {
+    let mut q = BigInt::zero();
+    let mut r = BigInt::zero();
+    self.div_rem(other, &mut q, &mut r);
+    return r;
+  }
+
+  // The quotient rounded down, and the remainder, which has the sign of other.
+  fn div_mod_floor(self : &BigInt, other : &BigInt, q : &mut BigInt, r : &mut BigInt) -> void {
+    self.div_rem(other, q, r);
+    if !r.is_zero() && r.neg != other.neg {
+      *q = q.minus(&BigInt::from_i64(1));
+      *r = r.plus(other);
+    }
+  }
+
+  fn div_floor(self : &BigInt, other : &BigInt) -> BigInt {
+    let mut q = BigInt::zero();
+    let mut r = BigInt::zero();
+    self.div_mod_floor(other, &mut q, &mut r);
+    return q;
+  }
+
+  fn mod_floor(self : &BigInt, other : &BigInt) -> BigInt {
+    let mut q = BigInt::zero();
+    let mut r = BigInt::zero();
+    self.div_mod_floor(other, &mut q, &mut r);
+    return r;
+  }
+
+  // The quotient rounded up.
+  fn div_ceil(self : &BigInt, other : &BigInt) -> BigInt {
+    return self.negated().div_floor(other).negated();
+  }
+
+  // self * 2^k, for k >= 0.
+  fn shl(self : &BigInt, k : i64) -> BigInt {
+    return BigInt::from_parts(self.neg, nat_shl(&self.mag, k));
+  }
+
+  // self / 2^k rounded down, for k >= 0, so -1 shifted right is still -1.
+  fn shr_floor(self : &BigInt, k : i64) -> BigInt {
+    let m = nat_shr(&self.mag, k);
+    if self.neg && !nat_low_bits_zero(&self.mag, k) {
+      return BigInt::from_parts(true, nat_add(&m, &nat_from_u64(1)));
+    }
+    return BigInt::from_parts(self.neg, m);
+  }
+
+  // How many bits |self| has.
+  fn bits(self : &BigInt) -> i64 {
+    return nat_bits(&self.mag);
+  }
+
+  fn pow(self : &BigInt, e : u32) -> BigInt {
+    let mut result = BigInt::from_i64(1);
+    let mut base = self.clone();
+    let mut k = e;
+    while k > 0 {
+      if (k & 1) == 1 {
+        result = result.times(&base);
+      }
+      k = k >> 1;
+      if k > 0 {
+        base = base.times(&base);
+      }
+    }
+    return result;
+  }
+
+  // The greatest common divisor of |self| and |other|. gcd(0, 0) is 0.
+  fn gcd(self : &BigInt, other : &BigInt) -> BigInt {
+    let mut a = self.abs();
+    let mut b = other.abs();
+    while !b.is_zero() {
+      let r = a.rem(&b);
+      a = b;
+      b = r;
+    }
+    return a;
+  }
+
+  // The largest integer whose square is at most self, for self >= 0 (Newton's method).
+  fn isqrt(self : &BigInt) -> BigInt {
+    if self.neg {
+      panic("bigint: isqrt of a negative number");
+    }
+    if self.is_zero() {
+      return BigInt::zero();
+    }
+    // Start above the root: 2^ceil(bits / 2).
+    let mut x = BigInt::from_i64(1).shl((self.bits() + 1) / 2);
+    let mut done = false;
+    while !done {
+      let y = x.plus(&self.div(&x)).shr_floor(1);
+      if y.compare(&x) >= 0 {
+        done = true;
+      } else {
+        x = y;
+      }
+    }
+    return x;
+  }
+
+  // self as an i64, or None if it does not fit.
+  fn to_i64(self : &BigInt) -> Option<i64> {
+    if self.mag.len() > 2 {
+      return Option<i64>::None();
+    }
+    let mut m : u64 = 0;
+    if self.mag.len() > 0 {
+      m = self.mag.get(0) as u64;
+    }
+    if self.mag.len() > 1 {
+      m = m | ((self.mag.get(1) as u64) << 32);
+    }
+    if self.neg {
+      if m > 9223372036854775808u64 {
+        return Option<i64>::None();
+      }
+      if m == 9223372036854775808u64 {
+        return Option<i64>::Some(-9223372036854775807i64 - 1i64);
+      }
+      return Option<i64>::Some(0 - (m as i64));
+    }
+    if m > 9223372036854775807u64 {
+      return Option<i64>::None();
+    }
+    return Option<i64>::Some(m as i64);
+  }
+
+  // The nearest f64 or close to it: exact below 2^53, and within a few units in the last
+  // place above. Not for proofs.
+  fn to_f64(self : &BigInt) -> f64 {
+    let mut x : f64 = 0.0;
+    let mut i = self.mag.len() - 1;
+    while i >= 0 {
+      // Through i64: on the AST path, v0.0.3 converts u32 to f64 as if it were signed.
+      x = x * 4294967296.0 + ((self.mag.get(i) as i64) as f64);
+      i = i - 1;
+    }
+    if self.neg {
+      return 0.0 - x;
+    }
+    return x;
+  }
+
+  // Print in decimal.
+  fn print(self : &BigInt) -> void {
+    if self.mag.len() == 0 {
+      print!("0");
+      return;
+    }
+    if self.neg {
+      print!("-");
+    }
+    // Split into base-10^9 digits, least significant first.
+    let mut chunks = Vec<u32>::new();
+    let mut m = nat_copy(&self.mag);
+    while m.len() > 0 {
+      let mut r : u32 = 0;
+      m = nat_div_small(&m, 1000000000, &mut r);
+      chunks.push(r);
+    }
+    let mut i = chunks.len() - 1;
+    print!(chunks.get(i));
+    i = i - 1;
+    while i >= 0 {
+      let c = chunks.get(i);
+      // Pad to nine digits.
+      let mut p : u32 = 100000000;
+      while p > 1 && c < p {
+        print!("0");
+        p = p / 10;
+      }
+      print!(c);
+      i = i - 1;
+    }
+  }
+}
+
+impl Clone for BigInt {
+  fn clone(self : &BigInt) -> BigInt {
+    return BigInt { neg: self.neg, mag: nat_copy(&self.mag) };
+  }
+}
+
+impl PartialEq for BigInt {
+  fn eq(self : &BigInt, other : &BigInt) -> bool {
+    return self.compare(other) == 0;
+  }
+}
+
+impl Ord for BigInt {
+  fn cmp(self : &BigInt, other : &BigInt) -> Ordering {
+    let c = self.compare(other);
+    if c < 0 {
+      return Ordering::Less;
+    }
+    if c > 0 {
+      return Ordering::Greater;
+    }
+    return Ordering::Equal;
+  }
+}
+
+impl Add for BigInt {
+  type Output = BigInt;
+  fn add(self : BigInt, rhs : BigInt) -> BigInt {
+    return self.plus(&rhs);
+  }
+}
+
+impl Sub for BigInt {
+  type Output = BigInt;
+  fn sub(self : BigInt, rhs : BigInt) -> BigInt {
+    return self.minus(&rhs);
+  }
+}
+
+impl Mul for BigInt {
+  type Output = BigInt;
+  fn mul(self : BigInt, rhs : BigInt) -> BigInt {
+    return self.times(&rhs);
+  }
+}
+
+impl Div for BigInt {
+  type Output = BigInt;
+  fn div(self : BigInt, rhs : BigInt) -> BigInt {
+    return BigInt::div(&self, &rhs);
+  }
+}
+
+impl Rem for BigInt {
+  type Output = BigInt;
+  fn rem(self : BigInt, rhs : BigInt) -> BigInt {
+    return BigInt::rem(&self, &rhs);
+  }
+}
+
+impl Neg for BigInt {
+  type Output = BigInt;
+  fn neg(self : BigInt) -> BigInt {
+    return self.negated();
+  }
+}
