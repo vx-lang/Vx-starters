@@ -17,6 +17,7 @@ toolchain. They have two jobs:
 | [`bigint`](bigint), [`rational`](rational), [`interval`](interval) | Operators on user types, `Vec`, exact arithmetic | A chain of libraries: `interval` needs `rational`, which needs `bigint` |
 | [`cycle-clique`](cycle-clique) | A published proof's computer check, ported and run natively | Optimization level as a build setting; expected output that comes from another project |
 | [`hellinger`](hellinger) | Traits over three number types, `i128`, an interval proof by branch and bound, `grad` to check its derivatives | A build that goes through LLVM IR and the bundled `clang`, because `vxc -O1` is too slow |
+| [`tiny-mlp`](tiny-mlp) | `grad` on training math: textbook derivatives, backprop checked three ways, Adam on XOR | Optional toolchain parts (Enzyme); a program that only runs under `run-jit` |
 
 The three number libraries are for checking the computer-assisted parts of proofs, such as those
 in [openai/math](https://github.com/openai/math), where the checkers need integers of any size,
@@ -28,7 +29,6 @@ Planned, each adding one new question:
 | Project | Shows | Build-system question |
 | --- | --- | --- |
 | `will-it-fit` | `--machine`, capacity and dtype errors | Machine models as build inputs, per target |
-| `tiny-mlp` | Tensors, `matmul`, `grad` | Optional toolchain parts (Enzyme) |
 | `prefill-decode` | `spawn on`, `transfer`, `--verify-seams` | Optional tools (`z3`) in the test step |
 | `ffi-zlib` | Calling a C library | Linking native libraries; build scripts |
 

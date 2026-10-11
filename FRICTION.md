@@ -173,6 +173,12 @@ fail in another.
 - **hellinger, v0.0.3: a float literal is `f32`.** `let s = 1000000000000.0;` next to an `f64`
   is `E3004: f64 vs f32`, at `0:0`. Every literal in `gradcheck.vx` has a typed `let`
   (the book's autodiff chapter mentions it, vx-lang/Vx#1446).
+- **tiny-mlp, v0.0.3: no gradient for a tensor of weights.** `vjp` returns the function's
+  result type, not the differentiated argument's
+  ([vx-lang/Vx#1600](https://github.com/vx-lang/Vx/issues/1600)), and a pointer passed after the
+  moved parameter breaks `grad` with an Enzyme shadow error
+  ([vx-lang/Vx#1601](https://github.com/vx-lang/Vx/issues/1601)). tiny-mlp takes one `grad` per
+  weight, with the weights in a struct of `f64` fields passed by value.
 - **bigint, v0.0.3: `panic!` does not exist.** It is the function `panic("..")`; `panic!(..)` is
   `Macro panic not found`.
 
