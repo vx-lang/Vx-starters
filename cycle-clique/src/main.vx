@@ -1,0 +1,655 @@
+// cycle-clique: the finite check in the proof that R(C_m, K_n) = (m - 1)(n - 1) + 1.
+//
+// A port of `verification/code/original_checker.py` from "Cycle-clique Ramsey numbers"
+// (openai/math, preprints/Cycle-clique-Ramsey-numbers-September-25-2026), Apache License 2.0.
+// The steps and their order are the same; sets of small numbers are u32 bit masks here, and
+// the forests are checked as they are made instead of being collected first.
+//
+// For k = 5..17 it prints k and three counts: forest patterns the check could not rule out,
+// patterns ruled out by the first packing bound, and patterns ruled out after deduction. The
+// proof needs the first count to be 0 for every k. build.sh compares the table with the one
+// the paper ships.
+//
+//   ./build.sh
+
+import std::vec;
+
+// The set {x}, as a mask.
+fn bit(x : i32) -> u32 {
+  let one : u32 = 1;
+  return one << (x as u32);
+}
+
+// Every number 0..31 not in m.
+fn not_mask(m : u32) -> u32 {
+  let all : u32 = 4294967295;
+  return m ^ all;
+}
+
+fn has(m : u32, x : i32) -> bool {
+  return (m & bit(x)) != 0;
+}
+
+// Whether every element of a is in b.
+fn subset(a : u32, b : u32) -> bool {
+  return (a & b) == a;
+}
+
+fn popcount(m : u32) -> i32 {
+  let mut c = 0;
+  let mut x = m;
+  while x != 0 {
+    x = x & (x - 1);
+    c = c + 1;
+  }
+  return c;
+}
+
+// {lo, lo + 1, .., hi} for 0 <= lo, hi < 32; empty when lo > hi.
+fn range_mask(lo : i32, hi : i32) -> u32 {
+  let mut m : u32 = 0;
+  for x in lo..(hi + 1) {
+    m = m | bit(x);
+  }
+  return m;
+}
+
+fn max(a : i32, b : i32) -> i32 {
+  if a > b {
+    return a;
+  }
+  return b;
+}
+
+// A square matrix of masks: M[i][j] is a set of numbers.
+struct Mat {
+  n : i32,
+  v : Vec<u32>,
+}
+
+impl Mat {
+  fn new(n : i32) -> Mat {
+    let mut v = Vec<u32>::with_capacity(n * n + 1);
+    for i in 0..(n * n) {
+      v.push(0);
+    }
+    return Mat { n: n, v: v };
+  }
+
+  fn get(self : &Mat, i : i32, j : i32) -> u32 {
+    return self.v.get(i * self.n + j);
+  }
+
+  fn add(self : &mut Mat, i : i32, j : i32, m : u32) -> void {
+    let k = i * self.n + j;
+    self.v.set(k, self.v.get(k) | m);
+  }
+}
+
+// A graph on vertices 0..n-1, as a neighbour mask for each vertex.
+fn copy_graph(g : &Vec<u32>) -> Vec<u32> {
+  let mut h = Vec<u32>::with_capacity(g.len() + 2);
+  for i in 0..g.len() {
+    h.push(g.get(i));
+  }
+  return h;
+}
+
+// The vertices and edges of a forest pattern (the paper's `data`).
+//
+// A pattern is a list of paths. In `pat` each path is its length followed by its numbers:
+// ((), (1, 2)) is [0, 2, 1, 2]. Each path starts at a vertex of Q; each number q adds an
+// edge (a, a + 1 + q) and q vertices inside it, and the edge's far end is in Q too. The
+// vertices of Q form a clique, and each edge is also a chain through its inside vertices.
+struct Pattern {
+  n : i32,
+  ea : Vec<i32>,
+  eb : Vec<i32>,
+  adj : Vec<u32>,
+  // The ends a vertex reaches: itself for a vertex of Q, else the two ends of its edge.
+  tip_a : Vec<i32>,
+  tip_b : Vec<i32>,
+}
+
+fn pattern(pat : &Vec<i32>) -> Pattern {
+  let mut ea = Vec<i32>::new();
+  let mut eb = Vec<i32>::new();
+  let mut q : u32 = 0;
+  let mut n = 0;
+  let mut i = 0;
+  while i < pat.len() {
+    let len = pat.get(i);
+    q = q | bit(n);
+    for j in 0..len {
+      let step = pat.get(i + 1 + j);
+      ea.push(n);
+      eb.push(n + 1 + step);
+      n = n + 1 + step;
+      q = q | bit(n);
+    }
+    n = n + 1;
+    i = i + 1 + len;
+  }
+  let mut adj = Vec<u32>::new();
+  let mut tip_a = Vec<i32>::new();
+  let mut tip_b = Vec<i32>::new();
+  for x in 0..n {
+    adj.push(0);
+    tip_a.push(x);
+    tip_b.push(x);
+  }
+  for x in 0..n {
+    if has(q, x) {
+      adj.set(x, q & not_mask(bit(x)));
+    }
+  }
+  for e in 0..ea.len() {
+    let a = ea.get(e);
+    let b = eb.get(e);
+    for x in a..b {
+      adj.set(x, adj.get(x) | bit(x + 1));
+      adj.set(x + 1, adj.get(x + 1) | bit(x));
+    }
+    for x in (a + 1)..b {
+      tip_a.set(x, a);
+      tip_b.set(x, b);
+    }
+  }
+  return Pattern { n: n, ea: ea, eb: eb, adj: adj, tip_a: tip_a, tip_b: tip_b };
+}
+
+// How many edges in the subset `sel` of `es` touch vertex v.
+fn uses(es_a : &Vec<i32>, es_b : &Vec<i32>, sel : u32, v : i32) -> i32 {
+  let mut c = 0;
+  for e in 0..es_a.len() {
+    if has(sel, e) {
+      if es_a.get(e) == v {
+        c = c + 1;
+      }
+      if es_b.get(e) == v {
+        c = c + 1;
+      }
+    }
+  }
+  return c;
+}
+
+// The paper's `forbidden`: the cycle-length offsets ruled out for the pair x < y.
+fn forbidden(k : i32, l : i32, p : &Pattern, x : i32, y : i32) -> u32 {
+  let mut out : u32 = 0;
+  // The edges with neither x nor y strictly inside them, in order.
+  let mut ra = Vec<i32>::new();
+  let mut rb = Vec<i32>::new();
+  for e in 0..p.ea.len() {
+    let a = p.ea.get(e);
+    let b = p.eb.get(e);
+    let inside_x = a < x && x < b;
+    let inside_y = a < y && y < b;
+    if !inside_x && !inside_y {
+      ra.push(a);
+      rb.push(b);
+    }
+  }
+  let total_edges = p.ea.len();
+  for sel in 0..(1 << ra.len()) {
+    let s = sel as u32;
+    let mut verts : u32 = 0;
+    let mut q0 = 0;
+    for e in 0..ra.len() {
+      if has(s, e) {
+        verts = verts | bit(ra.get(e)) | bit(rb.get(e));
+        q0 = q0 + rb.get(e) - ra.get(e) - 1;
+      }
+    }
+    let e_count = popcount(s) + 1;
+    for zi in 0..2 {
+      let mut z = p.tip_a.get(x);
+      if zi == 1 {
+        z = p.tip_b.get(x);
+      }
+      // A vertex of Q has one tip; do not look at it twice.
+      let skip_z = zi == 1 && p.tip_a.get(x) == p.tip_b.get(x);
+      if !skip_z {
+        if uses(&ra, &rb, s, z) < 2 {
+          // The chosen edges are in order along the chains, so one pass finds what z reaches.
+          let mut reach = bit(z);
+          for e in 0..ra.len() {
+            if has(s, e) {
+              if has(reach, ra.get(e)) {
+                reach = reach | bit(rb.get(e));
+              }
+            }
+          }
+          for wi in 0..2 {
+            let mut w = p.tip_a.get(y);
+            if wi == 1 {
+              w = p.tip_b.get(y);
+            }
+            let skip_w = wi == 1 && p.tip_a.get(y) == p.tip_b.get(y);
+            if !skip_w {
+              if z < w {
+                if uses(&ra, &rb, s, w) < 2 {
+                  let v = popcount(verts | bit(z) | bit(w));
+                  let mut dz = x - z;
+                  if dz < 0 {
+                    dz = 0 - dz;
+                  }
+                  let mut dw = y - w;
+                  if dw < 0 {
+                    dw = 0 - dw;
+                  }
+                  let q = q0 + dz + dw;
+                  if !has(reach, w) {
+                    let mut all = 0;
+                    if e_count >= total_edges {
+                      all = 1;
+                    }
+                    let low = l + all - q;
+                    let high = k + 1 - v - q;
+                    out = out | range_mask(max(1, low), high);
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return out;
+}
+
+// The paper's `initial`.
+fn initial(k : i32, t : i32, p : &Pattern) -> Mat {
+  let n = p.n;
+  let mut m = Mat::new(n);
+  for y in 0..n {
+    for x in 0..y {
+      let f = forbidden(k, n - t, p, x, y);
+      m.add(x, y, f);
+      m.add(y, x, f);
+    }
+  }
+  return m;
+}
+
+// {1, .., j}, and {0} for j = 0 once the weights are set (the paper's `req`).
+fn req(j : i32) -> u32 {
+  if j == 0 {
+    return 1;
+  }
+  return range_mask(1, j);
+}
+
+// The weighted search in the paper's `pack`. `order` lists nodes; returns whether some set of
+// pairwise adjacent nodes from it has total weight above `bound`.
+fn find(order : &Vec<i32>, bound : i32, w : &Vec<i32>, adj : &Vec<bool>, nodes : i32) -> bool {
+  let mut idx = 0;
+  while idx < order.len() {
+    let x = order.get(idx);
+    if w.get(x) > bound {
+      return true;
+    }
+    let mut z = Vec<i32>::new();
+    let mut sum = 0;
+    for j in (idx + 1)..order.len() {
+      let p = order.get(j);
+      if adj.get(x * nodes + p) {
+        z.push(p);
+        sum = sum + w.get(p);
+      }
+    }
+    let b = bound - w.get(x);
+    if sum > b {
+      if find(&z, b, w, adj, nodes) {
+        return true;
+      }
+    }
+    idx = idx + 1;
+  }
+  return false;
+}
+
+// The paper's `pack`: a weight for each vertex and level, then a search for a heavy clique.
+fn pack(k : i32, t : i32, m : &Mat) -> bool {
+  let n = m.n;
+  // Nodes (i, r) with r in -1..2, in the order the paper's dict adds them.
+  let mut ni = Vec<i32>::new();
+  let mut nr = Vec<i32>::new();
+  let mut w = Vec<i32>::new();
+  for i in 0..n {
+    ni.push(i);
+    nr.push(-1);
+    w.push(1);
+    let mut zeros = 0;
+    for j in 0..n {
+      if has(m.get(i, j), 0) {
+        zeros = zeros + 1;
+      }
+    }
+    let mut b = k + 1 - n + zeros;
+    if b > 0 {
+      let mut u = 1;
+      if b >= t {
+        u = 2;
+      }
+      ni.push(i);
+      nr.push(0);
+      w.push(u);
+      for r in 1..3 {
+        let mut tc = 0;
+        for j in 0..n {
+          if subset(req(r), m.get(i, j)) {
+            tc = tc + 1;
+          }
+        }
+        let c = max(b, k * u + 1 - n + tc);
+        let mut val = 1;
+        if c > t {
+          val = val + 1;
+        }
+        if c > max(k, 2 * t) {
+          val = val + 1;
+        }
+        val = max(u, val);
+        if val == 1 && b == t && c == t && k + 1 - n + tc >= t {
+          val = 2;
+        }
+        if val > u {
+          ni.push(i);
+          nr.push(r);
+          w.push(val);
+        }
+        b = c;
+        u = val;
+      }
+    }
+  }
+  let nodes = ni.len();
+  let mut adj = Vec<bool>::with_capacity(nodes * nodes + 1);
+  for a in 0..nodes {
+    for c in 0..nodes {
+      let ok = ni.get(a) != ni.get(c) && subset(req(nr.get(a) + nr.get(c) + 2), m.get(ni.get(a), ni.get(c)));
+      adj.push(ok);
+    }
+  }
+  // Sort by -w[p] * (sum of the weights next to p), keeping the dict order for ties.
+  let mut key = Vec<i32>::new();
+  for a in 0..nodes {
+    let mut s = 0;
+    for c in 0..nodes {
+      if adj.get(a * nodes + c) {
+        s = s + w.get(c);
+      }
+    }
+    key.push(0 - w.get(a) * s);
+  }
+  let mut order = Vec<i32>::new();
+  for a in 0..nodes {
+    // Insertion sort: stable, and the lists are short.
+    order.push(a);
+    let mut j = order.len() - 1;
+    while j > 0 {
+      if key.get(order.get(j - 1)) <= key.get(order.get(j)) {
+        break;
+      }
+      let tmp = order.get(j - 1);
+      order.set(j - 1, order.get(j));
+      order.set(j, tmp);
+      j = j - 1;
+    }
+  }
+  return find(&order, k, &w, &adj, nodes);
+}
+
+// Sets of non-negative keys (open addressing), for the path states in `exact`: a vector of
+// slots, -1 when free. Free functions on a local vector, not a struct: in v0.0.3, storing a
+// new vector into a field or through a reference does not free the old one
+// (vx-lang/Vx#1573), and methods that call each other crash the compiler (vx-lang/Vx#1488).
+fn empty_keys(cap : i32) -> Vec<i64> {
+  let mut keys = Vec<i64>::with_capacity(cap);
+  for i in 0..cap {
+    keys.push(-1);
+  }
+  return keys;
+}
+
+// Put key in its slot; return whether it was not there yet. There must be a free slot.
+fn place(keys : &mut Vec<i64>, key : i64) -> bool {
+  let cap = keys.len() as i64;
+  let mut h = ((key * 2654435761) % cap) as i32;
+  while keys.get(h) >= 0 {
+    if keys.get(h) == key {
+      return false;
+    }
+    h = h + 1;
+    if h == keys.len() {
+      h = 0;
+    }
+  }
+  keys.set(h, key);
+  return true;
+}
+
+// The same keys in twice as many slots.
+fn grown(keys : &Vec<i64>) -> Vec<i64> {
+  let mut bigger = empty_keys(keys.len() * 2);
+  for i in 0..keys.len() {
+    let k = keys.get(i);
+    if k >= 0 {
+      place(&mut bigger, k);
+    }
+  }
+  return bigger;
+}
+
+// The paper's `exact`: M, plus k - l in A[i][x] for every path of l edges from i to x.
+fn exact(k : i32, g : &Vec<u32>, m : &Mat) -> Mat {
+  let n = g.len();
+  let mut a = Mat::new(n);
+  for i in 0..m.n {
+    for j in 0..m.n {
+      a.add(i, j, m.get(i, j));
+    }
+  }
+  for i in 0..n {
+    // A state is (vertices used, last vertex), packed as used * 32 + last.
+    let mut states = Vec<i64>::new();
+    states.push((bit(i) as i64) * 32 + (i as i64));
+    for ell in 1..(k + 1) {
+      let mut seen = empty_keys(64);
+      let mut next = Vec<i64>::new();
+      for s in 0..states.len() {
+        let st = states.get(s);
+        let used = (st / 32) as u32;
+        let x = (st % 32) as i32;
+        let nb = g.get(x) & not_mask(used);
+        for y in 0..n {
+          if has(nb, y) {
+            let key = ((used | bit(y)) as i64) * 32 + (y as i64);
+            if (next.len() + 1) * 2 > seen.len() {
+              seen = grown(&seen);
+            }
+            if place(&mut seen, key) {
+              next.push(key);
+            }
+          }
+        }
+      }
+      for s in 0..next.len() {
+        let x = (next.get(s) % 32) as i32;
+        a.add(i, x, bit(k - ell));
+      }
+      states = next;
+    }
+  }
+  return a;
+}
+
+// The paper's `bad`: an edge whose pair has 0 ruled out, or a heavy packing.
+fn bad(k : i32, t : i32, g : &Vec<u32>, m : &Mat) -> bool {
+  for i in 0..g.len() {
+    for j in 0..g.len() {
+      if has(g.get(i), j) {
+        if has(m.get(i, j), 0) {
+          return true;
+        }
+      }
+    }
+  }
+  return pack(k, t, m);
+}
+
+// The paper's `attach`: g plus an edge i-j (d = 0), or a new vertex joined to both (d = 1).
+fn attach(g : &Vec<u32>, i : i32, j : i32, d : i32) -> Vec<u32> {
+  let mut h = copy_graph(g);
+  if d == 1 {
+    let z = h.len();
+    h.set(i, h.get(i) | bit(z));
+    h.set(j, h.get(j) | bit(z));
+    h.push(bit(i) | bit(j));
+  } else {
+    h.set(i, h.get(i) | bit(j));
+    h.set(j, h.get(j) | bit(i));
+  }
+  return h;
+}
+
+// The paper's `check`: 1 or 2 if the pattern is ruled out (by packing alone, or after
+// deduction), 0 if not.
+fn check(k : i32, t : i32, pat : &Vec<i32>) -> i32 {
+  let p = pattern(pat);
+  let m0 = initial(k, t, &p);
+  if pack(k, t, &m0) {
+    return 1;
+  }
+  let mut m = exact(k, &p.adj, &m0);
+  let n = p.n;
+  while !bad(k, t, &p.adj, &m) {
+    let mut ni = Vec<i32>::new();
+    let mut nj = Vec<i32>::new();
+    let mut nd = Vec<i32>::new();
+    for i in 0..n {
+      for j in 0..i {
+        for d in 0..2 {
+          let known = has(m.get(i, j), d);
+          let edge = d == 0 && has(p.adj.get(i), j);
+          if !known && !edge {
+            let h = attach(&p.adj, i, j, d);
+            if bad(k, t, &h, &exact(k, &h, &m)) {
+              ni.push(i);
+              nj.push(j);
+              nd.push(d);
+            }
+          }
+        }
+      }
+    }
+    if ni.len() == 0 {
+      return 0;
+    }
+    for e in 0..ni.len() {
+      m.add(ni.get(e), nj.get(e), bit(nd.get(e)));
+      m.add(nj.get(e), ni.get(e), bit(nd.get(e)));
+    }
+  }
+  return 2;
+}
+
+// Lexicographic order on number sequences, as Python compares tuples: -1, 0 or 1.
+fn lex(a : &Vec<i32>, b : &Vec<i32>) -> i32 {
+  let mut i = 0;
+  while i < a.len() {
+    if i >= b.len() {
+      return 1;
+    }
+    if a.get(i) != b.get(i) {
+      if a.get(i) < b.get(i) {
+        return -1;
+      }
+      return 1;
+    }
+    i = i + 1;
+  }
+  if a.len() < b.len() {
+    return -1;
+  }
+  return 0;
+}
+
+fn reversed(a : &Vec<i32>) -> Vec<i32> {
+  let mut out = Vec<i32>::with_capacity(a.len() + 1);
+  let mut i = a.len() - 1;
+  while i >= 0 {
+    out.push(a.get(i));
+    i = i - 1;
+  }
+  return out;
+}
+
+fn copy_ints(a : &Vec<i32>) -> Vec<i32> {
+  let mut out = Vec<i32>::with_capacity(a.len() + 1);
+  for i in 0..a.len() {
+    out.push(a.get(i));
+  }
+  return out;
+}
+
+// The paper's `forests(t, b, first)`: every pattern of paths using t vertices of Q and numbers
+// adding to at most b, with each path at least `first` and at most its own reverse. Each one
+// is appended to `prefix`, checked, and counted in `counts`.
+fn forests(k : i32, t_all : i32, t : i32, b : i32, first : &Vec<i32>, prefix : &Vec<i32>,
+           counts : &mut Vec<i32>) -> void {
+  if t == 0 {
+    let r = check(k, t_all, prefix);
+    counts.set(r, counts.get(r) + 1);
+    return;
+  }
+  let p = Vec<i32>::new();
+  seqs(k, t_all, t, b, first, prefix, &p, b, counts);
+}
+
+// The paper's inner `seqs(p, left)`.
+fn seqs(k : i32, t_all : i32, t : i32, b : i32, first : &Vec<i32>, prefix : &Vec<i32>,
+        p : &Vec<i32>, left : i32, counts : &mut Vec<i32>) -> void {
+  if lex(first, p) <= 0 && lex(p, &reversed(p)) <= 0 {
+    let mut longer = copy_ints(prefix);
+    longer.push(p.len());
+    for i in 0..p.len() {
+      longer.push(p.get(i));
+    }
+    forests(k, t_all, t - p.len() - 1, left, p, &longer, counts);
+  }
+  if p.len() < t - 1 {
+    for q in 1..(left + 1) {
+      let mut p2 = copy_ints(p);
+      p2.push(q);
+      seqs(k, t_all, t, b, first, prefix, &p2, left - q, counts);
+    }
+  }
+}
+
+fn main() -> i32 {
+  for k in 5..18 {
+    let mut counts = Vec<i32>::new();
+    counts.push(0);
+    counts.push(0);
+    counts.push(0);
+    let mut t = max(3, k / 2);
+    while t <= k && t <= 8 {
+      let none = Vec<i32>::new();
+      let start = Vec<i32>::new();
+      forests(k, t, t, k - t, &none, &start, &mut counts);
+      t = t + 1;
+    }
+    print!(k as i32);
+    print!(" ");
+    print!(counts.get(0));
+    print!(" ");
+    print!(counts.get(1));
+    print!(" ");
+    print!(counts.get(2));
+    print!("\n");
+  }
+  return 0;
+}

@@ -15,10 +15,12 @@ toolchain. They have two jobs:
 | [`wordcount`](wordcount) | Files, structs, loops, raw buffers | One package, one binary: how to build, run and test it |
 | [`textkit`](textkit) + [`textstat`](textstat) | Modules, traits, generics | A local library dependency; two packages with the same function name |
 | [`bigint`](bigint), [`rational`](rational), [`interval`](interval) | Operators on user types, `Vec`, exact arithmetic | A chain of libraries: `interval` needs `rational`, which needs `bigint` |
+| [`cycle-clique`](cycle-clique) | A published proof's computer check, ported and run natively | Optimization level as a build setting; expected output that comes from another project |
 
 The three number libraries are for checking the computer-assisted parts of proofs, such as those
 in [openai/math](https://github.com/openai/math), where the checkers need integers of any size,
-exact fractions and interval bounds, and Vx's `std` has none of them.
+exact fractions and interval bounds, and Vx's `std` has none of them. `cycle-clique` is the first
+such check ([vx-lang/Vx#1489](https://github.com/vx-lang/Vx/issues/1489)).
 
 Planned, each adding one new question:
 
