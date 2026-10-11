@@ -1,0 +1,20 @@
+// A memory check for bigint: 400000 divisions and remainders of a 9-limb number by a 3-limb
+// one. build.sh runs it and fails if it needs more than 20 MB. Before division stopped
+// writing through `&mut` (vx-lang/Vx#1573), this took 58 MB, and ten times more work took ten
+// times more.
+
+import bigint::int;
+
+fn main() -> i32 {
+  let a = BigInt::from_i64(3).pow(180);
+  let b = BigInt::from_i64(7).pow(30).plus(&BigInt::from_i64(12345));
+  let mut total : i64 = 0;
+  for i in 0..200000 {
+    let q = a.div_floor(&b);
+    let r = a.rem(&b);
+    total = total + (q.bits() + r.bits());
+  }
+  print!(total);
+  print!("\n");
+  return 0;
+}

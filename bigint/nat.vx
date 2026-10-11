@@ -251,21 +251,26 @@ fn nat_low_bits_zero(a : &Vec<u32>, k : i64) -> bool {
   return true;
 }
 
-// a / b and a % b, both rounded down, for b > 0. The quotient goes in `q` and the remainder
-// in `r`. This is Knuth's algorithm D (The Art of Computer Programming, vol. 2, 4.3.1), in the
-// form Hacker's Delight gives it (divmnu).
-fn nat_divmod(a : &Vec<u32>, b : &Vec<u32>, q : &mut Vec<u32>, r : &mut Vec<u32>) -> void {
+// A quotient and a remainder.
+//
+// Division returns one of these rather than writing through `&mut` arguments: in v0.0.3,
+// `*q = v` does not free the vector q held before (vx-lang/Vx#1573), so every division leaked.
+struct NatDivMod {
+  q : Vec<u32>,
+  r : Vec<u32>,
+}
+
+// a / b and a % b, both rounded down, for b > 0. This is Knuth's algorithm D (The Art of
+// Computer Programming, vol. 2, 4.3.1), in the form Hacker's Delight gives it (divmnu).
+fn nat_divmod(a : &Vec<u32>, b : &Vec<u32>) -> NatDivMod {
   if nat_cmp(a, b) < 0 {
-    *q = Vec<u32>::new();
-    *r = nat_copy(a);
-    return;
+    return NatDivMod { q: Vec<u32>::new(), r: nat_copy(a) };
   }
   let n = b.len();
   if n == 1 {
     let mut rem : u32 = 0;
-    *q = nat_div_small(a, b.get(0), &mut rem);
-    *r = nat_from_u64(rem as u64);
-    return;
+    let q = nat_div_small(a, b.get(0), &mut rem);
+    return NatDivMod { q: q, r: nat_from_u64(rem as u64) };
   }
   let m = a.len() - n;
 
@@ -324,12 +329,11 @@ fn nat_divmod(a : &Vec<u32>, b : &Vec<u32>, q : &mut Vec<u32>, r : &mut Vec<u32>
     j = j - 1;
   }
   nat_trim(&mut out);
-  *q = out;
 
   let mut rem = Vec<u32>::with_capacity(n);
   for i in 0..n {
     rem.push(an.get(i));
   }
   nat_trim(&mut rem);
-  *r = nat_shr(&rem, s);
+  return NatDivMod { q: out, r: nat_shr(&rem, s) };
 }

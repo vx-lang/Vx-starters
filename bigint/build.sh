@@ -5,7 +5,8 @@
 #   VX_HOME=<dir> ./build.sh   use a toolchain other than ~/.vx/current
 #
 # bigint is imported as `bigint::...`, so the repository root is on the import path, as in
-# ../textkit/build.sh. The tests print three numbers; the values below are from Python.
+# ../textkit/build.sh. The tests print three numbers; the values below are from Python. Then
+# stress.vx checks that division does not leak.
 
 set -euo pipefail
 
@@ -24,6 +25,20 @@ if [ "$got" != "$want" ]; then
   echo "$got" >&2
   echo "FAIL: want" >&2
   echo "$want" >&2
+  exit 1
+fi
+
+# Memory: build stress.vx as a program and check its peak size. It runs under a 1 GB limit,
+# so a leak stops it rather than the machine.
+CLANG="$VX_HOME/llvm/bin/clang"
+[ -x "$CLANG" ] || CLANG=clang
+mkdir -p build
+"$VX_HOME/bin/vxc" -O3 -a emit-obj stress.vx -o build/stress.o
+"$CLANG" build/stress.o -L"$VX_HOME/lib" -lvx_std_core -Wl,-rpath,"$VX_HOME/lib" -lm \
+  -o build/stress
+peak_kb="$( (ulimit -v 1000000; /usr/bin/time -f '%M' build/stress > /dev/null) 2>&1 | tail -1)"
+if ! [ "$peak_kb" -lt 20000 ] 2>/dev/null; then
+  echo "FAIL: stress.vx needed $peak_kb KB, want under 20000" >&2
   exit 1
 fi
 echo ok

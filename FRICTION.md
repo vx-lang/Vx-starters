@@ -88,8 +88,15 @@ fail in another.
   frees it ([vx-lang/Vx#1573](https://github.com/vx-lang/Vx/issues/1573)). A hash set that grew
   by `set.keys = bigger` made the checker peak at 600 MB, and a variant that ran longer reached
   57 GB and set off the machine's out-of-memory killer, which also killed other programs.
-  The checker keeps its hash set in a local vector now (4 MB). `bigint` still stores through
-  `&mut` in `div_rem`, so long computations with it grow.
+  The checker keeps its hash set in a local vector now (4 MB). `bigint`'s division wrote its
+  quotient and remainder through `&mut` and lost about 145 bytes per call; it returns a struct
+  now, and `bigint/build.sh` checks that 400,000 divisions stay under 20 MB.
+- **bigint, v0.0.3: moving a field out of a struct frees it twice.** `let d = f(); return d.q;`
+  aborts with `free(): double free`, because `d` still drops `q`
+  ([vx-lang/Vx#1507](https://github.com/vx-lang/Vx/issues/1507)). `let S { a, b } = s;` does not
+  parse, and `core::mem::replace`, the usual way out, does not compile for a `Vec`
+  ([vx-lang/Vx#1585](https://github.com/vx-lang/Vx/issues/1585)). So a function cannot hand back
+  two vectors without a copy: `div_rem` returns a struct, and its callers `clone()` the fields.
 
 ## Running
 
