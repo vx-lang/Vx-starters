@@ -16,6 +16,10 @@ Format: the project, the toolchain version, what happened, and what we did inste
 - **wordcount, v0.0.3: no project root.** Imports resolve from the toolchain's `stdlib/`, then the
   directory `vxc` runs in. There is no manifest, so `build.sh` `cd`s to the project first.
 
+- **cycle-clique, v0.0.3: optimization is off unless asked for.** `vxc` defaults to `-O0`.
+  `build.sh` passes `-O3`, which makes the check several times faster. A build tool needs a
+  debug and a release setting, and a way to set it per project.
+
 ## Libraries
 
 - **textkit, v0.0.3: a library is found only through `VX_STD_PATH`.** `import textkit::runs`
@@ -79,6 +83,14 @@ fail in another.
   any action that compiles ([vx-lang/Vx#1488](https://github.com/vx-lang/Vx/issues/1488)). A
   free function that calls itself works. `Rational::pow` uses no recursion.
 
+- **cycle-clique, v0.0.3: storing into a field or through `&mut` does not free the old value.**
+  `b.v = make(1000);` and `*out = make(1000);` leak the old `Vec`'s buffer; assigning to a local
+  frees it ([vx-lang/Vx#1573](https://github.com/vx-lang/Vx/issues/1573)). A hash set that grew
+  by `set.keys = bigger` made the checker peak at 600 MB, and a variant that ran longer reached
+  57 GB and set off the machine's out-of-memory killer, which also killed other programs.
+  The checker keeps its hash set in a local vector now (4 MB). `bigint` still stores through
+  `&mut` in `div_rem`, so long computations with it grow.
+
 ## Running
 
 - **wordcount, v0.0.3: `run-jit` and a built binary see different arguments.** Under `run-jit`
@@ -126,6 +138,9 @@ fail in another.
 - **bigint, v0.0.3: a range's variable is `i32`, and is not converted to `i64`.** After
   `for i in 1..31`, `BigInt::from_i64(i)` is `E3003`; it takes `i as i64`. Likewise
   `-9223372036854775807 - 1` where an `i64` is expected is `E3004: i64 vs i32`, at `0:0`.
+- **cycle-clique, v0.0.3: `print!` of a range's variable can fail to compile.** In
+  `for k in 5..18 { print!(k); }`, `k` has the internal type `index`: `unsupported print arg type
+  index`, then `MLIR verification failed`. `print!(k as i32)` works.
 - **bigint, v0.0.3: `panic!` does not exist.** It is the function `panic("..")`; `panic!(..)` is
   `Macro panic not found`.
 
