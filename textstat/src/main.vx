@@ -1,0 +1,44 @@
+// textstat: count the words, numbers and runs of capital letters in a file, using textkit.
+//
+//   ./build.sh, then build/textstat <file>
+
+import std::fs;
+import textkit::classes;
+import textkit::runs;
+
+extern {
+  fn vx_env_args_count() -> i32;
+  fn vx_env_arg(idx : i32) -> *mut i8;
+}
+
+fn main() -> i32 {
+  // The file is the last argument: `vxc -a run-jit` passes the source path first (vx-lang/Vx#1454).
+  let argc = unsafe { vx_env_args_count() };
+  if argc < 2 {
+    print!("usage: textstat <file>\n");
+    return 1;
+  }
+  let mut file = unsafe { File::open(vx_env_arg(argc - 1), OpenMode::Read) };
+  let buf : Tensor<u8, [4096]> = Tensor<u8, [4096]>::new();
+  let p = buf.as_mut_ptr();
+  let mut w = words();
+  let mut num = numbers();
+  let mut up = Runs<Upper>::new(Upper {});
+  loop {
+    let n = unsafe { file.read(p, 4096) as i64 };
+    if n == 0 {
+      break;
+    }
+    w.feed(p, 0, n);
+    num.feed(p, 0, n);
+    up.feed(p, 0, n);
+  }
+  print!("words ");
+  print!(w.count);
+  print!("\nnumbers ");
+  print!(num.count);
+  print!("\nupper ");
+  print!(up.count);
+  print!("\n");
+  return 0;
+}

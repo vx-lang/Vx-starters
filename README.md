@@ -13,12 +13,12 @@ toolchain. They have two jobs:
 | Project | Shows | Build-system question |
 | --- | --- | --- |
 | [`wordcount`](wordcount) | Files, structs, loops, raw buffers | One package, one binary: how to build, run and test it |
+| [`textkit`](textkit) + [`textstat`](textstat) | Modules, traits, generics | A local library dependency; two packages with the same function name |
 
 Planned, each adding one new question:
 
 | Project | Shows | Build-system question |
 | --- | --- | --- |
-| `textkit` + a tool that uses it | Modules, traits, generics | A local library dependency; two packages with the same function name |
 | `will-it-fit` | `--machine`, capacity and dtype errors | Machine models as build inputs, per target |
 | `tiny-mlp` | Tensors, `matmul`, `grad` | Optional toolchain parts (Enzyme) |
 | `prefill-decode` | `spawn on`, `transfer`, `--verify-seams` | Optional tools (`z3`) in the test step |

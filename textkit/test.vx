@@ -1,0 +1,71 @@
+// Tests for textkit. Returns the number of failed checks.
+//
+//   ./build.sh
+
+import std::string;
+import textkit::runs;
+
+// Copy the string `s` into `p`, and return its length.
+fn fill(p : *mut u8, s : *const i8) -> i64 {
+  let n = unsafe { string_length(s) as i64 };
+  for i in 0..n {
+    unsafe {
+      p[i] = s[i] as u8;
+    }
+  }
+  return n;
+}
+
+fn check(name : *const i8, got : i64, want : i64) -> i32 {
+  if got == want {
+    return 0;
+  }
+  print!("FAIL: ");
+  print!(name);
+  print!(": got ");
+  print!(got);
+  print!(", want ");
+  print!(want);
+  print!("\n");
+  return 1;
+}
+
+fn count_words(p : *mut u8, s : *const i8) -> i64 {
+  let n = fill(p, s);
+  let mut w = words();
+  w.feed(p, 0, n);
+  return w.count;
+}
+
+fn main() -> i32 {
+  let buf : Tensor<u8, [64]> = Tensor<u8, [64]>::new();
+  let p = buf.as_mut_ptr();
+  let mut failed = 0;
+
+  failed += check("no words", count_words(p, ""), 0);
+  failed += check("only space", count_words(p, " \t\n "), 0);
+  failed += check("two words", count_words(p, "ab cd"), 2);
+  failed += check("space around", count_words(p, "  ab\t\tcd\n"), 2);
+
+  // "ab" and "c d" fed one after the other: the word "abc" crosses the two pieces.
+  let n = fill(p, "abc d");
+  let mut w = words();
+  w.feed(p, 0, 2);
+  w.feed(p, 2, n);
+  failed += check("word across pieces", w.count, 2);
+
+  let n2 = fill(p, "a1 22b333.");
+  let mut num = numbers();
+  num.feed(p, 0, n2);
+  failed += check("numbers", num.count, 3);
+
+  let n3 = fill(p, "NASA and CPUs");
+  let mut up = Runs<Upper>::new(Upper {});
+  up.feed(p, 0, n3);
+  failed += check("upper", up.count, 2);
+
+  if failed == 0 {
+    print!("ok\n");
+  }
+  return failed;
+}

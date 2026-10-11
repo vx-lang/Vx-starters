@@ -1,0 +1,43 @@
+// textkit::classes: sets of bytes, as values of types that implement `ByteClass`.
+
+trait ByteClass {
+  fn has(self : &Self, b : u8) -> bool;
+}
+
+// Space, tab, newline, vertical tab, form feed and carriage return, as C's `isspace`.
+struct Space {}
+
+impl ByteClass for Space {
+  fn has(self : &Space, b : u8) -> bool {
+    return b == 32 || (b >= 9 && b <= 13);
+  }
+}
+
+// `0` to `9`.
+struct Digit {}
+
+impl ByteClass for Digit {
+  fn has(self : &Digit, b : u8) -> bool {
+    return b >= 48 && b <= 57;
+  }
+}
+
+// `A` to `Z`.
+struct Upper {}
+
+impl ByteClass for Upper {
+  fn has(self : &Upper, b : u8) -> bool {
+    return b >= 65 && b <= 90;
+  }
+}
+
+// Every byte that `inner` does not have.
+struct Not<C> {
+  inner : C,
+}
+
+impl<C : ByteClass> ByteClass for Not<C> {
+  fn has(self : &Not<C>, b : u8) -> bool {
+    return !self.inner.has(b);
+  }
+}
