@@ -1,0 +1,407 @@
+// tiny-mlp: training math, differentiated by `grad`.
+//
+// 1. Textbook derivatives used in training, checked against `grad`: the sigmoid, tanh, the
+//    logistic loss (its gradient in the logit is p - y) and softmax cross-entropy (its gradient
+//    is softmax - one-hot).
+// 2. A 2-2-1 network for XOR: the gradient of its loss from `grad` against hand-written
+//    backpropagation and against central finite differences.
+// 3. Training that network with Adam, using `grad` for the gradient.
+//
+// It prints what it finds, and returns the number of failed checks.
+//
+//   ./build.sh
+//
+// In Vx v0.0.3, `grad` differentiates a function's first parameter, which must be a scalar, and
+// `vjp` cannot give the gradient for a tensor of weights (vx-lang/Vx#1600). So the gradient is
+// taken one weight at a time: `loss_at(x, m, k)` is the loss with weight k set to x, and `grad`
+// moves x. The weights are a struct of f64 fields, because a pointer after the moved parameter
+// breaks `grad` (vx-lang/Vx#1601). That is one pass per weight, fine for nine weights.
+
+import core::num;
+
+// --- 1. Textbook derivatives -------------------------------------------------------------
+
+fn sigmoid(z : f64) -> f64 {
+  return 1.0f64 / (1.0 + (0.0 - z).exp());
+}
+
+fn tanh_of(z : f64) -> f64 {
+  return z.tanh();
+}
+
+// ln(1 + e^z), without overflow for large z.
+fn softplus(z : f64) -> f64 {
+  if z > 0.0 {
+    return z + (0.0 - z).exp().ln_1p();
+  }
+  return z.exp().ln_1p();
+}
+
+// The logistic (binary cross-entropy) loss of logit z for label y: -ln p if y = 1 and
+// -ln (1 - p) if y = 0, with p = sigmoid(z). It equals softplus(z) - y z.
+fn logistic(z : f64, y : f64) -> f64 {
+  return softplus(z) - y * z;
+}
+
+// Three logits, for softmax.
+struct Logits {
+  z0 : f64,
+  z1 : f64,
+  z2 : f64,
+}
+
+impl Copy for Logits {}
+
+fn logit(l : Logits, i : i32) -> f64 {
+  if i == 0 {
+    return l.z0;
+  }
+  if i == 1 {
+    return l.z1;
+  }
+  return l.z2;
+}
+
+fn with_logit(l : Logits, i : i32, x : f64) -> Logits {
+  let mut out = l;
+  if i == 0 {
+    out.z0 = x;
+  }
+  if i == 1 {
+    out.z1 = x;
+  }
+  if i == 2 {
+    out.z2 = x;
+  }
+  return out;
+}
+
+// Softmax cross-entropy for class c: ln(sum_j e^z_j) - z_c, with the largest logit taken out
+// first so the exponentials cannot overflow.
+fn cross_entropy(l : Logits, c : i32) -> f64 {
+  let top = l.z0.max(l.z1).max(l.z2);
+  let s = (l.z0 - top).exp() + (l.z1 - top).exp() + (l.z2 - top).exp();
+  return top + s.ln() - logit(l, c);
+}
+
+// Cross-entropy with logit i set to x, so that grad in x is the partial derivative in z_i.
+fn cross_entropy_at(x : f64, l : Logits, c : i32, i : i32) -> f64 {
+  return cross_entropy(with_logit(l, i, x), c);
+}
+
+fn softmax(l : Logits, i : i32) -> f64 {
+  let top = l.z0.max(l.z1).max(l.z2);
+  let s = (l.z0 - top).exp() + (l.z1 - top).exp() + (l.z2 - top).exp();
+  return (logit(l, i) - top).exp() / s;
+}
+
+// --- 2 and 3. A 2-2-1 network for XOR --------------------------------------------------------
+
+// h_j = tanh(a_j0 x0 + a_j1 x1 + b_j), out = c0 h0 + c1 h1 + d, p = sigmoid(out).
+struct Net {
+  a00 : f64,
+  a01 : f64,
+  a10 : f64,
+  a11 : f64,
+  b0 : f64,
+  b1 : f64,
+  c0 : f64,
+  c1 : f64,
+  d : f64,
+}
+
+impl Copy for Net {}
+
+fn weight(n : Net, k : i32) -> f64 {
+  if k == 0 {
+    return n.a00;
+  }
+  if k == 1 {
+    return n.a01;
+  }
+  if k == 2 {
+    return n.a10;
+  }
+  if k == 3 {
+    return n.a11;
+  }
+  if k == 4 {
+    return n.b0;
+  }
+  if k == 5 {
+    return n.b1;
+  }
+  if k == 6 {
+    return n.c0;
+  }
+  if k == 7 {
+    return n.c1;
+  }
+  return n.d;
+}
+
+fn with_weight(n : Net, k : i32, x : f64) -> Net {
+  let mut m = n;
+  if k == 0 {
+    m.a00 = x;
+  }
+  if k == 1 {
+    m.a01 = x;
+  }
+  if k == 2 {
+    m.a10 = x;
+  }
+  if k == 3 {
+    m.a11 = x;
+  }
+  if k == 4 {
+    m.b0 = x;
+  }
+  if k == 5 {
+    m.b1 = x;
+  }
+  if k == 6 {
+    m.c0 = x;
+  }
+  if k == 7 {
+    m.c1 = x;
+  }
+  if k == 8 {
+    m.d = x;
+  }
+  return m;
+}
+
+// XOR: input s is (s / 2, s % 2), and the label is 1 when they differ.
+fn input0(s : i32) -> f64 {
+  return (s / 2) as f64;
+}
+
+fn input1(s : i32) -> f64 {
+  return (s % 2) as f64;
+}
+
+fn label(s : i32) -> f64 {
+  if (s / 2) != (s % 2) {
+    return 1.0f64;
+  }
+  return 0.0f64;
+}
+
+// The network's logit for input s.
+fn forward(n : Net, s : i32) -> f64 {
+  let x0 = input0(s);
+  let x1 = input1(s);
+  let h0 = (n.a00 * x0 + n.a01 * x1 + n.b0).tanh();
+  let h1 = (n.a10 * x0 + n.a11 * x1 + n.b1).tanh();
+  return n.c0 * h0 + n.c1 * h1 + n.d;
+}
+
+// The mean logistic loss over the four XOR points.
+fn loss(n : Net) -> f64 {
+  let mut total : f64 = 0.0;
+  for s in 0..4 {
+    total = total + logistic(forward(n, s as i32), label(s as i32));
+  }
+  return total / 4.0;
+}
+
+// The loss with weight k set to x: grad in x is the partial derivative in weight k.
+fn loss_at(x : f64, n : Net, k : i32) -> f64 {
+  return loss(with_weight(n, k, x));
+}
+
+// Weight k's partial derivative, by grad.
+fn by_grad(n : Net, k : i32) -> f64 {
+  return grad(loss_at, weight(n, k), n, k);
+}
+
+// Weight k's partial derivative, by backpropagation written out by hand: the error at the
+// output is p - y, and it flows back through c_j and the tanh derivative 1 - h^2.
+fn by_backprop(n : Net, k : i32) -> f64 {
+  let mut g : f64 = 0.0;
+  for s in 0..4 {
+    let x0 = input0(s as i32);
+    let x1 = input1(s as i32);
+    let h0 = (n.a00 * x0 + n.a01 * x1 + n.b0).tanh();
+    let h1 = (n.a10 * x0 + n.a11 * x1 + n.b1).tanh();
+    let p = sigmoid(n.c0 * h0 + n.c1 * h1 + n.d);
+    let e = (p - label(s as i32)) / 4.0;
+    let e0 = e * n.c0 * (1.0 - h0 * h0);
+    let e1 = e * n.c1 * (1.0 - h1 * h1);
+    if k == 0 {
+      g = g + e0 * x0;
+    }
+    if k == 1 {
+      g = g + e0 * x1;
+    }
+    if k == 2 {
+      g = g + e1 * x0;
+    }
+    if k == 3 {
+      g = g + e1 * x1;
+    }
+    if k == 4 {
+      g = g + e0;
+    }
+    if k == 5 {
+      g = g + e1;
+    }
+    if k == 6 {
+      g = g + e * h0;
+    }
+    if k == 7 {
+      g = g + e * h1;
+    }
+    if k == 8 {
+      g = g + e;
+    }
+  }
+  return g;
+}
+
+// Weight k's partial derivative, by central differences.
+fn by_difference(n : Net, k : i32) -> f64 {
+  let h : f64 = 0.000001;
+  let w = weight(n, k);
+  return (loss(with_weight(n, k, w + h)) - loss(with_weight(n, k, w - h))) / (2.0 * h);
+}
+
+// --- Checks ------------------------------------------------------------------------------
+
+fn check(name : *const i8, got : f64, want : f64, tol : f64) -> i32 {
+  if (got - want).abs() <= tol {
+    return 0;
+  }
+  print!("FAIL: ");
+  print!(name);
+  print!(": got ");
+  print!(got);
+  print!(", want ");
+  print!(want);
+  print!("\n");
+  return 1;
+}
+
+// A deterministic number in [-2, 2], for test points.
+fn point(i : i32) -> f64 {
+  let x = ((i * 7919 + 13) % 4001) as f64;
+  return x / 1000.0 - 2.0;
+}
+
+fn main() -> i32 {
+  let mut failed = 0;
+  let tight : f64 = 0.000000000001;
+
+  // 1. Textbook derivatives, at 20 points each.
+  for i in 0..20 {
+    let z = point(i as i32);
+    let s = sigmoid(z);
+    failed += check("sigmoid' = s (1 - s)", grad(sigmoid, z), s * (1.0 - s), tight);
+    let t = z.tanh();
+    failed += check("tanh' = 1 - tanh^2", grad(tanh_of, z), 1.0 - t * t, tight);
+    let one : f64 = 1.0;
+    let zero : f64 = 0.0;
+    failed += check("logistic loss, y = 1: p - 1", grad(logistic, z, one), s - 1.0, tight);
+    failed += check("logistic loss, y = 0: p", grad(logistic, z, zero), s, tight);
+    let l = Logits { z0: z, z1: point(i as i32 + 50), z2: point(i as i32 + 99) };
+    let c = (i % 3) as i32;
+    for j in 0..3 {
+      let jj = j as i32;
+      let mut onehot : f64 = 0.0;
+      if jj == c {
+        onehot = 1.0;
+      }
+      let g = grad(cross_entropy_at, logit(l, jj), l, c, jj);
+      failed += check("softmax cross-entropy: softmax - one-hot", g, softmax(l, jj) - onehot, tight);
+    }
+  }
+  print!("textbook derivatives: sigmoid, tanh, logistic loss, softmax cross-entropy at 20 points\n");
+
+  // 2. The network's gradient three ways, at its starting weights.
+  let start = Net {
+    a00: 0.5, a01: -0.4, a10: -0.3, a11: 0.6, b0: 0.1, b1: -0.1, c0: 0.7, c1: -0.5, d: 0.05,
+  };
+  let mut worst_backprop : f64 = 0.0;
+  let mut worst_difference : f64 = 0.0;
+  for k in 0..9 {
+    let kk = k as i32;
+    let g = by_grad(start, kk);
+    worst_backprop = worst_backprop.max((g - by_backprop(start, kk)).abs());
+    worst_difference = worst_difference.max((g - by_difference(start, kk)).abs());
+  }
+  print!("gradient of the XOR loss, 9 weights: grad vs backprop differ by at most ");
+  print!(worst_backprop);
+  print!(", vs central differences by at most ");
+  print!(worst_difference);
+  print!("\n");
+  failed += check("grad vs backprop", worst_backprop, 0.0, tight);
+  failed += check("grad vs central differences", worst_difference, 0.0, 0.000000001);
+
+  // 3. Train with Adam.
+  let rate : f64 = 0.05;
+  let beta1 : f64 = 0.9;
+  let beta2 : f64 = 0.999;
+  let eps : f64 = 0.00000001;
+  let mean : Tensor<f64, [9]> = Tensor<f64, [9]>::new();
+  let square : Tensor<f64, [9]> = Tensor<f64, [9]>::new();
+  let m = mean.as_mut_ptr();
+  let v = square.as_mut_ptr();
+  let mut net = start;
+  let mut b1t : f64 = 1.0;
+  let mut b2t : f64 = 1.0;
+  for step in 0..1501 {
+    if step % 300 == 0 {
+      print!("step ");
+      print!(step as i32);
+      print!(": loss ");
+      print!(loss(net));
+      print!("\n");
+    }
+    b1t = b1t * beta1;
+    b2t = b2t * beta2;
+    // All nine partial derivatives first, then the update.
+    let grads : Tensor<f64, [9]> = Tensor<f64, [9]>::new();
+    let g = grads.as_mut_ptr();
+    for k in 0..9 {
+      unsafe { g[k] = by_grad(net, k as i32); }
+    }
+    for k in 0..9 {
+      let gk = unsafe { g[k] };
+      unsafe {
+        m[k] = beta1 * m[k] + (1.0 - beta1) * gk;
+        v[k] = beta2 * v[k] + (1.0 - beta2) * gk * gk;
+      }
+      let mhat = unsafe { m[k] } / (1.0 - b1t);
+      let vhat = unsafe { v[k] } / (1.0 - b2t);
+      let w = weight(net, k as i32) - rate * mhat / (vhat.sqrt() + eps);
+      net = with_weight(net, k as i32, w);
+    }
+  }
+  let final_loss = loss(net);
+  if final_loss > 0.05 {
+    print!("FAIL: the loss after training is ");
+    print!(final_loss);
+    print!(", want at most 0.05\n");
+    failed += 1;
+  }
+  for s in 0..4 {
+    let p = sigmoid(forward(net, s as i32));
+    print!(input0(s as i32) as i32);
+    print!(" xor ");
+    print!(input1(s as i32) as i32);
+    print!(": p = ");
+    print!(p);
+    print!("\n");
+    let mut said : f64 = 0.0;
+    if p > 0.5 {
+      said = 1.0;
+    }
+    failed += check("XOR prediction", said, label(s as i32), 0.0);
+  }
+
+  if failed == 0 {
+    print!("ok\n");
+  }
+  return failed;
+}
