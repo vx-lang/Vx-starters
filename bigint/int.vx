@@ -21,6 +21,14 @@ struct BigInt {
   mag : Vec<u32>,
 }
 
+// A quotient and a remainder, from `div_rem` and `div_mod_floor`. They return this rather than
+// writing through `&mut` arguments, which leaks in v0.0.3 (vx-lang/Vx#1573). Read the fields
+// by reference or `clone()` them: moving one out frees it twice (vx-lang/Vx#1507).
+struct DivRem {
+  q : BigInt,
+  r : BigInt,
+}
+
 impl BigInt {
   fn zero() -> BigInt {
     return BigInt { neg: false, mag: Vec<u32>::new() };
@@ -155,52 +163,46 @@ impl BigInt {
 
   // The quotient rounded toward zero, and the remainder, which has the sign of self.
   // other must not be zero.
-  fn div_rem(self : &BigInt, other : &BigInt, q : &mut BigInt, r : &mut BigInt) -> void {
+  fn div_rem(self : &BigInt, other : &BigInt) -> DivRem {
     if other.is_zero() {
       panic("bigint: division by zero");
     }
-    let mut qm = Vec<u32>::new();
-    let mut rm = Vec<u32>::new();
-    nat_divmod(&self.mag, &other.mag, &mut qm, &mut rm);
-    *q = BigInt::from_parts(self.neg != other.neg, qm);
-    *r = BigInt::from_parts(self.neg, rm);
+    // Copies, not moves: moving a field out of a struct makes v0.0.3 free it twice
+    // (vx-lang/Vx#1507). The copy is linear; the division is quadratic.
+    let d = nat_divmod(&self.mag, &other.mag);
+    return DivRem {
+      q: BigInt::from_parts(self.neg != other.neg, nat_copy(&d.q)),
+      r: BigInt::from_parts(self.neg, nat_copy(&d.r)),
+    };
   }
 
   fn div(self : &BigInt, other : &BigInt) -> BigInt {
-    let mut q = BigInt::zero();
-    let mut r = BigInt::zero();
-    self.div_rem(other, &mut q, &mut r);
-    return q;
+    let d = self.div_rem(other);
+    return d.q.clone();
   }
 
   fn rem(self : &BigInt, other : &BigInt) -> BigInt {
-    let mut q = BigInt::zero();
-    let mut r = BigInt::zero();
-    self.div_rem(other, &mut q, &mut r);
-    return r;
+    let d = self.div_rem(other);
+    return d.r.clone();
   }
 
   // The quotient rounded down, and the remainder, which has the sign of other.
-  fn div_mod_floor(self : &BigInt, other : &BigInt, q : &mut BigInt, r : &mut BigInt) -> void {
-    self.div_rem(other, q, r);
-    if !r.is_zero() && r.neg != other.neg {
-      *q = q.minus(&BigInt::from_i64(1));
-      *r = r.plus(other);
+  fn div_mod_floor(self : &BigInt, other : &BigInt) -> DivRem {
+    let d = self.div_rem(other);
+    if !d.r.is_zero() && d.r.neg != other.neg {
+      return DivRem { q: d.q.minus(&BigInt::from_i64(1)), r: d.r.plus(other) };
     }
+    return d;
   }
 
   fn div_floor(self : &BigInt, other : &BigInt) -> BigInt {
-    let mut q = BigInt::zero();
-    let mut r = BigInt::zero();
-    self.div_mod_floor(other, &mut q, &mut r);
-    return q;
+    let d = self.div_mod_floor(other);
+    return d.q.clone();
   }
 
   fn mod_floor(self : &BigInt, other : &BigInt) -> BigInt {
-    let mut q = BigInt::zero();
-    let mut r = BigInt::zero();
-    self.div_mod_floor(other, &mut q, &mut r);
-    return r;
+    let d = self.div_mod_floor(other);
+    return d.r.clone();
   }
 
   // The quotient rounded up.

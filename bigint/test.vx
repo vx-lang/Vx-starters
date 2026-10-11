@@ -86,17 +86,17 @@ fn check_pair(a : &BigInt, b : &BigInt) -> i32 {
   failed += check_eq("a * b = b * a", &a.times(b), &b.times(a));
   failed += check_eq("a * (b + 1)", &a.times(&b.plus(&one)), &a.times(b).plus(a));
   if !b.is_zero() {
-    let mut q = BigInt::zero();
-    let mut r = BigInt::zero();
-    a.div_rem(b, &mut q, &mut r);
+    let d = a.div_rem(b);
+    let q = d.q.clone();
+    let r = d.r.clone();
     failed += check_eq("q * b + r", &q.times(b).plus(&r), a);
     failed += check("|r| < |b|", r.abs().compare(&b.abs()) < 0);
     failed += check("r has the sign of a", r.is_zero() || r.sign() == a.sign());
     failed += check_eq("a * b / b", &a.times(b).div(b), a);
 
-    let mut fq = BigInt::zero();
-    let mut fr = BigInt::zero();
-    a.div_mod_floor(b, &mut fq, &mut fr);
+    let fd = a.div_mod_floor(b);
+    let fq = fd.q.clone();
+    let fr = fd.r.clone();
     failed += check_eq("floor: q * b + r", &fq.times(b).plus(&fr), a);
     failed += check("floor: r has the sign of b", fr.is_zero() || fr.sign() == b.sign());
     failed += check("floor: |r| < |b|", fr.abs().compare(&b.abs()) < 0);

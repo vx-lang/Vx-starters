@@ -25,13 +25,17 @@ BigInt::from_i64(2).pow(201).isqrt().print();
 
 `+ - * / %` work too, but use up their operands (`a + b` moves `a` and `b`); the methods take
 references. `/` and `%` round toward zero, as on `i64`; `div_floor`, `mod_floor` and `div_ceil`
-round the other ways. There are also `gcd`, `pow`, `isqrt`, `shl`, `shr_floor`, `bits`,
+round the other ways. `div_rem` and `div_mod_floor` return both parts as a `DivRem`; read its
+`q` and `r` by reference or `clone()` them. There are also `gcd`, `pow`, `isqrt`, `shl`, `shr_floor`, `bits`,
 `compare`, `to_i64` and `to_f64`.
 
 The tests check fixed values from Python, then the identities that division, shifts, `gcd`
 and `isqrt` must satisfy on 3000 random numbers. The random digits are often 0, 2^31 and
 2^32 - 1, so long division takes the rare step where it corrects its guess of a quotient
 digit. Breaking that step, or any of several others, makes the tests fail.
+
+`build.sh` also builds `stress.vx`, 400,000 divisions, and fails if it needs more than 20 MB:
+an earlier version leaked about 145 bytes per division (see `FRICTION.md`).
 
 Multiplication is schoolbook and division is quadratic, which is fine for numbers of a few
 thousand digits. See [`../FRICTION.md`](../FRICTION.md) for the compiler bugs this library
