@@ -27,7 +27,9 @@ Format: the project, the toolchain version, what happened, and what we did inste
 - **wordcount, v0.0.3: no way to build an executable.** `vxc` can run a program (`run-jit`) or
   emit an object file (`emit-obj`), but not link one. `build.sh` links the object against
   `$VX_HOME/lib/libvx_std_core.so` with the bundled clang, and sets an rpath so the binary finds
-  it. A user has to know the library's name and where it lives.
+  it. A user has to know the library's name and where it lives. Still so on main 39a12e0a, where
+  `ffi-zlib` links by hand the way `run-jit` does inside, which also names
+  `libmlir_c_runner_utils` and `libmlir_runner_utils` from `$VX_HOME/llvm/lib`.
 - **wordcount, v0.0.3: no project root.** Imports resolve from the toolchain's `stdlib/`, then the
   directory `vxc` runs in. There is no manifest, so `build.sh` `cd`s to the project first.
 
@@ -131,6 +133,11 @@ fail in another.
   ([vx-lang/Vx#1590](https://github.com/vx-lang/Vx/issues/1590)). The checker's intervals have no
   contracts.
 
+- **rational, main 39a12e0a: `rational` and `interval` no longer compile.** Any program that
+  imports `rational::rat` fails with `operation with block successors must terminate its parent
+  block` and `MLIR verification failed`; v0.0.3 runs them. Put into one file, the same code
+  compiles, so it depends on the split into modules
+  ([vx-lang/Vx#1661](https://github.com/vx-lang/Vx/issues/1661)). No workaround yet.
 - **bigint, main 39a12e0a: a loop that swaps values is now a borrow error.** In `gcd`,
   `let r = a.rem(&b); a = b; b = r;` inside a `while` is `E4007: b is moved while it is
   borrowed`; v0.0.3 accepts it, and `r` holds no borrow
