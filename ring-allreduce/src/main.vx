@@ -1,0 +1,282 @@
+// ring-allreduce: the all-reduce of data-parallel training, on a simulated ring of ranks.
+//
+// In data-parallel training every rank (GPU) computes a gradient, and before the optimizer step
+// every rank needs the sum of all of them. Ring all-reduce does that with N ranks in a ring, each
+// sending only to its right neighbour:
+//
+//   1. Reduce-scatter, N - 1 steps. The vector is cut into N chunks. At step s, rank r sends
+//      chunk r - s (mod N) to rank r + 1, which adds it into its own copy. After N - 1 steps rank
+//      r holds the full sum of chunk r + 1.
+//   2. All-gather, N - 1 steps. At step s, rank r sends chunk r + 1 - s (mod N), now a full sum,
+//      to rank r + 1, which overwrites its copy. After N - 1 steps every rank has every sum.
+//
+// Each rank sends 2 (N - 1) / N of the vector in all, whatever N is: the ring is
+// bandwidth-optimal. Sending everything to rank 0 and back makes rank 0 send and receive N - 1
+// whole vectors.
+//
+// Vx has no threads, so the ranks are rows of one array, and a step copies every rank's outgoing
+// chunk into a buffer before any rank adds, as if all sends happen at once. (At each step a rank
+// sends a different chunk from the one it receives, so the order would not matter anyway.)
+//
+// The checks, for N = 2 to 8 and a vector of 1000 numbers (so N often does not divide it):
+//   - with whole numbers, every rank ends with exactly the plain sum;
+//   - with random reals, every rank ends with the same bits, within rounding of the plain sum;
+//   - the ranks send 2 (N - 1) vectors in all, and no rank sends more than 2 (N - 1) chunks of
+//     the largest size.
+// The chunk numbers (r - s mod N and so on) are proved by contracts to be in 0..N.
+//
+// It returns the number of failed checks, and prints "ok" when there are none.
+
+import core::convert;
+import core::num;
+import std::vec;
+
+// --- Ring arithmetic, with contracts -----------------------------------------------------------
+
+// x mod n, for x within one n of 0..n.
+fn wrap(x : i32, n : i32) -> i32
+    requires n > 0 && x >= 0 - n && x < n + n
+    ensures return >= 0 && return < n
+{
+  if x < 0 {
+    return x + n;
+  }
+  if x >= n {
+    return x - n;
+  }
+  return x;
+}
+
+// The rank to the right of r.
+fn right(r : i32, n : i32) -> i32
+    requires n > 0 && r >= 0 && r < n
+    ensures return >= 0 && return < n
+{
+  return wrap(r + 1, n);
+}
+
+// The chunk rank r sends at step s of reduce-scatter.
+fn scatter_chunk(r : i32, s : i32, n : i32) -> i32
+    requires n > 0 && r >= 0 && r < n && s >= 0 && s < n
+    ensures return >= 0 && return < n
+{
+  return wrap(r - s, n);
+}
+
+// The chunk rank r sends at step s of all-gather: the one it finished, then the ones it received.
+fn gather_chunk(r : i32, s : i32, n : i32) -> i32
+    requires n > 0 && r >= 0 && r < n && s >= 0 && s < n
+    ensures return >= 0 && return < n
+{
+  return wrap(r + 1 - s, n);
+}
+
+// --- Chunks ----------------------------------------------------------------------------------
+
+// The first index of chunk c, when len numbers are cut into n chunks and the first len % n
+// chunks get one extra.
+fn chunk_start(c : i32, len : i32, n : i32) -> i32 {
+  let q = len / n;
+  let extra = len % n;
+  return c * q + c.min(extra);
+}
+
+fn chunk_size(c : i32, len : i32, n : i32) -> i32 {
+  return chunk_start(c + 1, len, n) - chunk_start(c, len, n);
+}
+
+// --- The all-reduce --------------------------------------------------------------------------
+
+// What a run sent: the total, and the most any one rank sent, in numbers.
+struct Sent {
+  total : i64,
+  most : i64,
+}
+
+impl Copy for Sent {}
+
+// One step: every rank r sends chunk which(r) to its right neighbour, which adds it in (add) or
+// overwrites with it. `data` holds n rows of len; `sent` counts what each rank sent.
+fn step(data : &mut Vec<f64>, buf : &mut Vec<f64>, sent : &mut Vec<i64>, n : i32, len : i32,
+        s : i32, add : bool) -> void
+    requires n > 0 && s >= 0 && s < n
+{
+  // Everyone's outgoing chunk goes into the buffer first, as if all sends happen at once.
+  for r in 0..n {
+    let mut c = scatter_chunk(r, s, n);
+    if !add {
+      c = gather_chunk(r, s, n);
+    }
+    let lo = chunk_start(c, len, n);
+    let size = chunk_size(c, len, n);
+    for i in 0..size {
+      buf.set(r * len + i, data.get(r * len + lo + i));
+    }
+    sent.set(r, sent.get(r) + i64::from(size));
+  }
+  for r in 0..n {
+    let mut c = scatter_chunk(r, s, n);
+    if !add {
+      c = gather_chunk(r, s, n);
+    }
+    let to = right(r, n);
+    let lo = chunk_start(c, len, n);
+    for i in 0..chunk_size(c, len, n) {
+      let k = to * len + lo + i;
+      if add {
+        data.set(k, data.get(k) + buf.get(r * len + i));
+      } else {
+        data.set(k, buf.get(r * len + i));
+      }
+    }
+  }
+}
+
+// Ring all-reduce of n rows of len numbers, in place.
+fn all_reduce(data : &mut Vec<f64>, n : i32, len : i32) -> Sent {
+  let mut buf = Vec<f64>::with_capacity(n * len);
+  for i in 0..n * len {
+    buf.push(0.0f64);
+  }
+  let mut sent = Vec<i64>::with_capacity(n);
+  for r in 0..n {
+    sent.push(0i64);
+  }
+  for s in 0..n - 1 {
+    step(data, &mut buf, &mut sent, n, len, s, true);
+  }
+  for s in 0..n - 1 {
+    step(data, &mut buf, &mut sent, n, len, s, false);
+  }
+  let mut total : i64 = 0;
+  let mut most : i64 = 0;
+  for r in 0..n {
+    total = total + sent.get(r);
+    most = most.max(sent.get(r));
+  }
+  return Sent { total: total, most: most };
+}
+
+// --- Checking --------------------------------------------------------------------------------
+
+struct Rng {
+  s : u64,
+}
+
+impl Rng {
+  fn next(self : &mut Rng) -> u64 {
+    let mut x = self.s;
+    x = x ^ (x << 13);
+    x = x ^ (x >> 7);
+    x = x ^ (x << 17);
+    self.s = x;
+    return x;
+  }
+}
+
+// n rows of len numbers: whole numbers in -1000..1000, or reals in [-1, 1).
+fn random(rng : &mut Rng, n : i32, len : i32, whole : bool) -> Vec<f64> {
+  let mut out = Vec<f64>::with_capacity(n * len);
+  for i in 0..n * len {
+    let k = (rng.next() % 2000u64) as i32 - 1000;
+    if whole {
+      out.push(f64::from(k));
+    } else {
+      out.push(f64::from(k) / 1000.0f64 + f64::from((rng.next() % 1000u64) as i32) / 1000000.0f64);
+    }
+  }
+  return out;
+}
+
+// The plain sum of the n rows, left to right.
+fn plain_sum(data : &Vec<f64>, n : i32, len : i32) -> Vec<f64> {
+  let mut out = Vec<f64>::with_capacity(len);
+  for i in 0..len {
+    let mut s : f64 = 0.0;
+    for r in 0..n {
+      s = s + data.get(r * len + i);
+    }
+    out.push(s);
+  }
+  return out;
+}
+
+// The largest difference between any rank's row and the sum, and whether all rows are equal.
+fn worst(data : &Vec<f64>, sum : &Vec<f64>, n : i32, len : i32) -> f64 {
+  let mut w : f64 = 0.0;
+  for r in 0..n {
+    for i in 0..len {
+      let e = (data.get(r * len + i) - sum.get(i)).abs();
+      if !(e <= w) {
+        w = e;
+      }
+    }
+  }
+  return w;
+}
+
+fn rows_equal(data : &Vec<f64>, n : i32, len : i32) -> bool {
+  for r in 1..n {
+    for i in 0..len {
+      if data.get(r * len + i) != data.get(i) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+fn main() -> i32 {
+  let mut failed = 0;
+  let len = 1000;
+  let mut rng = Rng { s: 88172645463325252u64 };
+  for n in 2..9 {
+    // Whole numbers: the sum is exact in any order.
+    let mut a = random(&mut rng, n, len, true);
+    let want = plain_sum(&a, n, len);
+    let sent = all_reduce(&mut a, n, len);
+    if worst(&a, &want, n, len) != 0.0f64 {
+      print!("FAIL: whole numbers, ");
+      print!(n);
+      print!(" ranks: a rank does not have the sum\n");
+      failed = failed + 1;
+    }
+    // In all, every step moves the whole vector once: 2 (n - 1) vectors.
+    let longest = i64::from(chunk_size(0, len, n));
+    if sent.total != i64::from(2 * (n - 1) * len) || sent.most > i64::from(2 * (n - 1)) * longest {
+      print!("FAIL: ");
+      print!(n);
+      print!(" ranks sent the wrong amount\n");
+      failed = failed + 1;
+    }
+
+    // Reals: the ring adds in another order, so only within rounding; but every rank must end
+    // with the same bits, since all-gather copies.
+    let mut b = random(&mut rng, n, len, false);
+    let bsum = plain_sum(&b, n, len);
+    all_reduce(&mut b, n, len);
+    let off = worst(&b, &bsum, n, len);
+    if !(off < 0.000000000001f64) || !rows_equal(&b, n, len) {
+      print!("FAIL: reals, ");
+      print!(n);
+      print!(" ranks\n");
+      failed = failed + 1;
+    }
+
+    // 2 (n - 1) / n of a vector per rank, against n - 1 whole vectors through rank 0.
+    print!(n);
+    print!(" ranks: each sends ");
+    print!((sent.total as f64) / f64::from(n * len));
+    print!(" vectors (at most ");
+    print!(sent.most);
+    print!(" numbers); through rank 0 it would send ");
+    print!(n - 1);
+    print!("; reals off by ");
+    print!(off);
+    print!("\n");
+  }
+  if failed == 0 {
+    print!("ok\n");
+  }
+  return failed;
+}
