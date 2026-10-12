@@ -1,0 +1,331 @@
+// ffi-zlib: call the system's zlib from Vx.
+//
+// zlib's functions are declared in an `extern` block and called with pointers into `Vec<u8>`
+// buffers. Vx cannot yet be told to link a C library (vx-lang/Vx#1652), so build.sh compiles
+// this file to an object and links it with `-lz` itself.
+//
+// The checks:
+//   1. Known values: crc32("123456789") is 0xCBF43926 and adler32("Wikipedia") is 0x11E60398.
+//   2. CRC-32 written in Vx, from a 256-entry table, equals zlib's on 200 random buffers, and
+//      zlib's crc32 of two pieces chained equals the crc32 of the whole.
+//   3. compress2 then uncompress gives back the exact bytes, for text and for random bytes, at
+//      levels 0, 1, 6 and 9; repetitive text shrinks to under a tenth.
+//   4. A broken stream is refused: a wrong header byte or a wrong checksum gives Z_DATA_ERROR,
+//      and an output buffer one byte too small gives Z_BUF_ERROR.
+//
+// It returns the number of failed checks, and prints "ok" when there are none.
+
+import core::convert;
+import std::vec;
+
+// From zlib.h. On 64-bit Linux, uLong is 64 bits and uInt 32.
+extern {
+  fn zlibVersion() -> *const i8;
+  fn crc32(crc : u64, buf : *const u8, len : u32) -> u64;
+  fn adler32(adler : u64, buf : *const u8, len : u32) -> u64;
+  fn compressBound(source_len : u64) -> u64;
+  fn compress2(dest : *mut u8, dest_len : *mut u64, source : *const u8, source_len : u64,
+               level : i32) -> i32;
+  fn uncompress(dest : *mut u8, dest_len : *mut u64, source : *const u8, source_len : u64) -> i32;
+}
+
+fn z_ok() -> i32 {
+  return 0;
+}
+
+fn z_data_error() -> i32 {
+  return -3;
+}
+
+fn z_buf_error() -> i32 {
+  return -5;
+}
+
+// --- Safe wrappers ---------------------------------------------------------------------------
+//
+// Each passes a buffer's own pointer and length, so callers cannot get the pair wrong.
+
+fn zlib_crc(crc : u64, v : &Vec<u8>) -> u64 {
+  return unsafe { crc32(crc, v.as_mut_ptr() as *const u8, v.len() as u32) };
+}
+
+fn zlib_adler(v : &Vec<u8>) -> u64 {
+  return unsafe { adler32(1u64, v.as_mut_ptr() as *const u8, v.len() as u32) };
+}
+
+// What compress2 or uncompress answered, and the bytes it wrote.
+struct Out {
+  code : i32,
+  bytes : Vec<u8>,
+}
+
+fn zeros(n : i32) -> Vec<u8> {
+  let mut out = Vec<u8>::with_capacity(n);
+  for i in 0..n {
+    out.push(0u8);
+  }
+  return out;
+}
+
+// Drop bytes from the end until v has length n.
+fn cut_to(v : &mut Vec<u8>, n : i32) -> void {
+  while v.len() > n {
+    v.pop();
+  }
+  return;
+}
+
+fn deflate(src : &Vec<u8>, level : i32) -> Out {
+  let n = u64::from(src.len() as u32);
+  let room = unsafe { compressBound(n) };
+  let mut dest = zeros(room as i32);
+  let mut len = Vec<u64>::new();
+  len.push(room);
+  let code = unsafe {
+    compress2(dest.as_mut_ptr(), len.as_mut_ptr(), src.as_mut_ptr() as *const u8, n, level)
+  };
+  cut_to(&mut dest, len.get(0) as i32);
+  return Out { code: code, bytes: dest };
+}
+
+// Inflate into a buffer of `room` bytes.
+fn inflate(src : &Vec<u8>, room : i32) -> Out {
+  let mut dest = zeros(room);
+  let mut len = Vec<u64>::new();
+  len.push(u64::from(room as u32));
+  let code = unsafe {
+    uncompress(dest.as_mut_ptr(), len.as_mut_ptr(), src.as_mut_ptr() as *const u8,
+               u64::from(src.len() as u32))
+  };
+  cut_to(&mut dest, len.get(0) as i32);
+  return Out { code: code, bytes: dest };
+}
+
+// --- CRC-32 in Vx ----------------------------------------------------------------------------
+
+// The table for the reflected polynomial 0xEDB88320. It is built at run time: the compile-time
+// evaluator cannot run `>>`, `^` or `&` yet (vx-lang/Vx#1653).
+fn crc_table() -> Vec<u32> {
+  let mut t = Vec<u32>::with_capacity(256);
+  for k in 0..256 {
+    let mut c = k as u32;
+    for i in 0..8 {
+      if (c & 1u32) == 1u32 {
+        c = 3988292384u32 ^ (c >> 1);
+      } else {
+        c = c >> 1;
+      }
+    }
+    t.push(c);
+  }
+  return t;
+}
+
+fn vx_crc(t : &Vec<u32>, v : &Vec<u8>) -> u64 {
+  let mut c : u32 = 4294967295;
+  for i in 0..v.len() {
+    let k = (c ^ u32::from(v.get(i))) & 255u32;
+    c = t.get(k as i32) ^ (c >> 8);
+  }
+  return u64::from(c ^ 4294967295u32);
+}
+
+// --- Data ------------------------------------------------------------------------------------
+
+fn bytes_of(s : *const i8) -> Vec<u8> {
+  let mut out = Vec<u8>::new();
+  let mut i : i64 = 0;
+  let mut b = unsafe { s[0] };
+  while b != 0 {
+    out.push(b as u8);
+    i = i + 1;
+    b = unsafe { s[i] };
+  }
+  return out;
+}
+
+struct Rng {
+  s : u64,
+}
+
+impl Rng {
+  fn next(self : &mut Rng) -> u64 {
+    let mut x = self.s;
+    x = x ^ (x << 13);
+    x = x ^ (x >> 7);
+    x = x ^ (x << 17);
+    self.s = x;
+    return x;
+  }
+
+  fn below(self : &mut Rng, n : i32) -> i32 {
+    return (self.next() % u64::from(n as u32)) as i32;
+  }
+}
+
+fn random_bytes(rng : &mut Rng, n : i32) -> Vec<u8> {
+  let mut out = Vec<u8>::with_capacity(n);
+  for i in 0..n {
+    out.push((rng.next() & 255u64) as u8);
+  }
+  return out;
+}
+
+// About 7 KB of text: one paragraph, 40 times, with the copy number in each.
+fn text() -> Vec<u8> {
+  let para = bytes_of("Ring all-reduce cuts the vector into chunks and passes them around the ring; each rank sends two chunks per step, so the bandwidth it needs does not grow with the number of ranks. ");
+  let mut out = Vec<u8>::new();
+  for k in 0..40 {
+    out.push(48u8 + ((k / 10) as u8));
+    out.push(48u8 + ((k % 10) as u8));
+    out.push(32u8);
+    for i in 0..para.len() {
+      out.push(para.get(i));
+    }
+  }
+  return out;
+}
+
+fn same(a : &Vec<u8>, b : &Vec<u8>) -> bool {
+  if a.len() != b.len() {
+    return false;
+  }
+  for i in 0..a.len() {
+    if a.get(i) != b.get(i) {
+      return false;
+    }
+  }
+  return true;
+}
+
+fn copy(v : &Vec<u8>) -> Vec<u8> {
+  let mut out = Vec<u8>::with_capacity(v.len());
+  for i in 0..v.len() {
+    out.push(v.get(i));
+  }
+  return out;
+}
+
+fn main() -> i32 {
+  let mut failed = 0;
+  print!("zlib ");
+  print!(unsafe { zlibVersion() });
+  print!("\n");
+
+  // 1. Known values.
+  let digits = bytes_of("123456789");
+  let wiki = bytes_of("Wikipedia");
+  let c = zlib_crc(0u64, &digits);
+  let a = zlib_adler(&wiki);
+  print!("crc32(\"123456789\") = ");
+  print!(c);
+  print!(", adler32(\"Wikipedia\") = ");
+  print!(a);
+  print!("\n");
+  if c != 3421780262u64 || a != 300286872u64 {
+    print!("FAIL: known checksums\n");
+    failed = failed + 1;
+  }
+
+  // 2. CRC-32 in Vx against zlib, and chaining.
+  let table = crc_table();
+  let mut rng = Rng { s: 88172645463325252u64 };
+  let mut differ = 0;
+  if vx_crc(&table, &digits) != c {
+    differ = differ + 1;
+  }
+  let mut chain_bad = 0;
+  for k in 0..200 {
+    let nv = rng.below(5000);
+    let v = random_bytes(&mut rng, nv);
+    if vx_crc(&table, &v) != zlib_crc(0u64, &v) {
+      differ = differ + 1;
+    }
+    // crc32 of v then w, chained, equals crc32 of v followed by w.
+    let nw = rng.below(300);
+    let w = random_bytes(&mut rng, nw);
+    let mut both = copy(&v);
+    for i in 0..w.len() {
+      both.push(w.get(i));
+    }
+    if zlib_crc(zlib_crc(0u64, &v), &w) != zlib_crc(0u64, &both) {
+      chain_bad = chain_bad + 1;
+    }
+  }
+  print!("CRC-32 in Vx vs zlib, 201 buffers: ");
+  print!(differ);
+  print!(" differ; chained crc32 vs whole: ");
+  print!(chain_bad);
+  print!(" differ\n");
+  if differ > 0 || chain_bad > 0 {
+    print!("FAIL: CRC-32\n");
+    failed = failed + 1;
+  }
+
+  // 3. Round trips.
+  let txt = text();
+  let rnd = random_bytes(&mut rng, 20000);
+  let levels = [0, 1, 6, 9];
+  let mut trips_bad = 0;
+  let mut small : i32 = 0;
+  for k in 0..2 {
+    let mut src = copy(&rnd);
+    if k == 0 {
+      src = copy(&txt);
+      print!("text, ");
+    } else {
+      print!("random bytes, ");
+    }
+    print!(src.len());
+    print!(" bytes, compressed at levels 0 1 6 9:");
+    for l in 0..4 {
+      let packed = deflate(&src, levels[l]);
+      let back = inflate(&packed.bytes, src.len());
+      print!(" ");
+      print!(packed.bytes.len());
+      if packed.code != z_ok() || back.code != z_ok() || !same(&back.bytes, &src) {
+        trips_bad = trips_bad + 1;
+      }
+      if k == 0 && l == 3 {
+        small = packed.bytes.len();
+      }
+    }
+    print!("\n");
+  }
+  if trips_bad > 0 {
+    print!("FAIL: a round trip did not give back the same bytes\n");
+    failed = failed + 1;
+  }
+  if !(small * 10 < txt.len()) {
+    print!("FAIL: repetitive text should shrink to under a tenth\n");
+    failed = failed + 1;
+  }
+
+  // 4. Broken streams. The first byte of a zlib stream names the method and window, and the
+  //    last four are the Adler-32 of the data.
+  let good = deflate(&txt, 6);
+  let mut head = copy(&good.bytes);
+  head.set(0, head.get(0) ^ 1u8);
+  let mut tail = copy(&good.bytes);
+  let last = tail.len() - 1;
+  tail.set(last, tail.get(last) ^ 1u8);
+  let h = inflate(&head, txt.len()).code;
+  let t = inflate(&tail, txt.len()).code;
+  let s = inflate(&good.bytes, txt.len() - 1).code;
+  print!("broken header: ");
+  print!(h);
+  print!(", broken checksum: ");
+  print!(t);
+  print!(", output one byte short: ");
+  print!(s);
+  print!("\n");
+  if h != z_data_error() || t != z_data_error() || s != z_buf_error() {
+    print!("FAIL: broken streams should give Z_DATA_ERROR (-3) and Z_BUF_ERROR (-5)\n");
+    failed = failed + 1;
+  }
+
+  if failed == 0 {
+    print!("ok\n");
+  }
+  return failed;
+}

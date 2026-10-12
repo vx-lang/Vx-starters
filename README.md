@@ -29,6 +29,12 @@ toolchain. They have two jobs:
 | [`bf16`](bf16) | bf16 and fp16 rounding as bit operations, checked against Vx's own types; a stalled bf16 sum, loss scaling, dynamic loss scaling | Checking against the toolchain's own number types, whose conversions depend on the CPU |
 | [`sampler`](sampler) | Greedy, temperature, top-k, top-p and min-p sampling, with masked tokens; 200,000 draws per setting checked by chi-square | Statistical tests in the test step: a seeded RNG from `std::rand` and a pass threshold |
 | [`rope`](rope) | Rotary position embeddings: rotation keeps length, attention sees only relative positions; constants computed by `comptime` | Values worked out by the compiler, and checked against the run-time library |
+| [`lr-schedule`](lr-schedule) | Warmup and cosine decay, clipping by global norm, gradient accumulation checked with `grad`; one bad label that clipping survives | The same optional toolchain part (Enzyme) in a second project |
+| [`data-loader`](data-loader) | Per-epoch shuffling, sharding across ranks, exact resume, the same global batches on any number of ranks | A program whose output must not change between runs or machines |
+| [`spec-decode`](spec-decode) | Speculative decoding: accept/reject keeps the target model's distribution exactly; tokens per pass match the formula | Randomized tests with fixed seeds and statistical limits |
+| [`moe-router`](moe-router) | Mixture-of-experts top-k routing with expert capacity, dropped tokens, the balance loss, and dispatch/combine | One more project of the same shape: what a template or `vx new` would generate |
+| [`layernorm`](layernorm) | Variance in f32 (one pass fails, two-pass and Welford do not), merging statistics across shards, LayerNorm's backward against `grad` | Numerical tolerances as part of a test's contract |
+| [`ffi-zlib`](ffi-zlib) | Calling a C library: zlib's crc32, adler32, compress2 and uncompress through an `extern` block, checked against known values and a CRC-32 written in Vx | Linking native libraries: `vxc` cannot add `-lz`, so the build compiles to an object and links it by hand |
 
 The three number libraries are for checking the computer-assisted parts of proofs, such as those
 in [openai/math](https://github.com/openai/math), where the checkers need integers of any size,
@@ -41,7 +47,6 @@ Planned, each adding one new question:
 | --- | --- | --- |
 | `will-it-fit` | `--machine`, capacity and dtype errors | Machine models as build inputs, per target |
 | `prefill-decode` | `spawn on`, `transfer`, `--verify-seams` | Optional tools (`z3`) in the test step |
-| `ffi-zlib` | Calling a C library | Linking native libraries; build scripts |
 
 ## Getting the toolchain
 
