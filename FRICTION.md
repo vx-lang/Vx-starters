@@ -280,6 +280,9 @@ fail in another.
   u8` is `Unsupported cast: ... Pointer(Scalar(I8)) to Pointer(Scalar(U8))`; the bytes are
   copied into a `Vec<u8>` first.
 
+- **moe-router, main 39a12e0a: no nested array literals.** `[[2.0f64, 1.0f64], [..]]` is `an
+  array literal's elements must be scalars`. The rows are written out flat.
+
 ## Standard library
 
 - **ring-allreduce, main 39a12e0a: no threads, so ranks are simulated.** `core::sync::atomic`

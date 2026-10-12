@@ -1,0 +1,378 @@
+// moe-router: routing tokens to experts in a mixture-of-experts layer.
+//
+// Each token's router gives a score per expert; softmax turns them into probabilities. The token
+// goes to its top k experts (k = 2 here), with weights that are those probabilities
+// renormalized to sum to 1. Each expert takes at most `capacity` tokens per batch,
+// capacity = ceil(capacity_factor * tokens * k / experts); assignments past that are dropped,
+// in token order (GShard, Switch Transformer). The layer's output for a token is the weighted
+// sum of what its kept experts return.
+//
+// Training adds a load-balancing loss so the router spreads tokens: experts * sum_i f_i * P_i,
+// where f_i is the share of assignments expert i got and P_i its mean router probability. It is
+// 1 when routing is uniform and grows when it is lopsided.
+//
+// The checks:
+//   1. A batch worked out by hand (in the README): which assignments are kept and dropped, and
+//      the combine weights.
+//   2. A random batch of 512 tokens over 8 experts: no expert over capacity, kept + dropped
+//      equals tokens * k, each token's weights sum to 1 when nothing is dropped, and the
+//      dispatch counts are what an all-to-all would send.
+//   3. The balance loss is 1 for uniform routing and larger for skewed routing; raising the
+//      capacity factor lowers the drop rate.
+//   4. With every expert the identity times a constant c_i, the layer's output for a token is
+//      x times sum of weight_i c_i, computed through dispatch and combine.
+//
+// It returns the number of failed checks, and prints "ok" when there are none.
+
+import core::convert;
+import core::num;
+import std::vec;
+
+struct Rng {
+  s : u64,
+}
+
+impl Rng {
+  fn next(self : &mut Rng) -> u64 {
+    let mut x = self.s;
+    x = x ^ (x << 13);
+    x = x ^ (x >> 7);
+    x = x ^ (x << 17);
+    self.s = x;
+    return x;
+  }
+
+  fn unit(self : &mut Rng) -> f64 {
+    return ((self.next() >> 11) as f64) / 9007199254740992.0f64;
+  }
+}
+
+// Softmax of row t of `scores` (tokens x experts), into `out` (same shape).
+fn softmax_row(scores : &Vec<f64>, out : &mut Vec<f64>, t : i32, e : i32) -> void {
+  let mut m = scores.get(t * e);
+  for i in 1..e {
+    m = m.max(scores.get(t * e + i));
+  }
+  let mut sum : f64 = 0.0;
+  for i in 0..e {
+    let x = (scores.get(t * e + i) - m).exp();
+    out.set(t * e + i, x);
+    sum = sum + x;
+  }
+  for i in 0..e {
+    out.set(t * e + i, out.get(t * e + i) / sum);
+  }
+  return;
+}
+
+// The result of routing: for token t and choice j (0 .. k), the expert, its weight, and whether
+// the assignment was kept. Plus each expert's load.
+struct Route {
+  tokens : i32,
+  experts : i32,
+  k : i32,
+  capacity : i32,
+  expert : Vec<i32>,
+  weight : Vec<f64>,
+  kept : Vec<i32>,
+  load : Vec<i32>,
+  probs : Vec<f64>,
+}
+
+fn capacity_for(tokens : i32, experts : i32, k : i32, factor : f64) -> i32 {
+  let c = factor * f64::from(tokens * k) / f64::from(experts);
+  let f = c.floor();
+  if c > f {
+    return (f as i32) + 1;
+  }
+  return f as i32;
+}
+
+fn route(scores : &Vec<f64>, tokens : i32, experts : i32, k : i32, factor : f64) -> Route {
+  let mut probs = Vec<f64>::with_capacity(tokens * experts);
+  for i in 0..tokens * experts {
+    probs.push(0.0f64);
+  }
+  for t in 0..tokens {
+    softmax_row(scores, &mut probs, t, experts);
+  }
+  let mut r = Route {
+    tokens: tokens,
+    experts: experts,
+    k: k,
+    capacity: capacity_for(tokens, experts, k, factor),
+    expert: Vec<i32>::new(),
+    weight: Vec<f64>::new(),
+    kept: Vec<i32>::new(),
+    load: Vec<i32>::new(),
+    probs: probs,
+  };
+  for i in 0..experts {
+    r.load.push(0);
+  }
+  // Top k per token, largest first; a tie goes to the lower expert number.
+  for t in 0..tokens {
+    let mut total : f64 = 0.0;
+    let first = r.expert.len();
+    for j in 0..k {
+      let mut best = -1;
+      for i in 0..experts {
+        let mut taken = false;
+        for c in first..r.expert.len() {
+          if r.expert.get(c) == i {
+            taken = true;
+          }
+        }
+        if !taken && (best < 0 || r.probs.get(t * experts + i) > r.probs.get(t * experts + best)) {
+          best = i;
+        }
+      }
+      r.expert.push(best);
+      r.weight.push(r.probs.get(t * experts + best));
+      total = total + r.probs.get(t * experts + best);
+    }
+    for c in first..r.expert.len() {
+      r.weight.set(c, r.weight.get(c) / total);
+    }
+  }
+  // Capacity, in token order: all of token 0's choices, then token 1's, and so on.
+  for c in 0..r.expert.len() {
+    let x = r.expert.get(c);
+    if r.load.get(x) < r.capacity {
+      r.load.set(x, r.load.get(x) + 1);
+      r.kept.push(1);
+    } else {
+      r.kept.push(0);
+    }
+  }
+  return r;
+}
+
+fn dropped(r : &Route) -> i32 {
+  let mut d = 0;
+  for c in 0..r.kept.len() {
+    if r.kept.get(c) == 0 {
+      d = d + 1;
+    }
+  }
+  return d;
+}
+
+// experts * sum_i f_i P_i, with f_i over all assignments (kept or not) as in Switch.
+fn balance_loss(r : &Route) -> f64 {
+  let mut loss : f64 = 0.0;
+  for i in 0..r.experts {
+    let mut count = 0;
+    for c in 0..r.expert.len() {
+      if r.expert.get(c) == i {
+        count = count + 1;
+      }
+    }
+    let f = f64::from(count) / f64::from(r.tokens * r.k);
+    let mut p : f64 = 0.0;
+    for t in 0..r.tokens {
+      p = p + r.probs.get(t * r.experts + i);
+    }
+    p = p / f64::from(r.tokens);
+    loss = loss + f * p;
+  }
+  return f64::from(r.experts) * loss;
+}
+
+fn main() -> i32 {
+  let mut failed = 0;
+
+  // 1. By hand: 4 tokens, 3 experts, k = 2, capacity factor 1, so capacity ceil(4 * 2 / 3) = 3.
+  //    The scores make every token prefer expert 0, then expert 1 for tokens 0..2 and expert 2
+  //    for token 3. Expert 0 fills after tokens 0, 1, 2; token 3's first choice is dropped.
+  let mut s = Vec<f64>::new();
+  // Row by row; nested array literals are not supported yet.
+  let rows = [2.0f64, 1.0f64, 0.0f64, 2.0f64, 1.0f64, 0.0f64, 2.0f64, 1.0f64, 0.0f64, 2.0f64,
+              0.0f64, 1.0f64];
+  for i in 0..12 {
+    s.push(rows[i]);
+  }
+  let h = route(&s, 4, 3, 2, 1.0f64);
+  // exp(2) / (exp(2) + exp(1)) = 1 / (1 + e^-1).
+  let w0 = 1.0f64 / (1.0f64 + (-1.0f64).exp());
+  let mut hand = h.capacity == 3 && dropped(&h) == 1 && h.kept.get(6) == 0 && h.expert.get(6) == 0 &&
+                 h.expert.get(7) == 2 && h.load.get(0) == 3 && h.load.get(1) == 3 && h.load.get(2) == 1;
+  for c in 0..8 {
+    let mut want = w0;
+    if c % 2 == 1 {
+      want = 1.0f64 - w0;
+    }
+    if !((h.weight.get(c) - want).abs() < 0.000000000000001f64) {
+      hand = false;
+    }
+  }
+  print!("by hand: capacity ");
+  print!(h.capacity);
+  print!(", loads ");
+  print!(h.load.get(0));
+  print!(" ");
+  print!(h.load.get(1));
+  print!(" ");
+  print!(h.load.get(2));
+  print!(", ");
+  print!(dropped(&h));
+  print!(" dropped (token 3's choice of expert 0), weights ");
+  print!(h.weight.get(0));
+  print!(" and ");
+  print!(h.weight.get(1));
+  print!("\n");
+  if !hand {
+    print!("FAIL: the batch worked by hand\n");
+    failed = failed + 1;
+  }
+
+  // 2. 512 random tokens over 8 experts, router scores in [-2, 2].
+  let mut rng = Rng { s: 2463534242u64 };
+  let n = 512;
+  let e = 8;
+  let mut scores = Vec<f64>::new();
+  for i in 0..n * e {
+    scores.push(4.0f64 * rng.unit() - 2.0f64);
+  }
+  let r = route(&scores, n, e, 2, 1.0f64);
+  let mut sound = true;
+  let mut kept = 0;
+  for i in 0..e {
+    if r.load.get(i) > r.capacity {
+      sound = false;
+    }
+    kept = kept + r.load.get(i);
+  }
+  if kept + dropped(&r) != n * 2 {
+    sound = false;
+  }
+  for t in 0..n {
+    let a = r.weight.get(2 * t);
+    let b = r.weight.get(2 * t + 1);
+    if !((a + b - 1.0f64).abs() < 0.000000000000001f64) || a < b ||
+       r.expert.get(2 * t) == r.expert.get(2 * t + 1) {
+      sound = false;
+    }
+  }
+  print!("512 tokens, 8 experts, top 2, capacity factor 1: capacity ");
+  print!(r.capacity);
+  print!(", ");
+  print!(dropped(&r));
+  print!(" of 1024 assignments dropped, balance loss ");
+  print!(balance_loss(&r));
+  print!("\n");
+  if !sound {
+    print!("FAIL: routing breaks capacity, loses assignments, or has bad weights\n");
+    failed = failed + 1;
+  }
+
+  // 3. The balance loss: uniform scores give 1 (every P_i = 1/8; ties pick experts 0 and 1,
+  //    so f is lopsided, but P is flat). Scores that favour expert 0 give more than random ones.
+  let mut flat = Vec<f64>::new();
+  let mut skew = Vec<f64>::new();
+  for t in 0..n {
+    for i in 0..e {
+      flat.push(0.0f64);
+      if i == 0 {
+        skew.push(4.0f64 * rng.unit());
+      } else {
+        skew.push(4.0f64 * rng.unit() - 2.0f64);
+      }
+    }
+  }
+  let lf = balance_loss(&route(&flat, n, e, 2, 1.25f64));
+  let ls = balance_loss(&route(&skew, n, e, 2, 1.25f64));
+  let lr = balance_loss(&r);
+  print!("balance loss: flat router ");
+  print!(lf);
+  print!(", random ");
+  print!(lr);
+  print!(", favouring one expert ");
+  print!(ls);
+  print!("\n");
+  if !((lf - 1.0f64).abs() < 0.000000000001f64) || !(ls > lr) || !(lr >= 1.0f64) {
+    print!("FAIL: the balance loss\n");
+    failed = failed + 1;
+  }
+  let mut last = n * 2 + 1;
+  let mut falling = true;
+  let factors = [0.5f64, 1.0f64, 1.25f64, 2.0f64, 8.0f64];
+  print!("dropped by capacity factor:");
+  for f in 0..5 {
+    let d = dropped(&route(&skew, n, e, 2, factors[f]));
+    print!(" ");
+    print!(d);
+    if d > last {
+      falling = false;
+    }
+    last = d;
+  }
+  print!(" (factors 0.5 1 1.25 2 8)\n");
+  if !falling || last != 0 {
+    print!("FAIL: more capacity should drop fewer, and enough capacity none\n");
+    failed = failed + 1;
+  }
+
+  // 4. Dispatch and combine with expert i = multiply by (i + 1). Each token's 4 features are
+  //    sent to its kept experts, multiplied there, and summed back with the weights.
+  let d = 4;
+  let mut x = Vec<f64>::new();
+  for i in 0..n * d {
+    x.push(rng.unit());
+  }
+  // Dispatch: each expert's input rows, in the order they arrive.
+  let mut inbox = Vec<f64>::new();
+  let mut from = Vec<i32>::new();
+  let mut at = Vec<i32>::new();
+  for i in 0..e {
+    for c in 0..r.expert.len() {
+      if r.kept.get(c) == 1 && r.expert.get(c) == i {
+        for j in 0..d {
+          inbox.push(x.get((c / 2) * d + j));
+        }
+        from.push(c);
+        at.push(i);
+      }
+    }
+  }
+  // The experts run, then combine.
+  let mut y = Vec<f64>::new();
+  for i in 0..n * d {
+    y.push(0.0f64);
+  }
+  for row in 0..from.len() {
+    let c = from.get(row);
+    let scale = f64::from(at.get(row) + 1);
+    for j in 0..d {
+      let t = c / 2;
+      y.set(t * d + j, y.get(t * d + j) + r.weight.get(c) * scale * inbox.get(row * d + j));
+    }
+  }
+  let mut worst : f64 = 0.0;
+  for t in 0..n {
+    let mut factor : f64 = 0.0;
+    for j in 0..2 {
+      let c = 2 * t + j;
+      if r.kept.get(c) == 1 {
+        factor = factor + r.weight.get(c) * f64::from(r.expert.get(c) + 1);
+      }
+    }
+    for j in 0..d {
+      worst = worst.max((y.get(t * d + j) - factor * x.get(t * d + j)).abs());
+    }
+  }
+  print!("dispatch, experts, combine: ");
+  print!(from.len());
+  print!(" rows sent, largest error ");
+  print!(worst);
+  print!("\n");
+  if !(worst < 0.000000000001f64) || from.len() != kept {
+    print!("FAIL: dispatch and combine\n");
+    failed = failed + 1;
+  }
+
+  if failed == 0 {
+    print!("ok\n");
+  }
+  return failed;
+}
