@@ -1,0 +1,309 @@
+// reshard: split a weight matrix for tensor parallelism, and change the number of shards.
+//
+// With tensor parallelism, each weight matrix is cut into k shards, one per rank: along its
+// columns for a column-parallel layer (Megatron's ColumnParallelLinear, as in the first matrix of
+// an MLP) or along its rows for a row-parallel one (RowParallelLinear, the second). When n rows
+// do not divide by k, the first n % k shards get one more, as torch.tensor_split does.
+//
+// A checkpoint saved with k1 shards and loaded with k2 has to be resharded. Gathering the whole
+// matrix first needs all of it in one place; resharding directly copies each overlap of an old
+// shard and a new one, piece by piece.
+//
+// Each rank's shard lives in its own buffer, rows by columns, as it would in its own memory.
+//
+// The checks, for a 37 x 23 matrix, both directions, and every k, k1, k2 from 1 to 8:
+//   - gathering the split gives back the matrix exactly;
+//   - resharding directly from k1 to k2 gives exactly the k2 split;
+//   - every slot of a rank's buffer outside its shard is untouched.
+// Contracts prove that an overlap of two ranges lies inside both, and that an index inside a
+// range is a valid position within it.
+//
+// It returns the number of failed checks, and prints "ok" when there are none.
+
+import core::convert;
+import core::num;
+import std::vec;
+
+// --- Ranges, with contracts --------------------------------------------------------------------
+
+// The start of the overlap of [a, ..) and [b, ..).
+fn later(a : i32, b : i32) -> i32
+    ensures return >= a && return >= b && (return == a || return == b)
+{
+  if a > b {
+    return a;
+  }
+  return b;
+}
+
+// The end of the overlap of [.., a) and [.., b).
+fn earlier(a : i32, b : i32) -> i32
+    ensures return <= a && return <= b && (return == a || return == b)
+{
+  if a < b {
+    return a;
+  }
+  return b;
+}
+
+// Index i of the whole as a position within the range [lo, hi).
+fn local(i : i32, lo : i32, hi : i32) -> i32
+    requires lo <= i && i < hi
+    ensures return >= 0 && return < hi - lo
+{
+  return i - lo;
+}
+
+// --- Splitting -------------------------------------------------------------------------------
+
+// Where shard p of n numbers split k ways starts; the first n % k shards get one extra.
+fn start(p : i32, n : i32, k : i32) -> i32 {
+  let q = n / k;
+  return p * q + p.min(n % k);
+}
+
+// A layout: `rows` x `cols` split `k` ways along rows (dim 0) or columns (dim 1). Rank p's
+// shard is a block of the matrix, stored rows by columns in its own buffer of `cap` numbers.
+struct Layout {
+  rows : i32,
+  cols : i32,
+  dim : i32,
+  k : i32,
+  cap : i32,
+}
+
+impl Copy for Layout {}
+
+fn layout(rows : i32, cols : i32, dim : i32, k : i32) -> Layout {
+  // The first shard is the largest.
+  let mut cap = (start(1, rows, k) - start(0, rows, k)) * cols;
+  if dim == 1 {
+    cap = rows * (start(1, cols, k) - start(0, cols, k));
+  }
+  return Layout { rows: rows, cols: cols, dim: dim, k: k, cap: cap };
+}
+
+// The length of the split dimension, and the first and last+1 index of shard p along it.
+fn extent(l : Layout) -> i32 {
+  if l.dim == 0 {
+    return l.rows;
+  }
+  return l.cols;
+}
+
+fn lo(l : Layout, p : i32) -> i32 {
+  return start(p, extent(l), l.k);
+}
+
+fn hi(l : Layout, p : i32) -> i32 {
+  return start(p + 1, extent(l), l.k);
+}
+
+// Where the number at (i, j) of the matrix sits, given that it is in shard p.
+fn place(l : Layout, p : i32, i : i32, j : i32) -> i32 {
+  let a = lo(l, p);
+  let b = hi(l, p);
+  if l.dim == 0 {
+    if i < a || i >= b {
+      panic("reshard: row outside the shard");
+    }
+    return p * l.cap + local(i, a, b) * l.cols + j;
+  }
+  if j < a || j >= b {
+    panic("reshard: column outside the shard");
+  }
+  return p * l.cap + i * (b - a) + local(j, a, b);
+}
+
+// The shard that holds index x of the split dimension.
+fn owner(l : Layout, x : i32) -> i32 {
+  let mut p = 0;
+  while hi(l, p) <= x {
+    p = p + 1;
+  }
+  return p;
+}
+
+// Empty buffers for every rank. -1 marks a slot no shard uses.
+fn buffers(l : Layout) -> Vec<f64> {
+  let mut out = Vec<f64>::with_capacity(l.k * l.cap);
+  for i in 0..l.k * l.cap {
+    out.push(-1.0f64);
+  }
+  return out;
+}
+
+fn split(w : &Vec<f64>, l : Layout) -> Vec<f64> {
+  let mut out = buffers(l);
+  for i in 0..l.rows {
+    for j in 0..l.cols {
+      let mut x = i;
+      if l.dim == 1 {
+        x = j;
+      }
+      out.set(place(l, owner(l, x), i, j), w.get(i * l.cols + j));
+    }
+  }
+  return out;
+}
+
+fn gather(s : &Vec<f64>, l : Layout) -> Vec<f64> {
+  let mut out = Vec<f64>::with_capacity(l.rows * l.cols);
+  for i in 0..l.rows {
+    for j in 0..l.cols {
+      let mut x = i;
+      if l.dim == 1 {
+        x = j;
+      }
+      out.push(s.get(place(l, owner(l, x), i, j)));
+    }
+  }
+  return out;
+}
+
+// What a direct reshard did: pieces copied, and numbers that changed rank.
+struct Moves {
+  pieces : i32,
+  moved : i32,
+}
+
+impl Copy for Moves {}
+
+// Reshard from layout a to layout b (same matrix and dim) without gathering: for each pair of an
+// old shard p and a new shard q whose ranges overlap, copy the overlap.
+fn reshard(s : &Vec<f64>, a : Layout, b : Layout, out : &mut Vec<f64>) -> Moves {
+  let mut pieces = 0;
+  let mut moved = 0;
+  for q in 0..b.k {
+    for p in 0..a.k {
+      let from = later(lo(a, p), lo(b, q));
+      let to = earlier(hi(a, p), hi(b, q));
+      if from < to {
+        pieces = pieces + 1;
+        for x in from..to {
+          // x runs along the split dimension, y across it.
+          let mut span = a.cols;
+          if a.dim == 1 {
+            span = a.rows;
+          }
+          for y in 0..span {
+            let mut i = x;
+            let mut j = y;
+            if a.dim == 1 {
+              i = y;
+              j = x;
+            }
+            out.set(place(b, q, i, j), s.get(place(a, p, i, j)));
+            if p != q {
+              moved = moved + 1;
+            }
+          }
+        }
+      }
+    }
+  }
+  return Moves { pieces: pieces, moved: moved };
+}
+
+fn same(a : &Vec<f64>, b : &Vec<f64>) -> bool {
+  if a.len() != b.len() {
+    return false;
+  }
+  for i in 0..a.len() {
+    if a.get(i) != b.get(i) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Slots outside the shards still hold -1, and the ones inside do not.
+fn clean(s : &Vec<f64>, l : Layout) -> bool {
+  for p in 0..l.k {
+    let mut used = (hi(l, p) - lo(l, p)) * l.cols;
+    if l.dim == 1 {
+      used = l.rows * (hi(l, p) - lo(l, p));
+    }
+    for t in 0..l.cap {
+      let v = s.get(p * l.cap + t);
+      if (t < used) != (v >= 0.0f64) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+fn main() -> i32 {
+  let mut failed = 0;
+  let rows = 37;
+  let cols = 23;
+  // Every number distinct, so a misplaced one is seen.
+  let mut w = Vec<f64>::with_capacity(rows * cols);
+  for i in 0..rows * cols {
+    w.push(f64::from(i));
+  }
+
+  for dim in 0..2 {
+    let mut gathered = 0;
+    let mut direct = 0;
+    for k1 in 1..9 {
+      let a = layout(rows, cols, dim, k1);
+      let s = split(&w, a);
+      if !same(&gather(&s, a), &w) || !clean(&s, a) {
+        print!("FAIL: a split does not gather back to the matrix, or writes a spare slot, k = ");
+        print!(k1);
+        print!("\n");
+        failed = failed + 1;
+      }
+      gathered = gathered + 1;
+      for k2 in 1..9 {
+        let b = layout(rows, cols, dim, k2);
+        let mut out = buffers(b);
+        let m = reshard(&s, a, b, &mut out);
+        if !same(&out, &split(&w, b)) {
+          print!("FAIL: resharding ");
+          print!(k1);
+          print!(" -> ");
+          print!(k2);
+          print!(" differs from splitting into ");
+          print!(k2);
+          print!("\n");
+          failed = failed + 1;
+        }
+        direct = direct + 1;
+        if (k1 == 4 && k2 == 8) || (k1 == 8 && k2 == 4) || (k1 == 3 && k2 == 5) {
+          if dim == 0 {
+            print!("rows");
+          } else {
+            print!("columns");
+          }
+          print!(", ");
+          print!(k1);
+          print!(" -> ");
+          print!(k2);
+          print!(" shards: ");
+          print!(m.pieces);
+          print!(" pieces, ");
+          print!(m.moved);
+          print!(" of ");
+          print!(rows * cols);
+          print!(" numbers change rank\n");
+        }
+      }
+    }
+    if dim == 0 {
+      print!("split along rows (row-parallel): ");
+    } else {
+      print!("split along columns (column-parallel): ");
+    }
+    print!(gathered);
+    print!(" splits gathered, ");
+    print!(direct);
+    print!(" direct reshards checked\n");
+  }
+  if failed == 0 {
+    print!("ok\n");
+  }
+  return failed;
+}
