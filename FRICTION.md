@@ -283,6 +283,12 @@ fail in another.
 - **moe-router, main 39a12e0a: no nested array literals.** `[[2.0f64, 1.0f64], [..]]` is `an
   array literal's elements must be scalars`. The rows are written out flat.
 
+- **layernorm, main 39a12e0a: a `for` variable passed straight to `grad` breaks Enzyme.** On the
+  older code generator, which every `grad` with a struct argument uses, it arrives as `i64` for
+  an `i32` parameter: `Cannot cast __enzyme_autodiff primal argument 3`
+  ([vx-lang/Vx#1656](https://github.com/vx-lang/Vx/issues/1656)). Calling `grad` from a small
+  function with an `i32` parameter works.
+
 ## Standard library
 
 - **ring-allreduce, main 39a12e0a: no threads, so ranks are simulated.** `core::sync::atomic`
