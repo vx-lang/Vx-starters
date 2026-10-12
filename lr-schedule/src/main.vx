@@ -1,0 +1,349 @@
+// lr-schedule: the parts of a training loop around the gradient, checked.
+//
+//   1. The learning-rate schedule most LLMs train with: a linear warmup, then cosine decay to a
+//      floor.
+//   2. Clipping the gradient by its global norm.
+//   3. Gradient accumulation: the mean of the gradients of 4 micro-batches of 8 is the gradient
+//      of the batch of 32. Gradients come from `grad`, and are also checked against the formula.
+//   4. Why clipping is there: one corrupted label (y = 1000) in the data. Training with clipping
+//      ends near the noise floor; without it, the loss stays thousands of times higher.
+//
+// The model is linear regression, y = w0 x0 + w1 x1 + w2 x2 + b, with a mean squared error. The
+// data comes from sines of the sample number, so that nothing in the differentiated code is
+// integer arithmetic (Enzyme stops on that, see ../hellinger).
+//
+// It returns the number of failed checks, and prints "ok" when there are none.
+//
+//   ./build.sh
+
+import core::convert;
+import core::num;
+
+// --- 1. The schedule -------------------------------------------------------------------------
+
+struct Schedule {
+  peak : f64,
+  floor : f64,
+  warmup : i32,
+  total : i32,
+}
+
+impl Copy for Schedule {}
+
+fn pi() -> f64 {
+  return 3.141592653589793f64;
+}
+
+// The rate for step t (0-based): peak (t + 1) / warmup during warmup, then
+// floor + (peak - floor) (1 + cos(pi p)) / 2, where p goes from 0 to 1 over the remaining steps.
+fn rate(s : Schedule, t : i32) -> f64 {
+  if t < s.warmup {
+    return s.peak * f64::from(t + 1) / f64::from(s.warmup);
+  }
+  let p = f64::from(t - s.warmup) / f64::from(s.total - s.warmup);
+  return s.floor + (s.peak - s.floor) * (1.0f64 + (pi() * p).cos()) / 2.0f64;
+}
+
+// --- The model and its data ------------------------------------------------------------------
+
+struct W {
+  w0 : f64,
+  w1 : f64,
+  w2 : f64,
+  b : f64,
+}
+
+impl Copy for W {}
+
+fn weight(w : W, k : i32) -> f64 {
+  if k == 0 {
+    return w.w0;
+  }
+  if k == 1 {
+    return w.w1;
+  }
+  if k == 2 {
+    return w.w2;
+  }
+  return w.b;
+}
+
+fn with_weight(w : W, k : i32, x : f64) -> W {
+  let mut m = w;
+  if k == 0 {
+    m.w0 = x;
+  } else if k == 1 {
+    m.w1 = x;
+  } else if k == 2 {
+    m.w2 = x;
+  } else {
+    m.b = x;
+  }
+  return m;
+}
+
+// Input j of sample i, in [-1, 1].
+fn input(i : i32, j : i32) -> f64 {
+  return (1.37f64 * f64::from(i) + 2.11f64 * f64::from(j) + 0.3f64).sin();
+}
+
+// The label of sample i: 2 x0 - 3 x1 + 0.5 x2 + 1, plus noise of size 0.1. Sample `bad` (if
+// any) has the label 1000 instead.
+fn label(i : i32, bad : i32) -> f64 {
+  if i == bad {
+    return 1000.0f64;
+  }
+  let clean = 2.0f64 * input(i, 0) - 3.0f64 * input(i, 1) + 0.5f64 * input(i, 2) + 1.0f64;
+  return clean + 0.1f64 * (17.3f64 * f64::from(i)).sin();
+}
+
+fn predict(w : W, i : i32) -> f64 {
+  return w.w0 * input(i, 0) + w.w1 * input(i, 1) + w.w2 * input(i, 2) + w.b;
+}
+
+// Mean of (prediction - label)^2 / 2 over samples start .. start + count.
+fn loss(w : W, start : i32, count : i32, bad : i32) -> f64 {
+  let mut sum : f64 = 0.0;
+  for n in 0..count {
+    let i = start + n;
+    let e = predict(w, i) - label(i, bad);
+    sum = sum + e * e / 2.0f64;
+  }
+  return sum / f64::from(count);
+}
+
+// The loss with weight k set to x: `grad` moves its first parameter.
+fn loss_at(x : f64, w : W, k : i32, start : i32, count : i32, bad : i32) -> f64 {
+  return loss(with_weight(w, k, x), start, count, bad);
+}
+
+fn by_grad(w : W, k : i32, start : i32, count : i32, bad : i32) -> f64 {
+  return grad(loss_at, weight(w, k), w, k, start, count, bad);
+}
+
+// The same partial derivative from the formula: mean of (prediction - label) times input k
+// (times 1 for the bias).
+fn by_formula(w : W, k : i32, start : i32, count : i32, bad : i32) -> f64 {
+  let mut sum : f64 = 0.0;
+  for n in 0..count {
+    let i = start + n;
+    let e = predict(w, i) - label(i, bad);
+    if k < 3 {
+      sum = sum + e * input(i, k);
+    } else {
+      sum = sum + e;
+    }
+  }
+  return sum / f64::from(count);
+}
+
+// A gradient: four numbers.
+struct G {
+  g0 : f64,
+  g1 : f64,
+  g2 : f64,
+  g3 : f64,
+}
+
+impl Copy for G {}
+
+fn part(g : G, k : i32) -> f64 {
+  if k == 0 {
+    return g.g0;
+  }
+  if k == 1 {
+    return g.g1;
+  }
+  if k == 2 {
+    return g.g2;
+  }
+  return g.g3;
+}
+
+fn gradient(w : W, start : i32, count : i32, bad : i32) -> G {
+  return G {
+    g0: by_grad(w, 0, start, count, bad),
+    g1: by_grad(w, 1, start, count, bad),
+    g2: by_grad(w, 2, start, count, bad),
+    g3: by_grad(w, 3, start, count, bad),
+  };
+}
+
+fn norm(g : G) -> f64 {
+  return (g.g0 * g.g0 + g.g1 * g.g1 + g.g2 * g.g2 + g.g3 * g.g3).sqrt();
+}
+
+fn scaled(g : G, c : f64) -> G {
+  return G { g0: c * g.g0, g1: c * g.g1, g2: c * g.g2, g3: c * g.g3 };
+}
+
+fn plus(a : G, b : G) -> G {
+  return G { g0: a.g0 + b.g0, g1: a.g1 + b.g1, g2: a.g2 + b.g2, g3: a.g3 + b.g3 };
+}
+
+// --- 2. Clipping -----------------------------------------------------------------------------
+
+// Scale g down so its norm is at most `limit`; a smaller g is left alone.
+fn clip(g : G, limit : f64) -> G {
+  let n = norm(g);
+  if n > limit {
+    return scaled(g, limit / n);
+  }
+  return g;
+}
+
+// --- 4. Training -----------------------------------------------------------------------------
+
+// SGD with the schedule, batches of 32 made of 4 micro-batches of 8, cycling through 256
+// samples; sample 77 has the bad label. With `limit` > 0 the gradient is clipped to it. Returns
+// the weights; `worst` gets the largest loss on the clean data seen after any step.
+struct Trained {
+  w : W,
+  worst : f64,
+}
+
+fn train(s : Schedule, limit : f64) -> Trained {
+  let mut w = W { w0: 0.0f64, w1: 0.0f64, w2: 0.0f64, b: 0.0f64 };
+  let mut worst : f64 = 0.0;
+  for t in 0..s.total {
+    let first = (t * 32) % 256;
+    let mut g = G { g0: 0.0f64, g1: 0.0f64, g2: 0.0f64, g3: 0.0f64 };
+    for m in 0..4 {
+      g = plus(g, gradient(w, first + 8 * m, 8, 77));
+    }
+    g = scaled(g, 0.25f64);
+    if limit > 0.0f64 {
+      g = clip(g, limit);
+    }
+    let lr = rate(s, t);
+    w = W {
+      w0: w.w0 - lr * g.g0,
+      w1: w.w1 - lr * g.g1,
+      w2: w.w2 - lr * g.g2,
+      b: w.b - lr * g.g3,
+    };
+    let l = loss(w, 0, 256, -1);
+    if !(l <= worst) {
+      worst = l;
+    }
+  }
+  return Trained { w: w, worst: worst };
+}
+
+fn near(a : f64, b : f64, tol : f64) -> bool {
+  return (a - b).abs() <= tol;
+}
+
+fn main() -> i32 {
+  let mut failed = 0;
+
+  // 1. Warmup over 100 steps to 3e-4, then cosine down to 3e-5 at step 1000.
+  let s = Schedule { peak: 0.0003f64, floor: 0.00003f64, warmup: 100, total: 1000 };
+  let mut shape = true;
+  for t in 0..1000 {
+    let r = rate(s, t);
+    // Warmup starts near 0; the floor holds from the end of warmup on.
+    if r <= 0.0f64 || r > s.peak || (t >= 100 && r < s.floor) {
+      shape = false;
+    }
+    if t > 0 {
+      let before = rate(s, t - 1);
+      if t < 100 && !(r > before) {
+        shape = false;
+      }
+      if t > 100 && !(r < before) {
+        shape = false;
+      }
+    }
+  }
+  let known = near(rate(s, 0), 0.000003f64, 0.000000000000000001f64) && near(rate(s, 99), s.peak, 0.000000000000000001f64) &&
+              near(rate(s, 100), s.peak, 0.000000000000000001f64) && near(rate(s, 550), 0.000165f64, 0.000000000000001f64);
+  print!("schedule: step 0 ");
+  print!(rate(s, 0));
+  print!(", step 99 ");
+  print!(rate(s, 99));
+  print!(", step 550 ");
+  print!(rate(s, 550));
+  print!(", step 999 ");
+  print!(rate(s, 999));
+  print!("\n");
+  if !shape || !known {
+    print!("FAIL: the schedule\n");
+    failed = failed + 1;
+  }
+
+  // 2. Clipping: a gradient of norm 5 clipped to 1 has norm 1 and the same direction; clipped
+  //    to 10 it is unchanged.
+  let g = G { g0: 3.0f64, g1: 0.0f64, g2: -4.0f64, g3: 0.0f64 };
+  let c = clip(g, 1.0f64);
+  let same = clip(g, 10.0f64);
+  let cosine = (c.g0 * g.g0 + c.g1 * g.g1 + c.g2 * g.g2 + c.g3 * g.g3) / (norm(c) * norm(g));
+  print!("clipping: norm 5 to 1 gives norm ");
+  print!(norm(c));
+  print!(", same direction (cosine ");
+  print!(cosine);
+  print!(")\n");
+  if !near(norm(c), 1.0f64, 0.000000000000001f64) || !near(cosine, 1.0f64, 0.000000000000001f64) || same.g0 != g.g0 ||
+     same.g2 != g.g2 {
+    print!("FAIL: clipping\n");
+    failed = failed + 1;
+  }
+
+  // 3. Accumulation, at some weights away from the answer.
+  let w = W { w0: 0.5f64, w1: -1.0f64, w2: 2.0f64, b: 0.25f64 };
+  let full = gradient(w, 0, 32, -1);
+  let mut acc = G { g0: 0.0f64, g1: 0.0f64, g2: 0.0f64, g3: 0.0f64 };
+  for m in 0..4 {
+    acc = plus(acc, gradient(w, 8 * m, 8, -1));
+  }
+  acc = scaled(acc, 0.25f64);
+  let mut acc_diff : f64 = 0.0;
+  let mut formula_diff : f64 = 0.0;
+  for k in 0..4 {
+    acc_diff = acc_diff.max((part(acc, k) - part(full, k)).abs());
+    formula_diff = formula_diff.max((part(full, k) - by_formula(w, k, 0, 32, -1)).abs());
+  }
+  print!("accumulation: 4 micro-batches of 8 vs one batch of 32 differ by ");
+  print!(acc_diff);
+  print!("; grad vs the formula by ");
+  print!(formula_diff);
+  print!("\n");
+  if !(acc_diff < 0.00000000000001f64) || !(formula_diff < 0.00000000000001f64) {
+    print!("FAIL: gradient accumulation\n");
+    failed = failed + 1;
+  }
+
+  // 4. Training with one bad label, with and without clipping at 1.
+  let t = Schedule { peak: 0.5f64, floor: 0.005f64, warmup: 20, total: 400 };
+  let clipped = train(t, 1.0f64);
+  let raw = train(t, 0.0f64);
+  let lc = loss(clipped.w, 0, 256, -1);
+  let lr = loss(raw.w, 0, 256, -1);
+  print!("one bad label in 256, clean loss after 400 steps: clipped ");
+  print!(lc);
+  print!(" (worst on the way ");
+  print!(clipped.worst);
+  print!("), not clipped ");
+  print!(lr);
+  print!(" (worst ");
+  print!(raw.worst);
+  print!(")\n");
+  print!("clipped weights: ");
+  print!(clipped.w.w0);
+  print!(" ");
+  print!(clipped.w.w1);
+  print!(" ");
+  print!(clipped.w.w2);
+  print!(" ");
+  print!(clipped.w.b);
+  print!(" (the data says 2 -3 0.5 1)\n");
+  if !(lc < 0.05f64) || !(lr > 100.0f64 * lc) {
+    print!("FAIL: clipping should save this run\n");
+    failed = failed + 1;
+  }
+
+  if failed == 0 {
+    print!("ok\n");
+  }
+  return failed;
+}
