@@ -212,7 +212,34 @@ fail in another.
 - **bigint, v0.0.3: `panic!` does not exist.** It is the function `panic("..")`; `panic!(..)` is
   `Macro panic not found`.
 
+- **batch-sched, main 39a12e0a: `==` on two C strings compares pointers.** `name != "static"`,
+  with `name : *const i8` passed `"static"`, is true: the two literals are different pointers.
+  It compiles without a warning, and it is also what pushed the program off the flat code
+  generator (`emitter gap at src/codegen/flat/emit/arith.rs:302`). The function takes a `bool`
+  instead.
+
+- **safetensors, main 39a12e0a: a `void` function ending in `if`/`else` sends the program to the
+  old code generator, where more things fail.** On that path `print!(k)` of a range variable is
+  `print cannot print a value of type index`, while `print!(k as i32)` gets `W1013: the cast does
+  nothing`; and `f32::from(i16)` fails in `mlir-translate`
+  ([vx-lang/Vx#1651](https://github.com/vx-lang/Vx/issues/1651)). A `return;` at the end keeps
+  the program on the flat path.
+- **safetensors, main 39a12e0a: `on` is a keyword.** A parameter called `on` is `Expected
+  parameter name`, with nothing saying why (as with `across`,
+  [vx-lang/Vx#1650](https://github.com/vx-lang/Vx/issues/1650)).
+
+- **reshard, main 39a12e0a: a keyword as a name gives a vague error.** `let mut across = ..` is
+  `Expected identifier after let`; `across` is a keyword, and the message does not say so
+  ([vx-lang/Vx#1650](https://github.com/vx-lang/Vx/issues/1650)). Renamed to `span`.
+- **ring-allreduce, main 39a12e0a: `f64::from` has no `i64` version.** `f64::from(x)` with
+  `x : i64` is `E3036`, since the conversion can round; it stays `x as f64`, which gives no
+  warning. (`quantize` hit the same.)
+
 ## Standard library
+
+- **ring-allreduce, main 39a12e0a: no threads, so ranks are simulated.** `core::sync::atomic`
+  says "Vx has no threads yet", and `spawn on` is device dispatch. The ranks are rows of one
+  array, and a step buffers every send before applying any.
 
 - **wordcount, v0.0.3: no command-line arguments in `std`.** The runtime has `vx_env_args_count`
   and `vx_env_arg`; wordcount declares them in an `extern` block itself.

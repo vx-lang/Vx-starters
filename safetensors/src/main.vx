@@ -1,0 +1,705 @@
+// safetensors: write and read the checkpoint format most model weights now ship in.
+//
+// A .safetensors file is:
+//   - 8 bytes: the length N of the header, a little-endian u64;
+//   - N bytes: a JSON object mapping each tensor's name to its dtype, shape and data_offsets
+//     [begin, end) into the data, plus an optional "__metadata__" object of strings; padded
+//     with spaces;
+//   - the data: every tensor's bytes, little-endian, one after another with no holes.
+//
+// This program writes a small checkpoint, reads it back with its own parser, checks every rule
+// a reader must check, and prints the tensors. build.sh then reads the same file with Python's
+// json and struct modules and compares what they print, so the file is checked by a reader that
+// shares no code with this one. Last, it feeds the reader broken files and checks that each is
+// refused for the right reason.
+//
+//   vxc -a run-jit src/main.vx -- <file to write>
+//
+// It returns the number of failed checks, and prints "ok" when there are none.
+
+import core::convert;
+import core::libm;
+import std::fs;
+import std::vec;
+
+extern {
+  fn vx_env_args_count() -> i32;
+  fn vx_env_arg(idx : i32) -> *mut i8;
+}
+
+// --- Bytes -----------------------------------------------------------------------------------
+
+fn push_str(out : &mut Vec<u8>, s : *const i8) -> void {
+  let mut i : i64 = 0;
+  let mut b = unsafe { s[0] };
+  while b != 0 {
+    out.push(b as u8);
+    i = i + 1;
+    b = unsafe { s[i] };
+  }
+}
+
+// A whole number in decimal.
+fn push_int(out : &mut Vec<u8>, v : i64) -> void {
+  if v < 0 {
+    out.push(45u8);
+    push_int(out, 0i64 - v);
+    return;
+  }
+  let mut digits = Vec<u8>::new();
+  let mut x = v;
+  digits.push((x % 10i64) as u8 + 48u8);
+  x = x / 10i64;
+  while x > 0i64 {
+    digits.push((x % 10i64) as u8 + 48u8);
+    x = x / 10i64;
+  }
+  let mut i = digits.len() - 1;
+  while i >= 0 {
+    out.push(digits.get(i));
+    i = i - 1;
+  }
+}
+
+// v as `count` little-endian bytes.
+fn push_le(out : &mut Vec<u8>, v : u64, count : i32) -> void {
+  let mut x = v;
+  for i in 0..count {
+    out.push((x & 255u64) as u8);
+    x = x >> 8;
+  }
+}
+
+fn read_le(b : &Vec<u8>, at : i64, count : i32) -> u64 {
+  let mut v : u64 = 0;
+  let mut i = count - 1;
+  while i >= 0 {
+    v = (v << 8) | u64::from(b.get((at as i32) + i));
+    i = i - 1;
+  }
+  return v;
+}
+
+fn write_file(path : *const i8, bytes : &Vec<u8>) -> bool {
+  let mut file = unsafe { File::open(path, OpenMode::Write) };
+  let n = unsafe { file.write(bytes.as_mut_ptr() as *const u8, u64::from(bytes.len() as u32)) };
+  return n == u64::from(bytes.len() as u32);
+}
+
+fn read_file(path : *const i8) -> Vec<u8> {
+  let mut file = unsafe { File::open(path, OpenMode::Read) };
+  let buf : Tensor<u8, [4096]> = Tensor<u8, [4096]>::new();
+  let p = buf.as_mut_ptr();
+  let mut out = Vec<u8>::new();
+  let mut done = false;
+  while !done {
+    let n = unsafe { file.read(p, 4096) };
+    if n == 0 {
+      done = true;
+    }
+    for i in 0..(n as i64) {
+      out.push(unsafe { p[i] });
+    }
+  }
+  return out;
+}
+
+// --- Writing ---------------------------------------------------------------------------------
+
+// The checkpoint: a 4 x 3 f32 matrix, a length-3 f32 vector and one i64.
+fn weight(i : i32) -> f32 {
+  let quarter : f32 = 0.25;
+  let one : f32 = 1.0;
+  return (i as f32) * quarter - one;
+}
+
+fn bias(i : i32) -> f32 {
+  if i == 0 {
+    return 0.5f32;
+  }
+  if i == 1 {
+    return -1.5f32;
+  }
+  return 3.0f32;
+}
+
+fn steps() -> i64 {
+  return 1234567890123i64;
+}
+
+// One entry of the header: "name":{"dtype":"..","shape":[..],"data_offsets":[b,e]}
+fn push_entry(h : &mut Vec<u8>, name : *const i8, dtype : *const i8, dims : &Vec<i64>, b : i64,
+              e : i64) -> void {
+  push_str(h, "\"");
+  push_str(h, name);
+  push_str(h, "\":{\"dtype\":\"");
+  push_str(h, dtype);
+  push_str(h, "\",\"shape\":[");
+  for i in 0..dims.len() {
+    if i > 0 {
+      push_str(h, ",");
+    }
+    push_int(h, dims.get(i));
+  }
+  push_str(h, "],\"data_offsets\":[");
+  push_int(h, b);
+  push_str(h, ",");
+  push_int(h, e);
+  push_str(h, "]}");
+}
+
+fn dims2(a : i64, b : i64) -> Vec<i64> {
+  let mut d = Vec<i64>::new();
+  d.push(a);
+  d.push(b);
+  return d;
+}
+
+fn dims1(a : i64) -> Vec<i64> {
+  let mut d = Vec<i64>::new();
+  d.push(a);
+  return d;
+}
+
+// The whole file, with the header length and data offsets as given (the broken files below
+// change them).
+fn checkpoint(fake_len : i64, bias_end : i64) -> Vec<u8> {
+  let mut data = Vec<u8>::new();
+  for i in 0..12 {
+    push_le(&mut data, u64::from(libm_f32_to_bits(weight(i))), 4);
+  }
+  for i in 0..3 {
+    push_le(&mut data, u64::from(libm_f32_to_bits(bias(i))), 4);
+  }
+  push_le(&mut data, steps() as u64, 8);
+
+  let mut h = Vec<u8>::new();
+  push_str(&mut h, "{\"__metadata__\":{\"format\":\"pt\",\"note\":\"Vx starter\"},");
+  push_entry(&mut h, "embed.weight", "F32", &dims2(4i64, 3i64), 0i64, 48i64);
+  push_str(&mut h, ",");
+  push_entry(&mut h, "head.bias", "F32", &dims1(3i64), 48i64, bias_end);
+  push_str(&mut h, ",");
+  push_entry(&mut h, "steps", "I64", &dims1(1i64), 60i64, 68i64);
+  push_str(&mut h, "}");
+  // Pad with spaces so the data starts at a multiple of 8.
+  while h.len() % 8 != 0 {
+    h.push(32u8);
+  }
+
+  let mut out = Vec<u8>::new();
+  let mut n = i64::from(h.len());
+  if fake_len >= 0i64 {
+    n = fake_len;
+  }
+  push_le(&mut out, n as u64, 8);
+  for i in 0..h.len() {
+    out.push(h.get(i));
+  }
+  for i in 0..data.len() {
+    out.push(data.get(i));
+  }
+  return out;
+}
+
+// --- Reading ---------------------------------------------------------------------------------
+
+// What the reader found: each tensor's name (a range in the file), dtype size and code, shape
+// (a range in `dims`) and data range; or why the file was refused.
+struct Table {
+  error : i32,
+  data_at : i64,
+  name_b : Vec<i32>,
+  name_e : Vec<i32>,
+  dtype : Vec<i32>,
+  dims_b : Vec<i32>,
+  dims_e : Vec<i32>,
+  dims : Vec<i64>,
+  begin : Vec<i64>,
+  end : Vec<i64>,
+}
+
+// Why a file is refused.
+fn ok_file() -> i32 {
+  return 0;
+}
+fn bad_length() -> i32 {
+  return 1;
+}
+fn bad_json() -> i32 {
+  return 2;
+}
+fn bad_dtype() -> i32 {
+  return 3;
+}
+fn bad_size() -> i32 {
+  return 4;
+}
+fn bad_layout() -> i32 {
+  return 5;
+}
+
+fn reason(e : i32) -> *const i8 {
+  if e == bad_length() {
+    return "header length runs past the end of the file";
+  }
+  if e == bad_json() {
+    return "header is not the JSON expected";
+  }
+  if e == bad_dtype() {
+    return "unknown dtype";
+  }
+  if e == bad_size() {
+    return "data range does not match dtype and shape";
+  }
+  if e == bad_layout() {
+    return "data ranges overlap, leave a hole, or run past the end";
+  }
+  return "fine";
+}
+
+// A cursor over the header.
+struct Cur {
+  at : i32,
+  end : i32,
+  bad : bool,
+}
+
+fn skip_ws(b : &Vec<u8>, c : &mut Cur) -> void {
+  while c.at < c.end && (b.get(c.at) == 32u8 || b.get(c.at) == 10u8) {
+    c.at = c.at + 1;
+  }
+}
+
+fn expect(b : &Vec<u8>, c : &mut Cur, ch : u8) -> void {
+  skip_ws(b, c);
+  if c.at >= c.end || b.get(c.at) != ch {
+    c.bad = true;
+  } else {
+    c.at = c.at + 1;
+  }
+  // Without this `return`, the program falls back to the older code generator
+  // (vx-lang/Vx#1651).
+  return;
+}
+
+fn peek(b : &Vec<u8>, c : &mut Cur) -> u8 {
+  skip_ws(b, c);
+  if c.at >= c.end {
+    c.bad = true;
+    return 0u8;
+  }
+  return b.get(c.at);
+}
+
+// A string without escapes; returns where its bytes start, and leaves the cursor after it. Its
+// end is c.at - 1.
+fn string(b : &Vec<u8>, c : &mut Cur) -> i32 {
+  expect(b, c, 34u8);
+  let start = c.at;
+  while c.at < c.end && b.get(c.at) != 34u8 {
+    if b.get(c.at) == 92u8 {
+      c.bad = true;
+    }
+    c.at = c.at + 1;
+  }
+  expect(b, c, 34u8);
+  return start;
+}
+
+fn number(b : &Vec<u8>, c : &mut Cur) -> i64 {
+  skip_ws(b, c);
+  let mut v : i64 = 0;
+  let mut digits = 0;
+  while c.at < c.end && b.get(c.at) >= 48u8 && b.get(c.at) <= 57u8 {
+    v = v * 10i64 + i64::from(b.get(c.at) - 48u8);
+    c.at = c.at + 1;
+    digits = digits + 1;
+  }
+  if digits == 0 {
+    c.bad = true;
+  }
+  return v;
+}
+
+// [n, n, ...] onto `out`.
+fn numbers(b : &Vec<u8>, c : &mut Cur, out : &mut Vec<i64>) -> void {
+  expect(b, c, 91u8);
+  if peek(b, c) == 93u8 {
+    c.at = c.at + 1;
+    return;
+  }
+  let mut more = true;
+  while more && !c.bad {
+    out.push(number(b, c));
+    if peek(b, c) == 44u8 {
+      c.at = c.at + 1;
+    } else {
+      more = false;
+    }
+  }
+  expect(b, c, 93u8);
+}
+
+// Whether bytes [s, e) of b spell the C string `want`.
+fn spells(b : &Vec<u8>, s : i32, e : i32, want : *const i8) -> bool {
+  let mut i = 0;
+  while i < e - s {
+    let w = unsafe { want[i64::from(i)] };
+    if w == 0 || b.get(s + i) != (w as u8) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return unsafe { want[i64::from(e - s)] } == 0;
+}
+
+// Bytes per element, or 0 for a dtype this reader does not know.
+fn dtype_size(b : &Vec<u8>, s : i32, e : i32) -> i32 {
+  if spells(b, s, e, "F64") || spells(b, s, e, "I64") || spells(b, s, e, "U64") {
+    return 8;
+  }
+  if spells(b, s, e, "F32") || spells(b, s, e, "I32") || spells(b, s, e, "U32") {
+    return 4;
+  }
+  if spells(b, s, e, "F16") || spells(b, s, e, "BF16") || spells(b, s, e, "I16") {
+    return 2;
+  }
+  if spells(b, s, e, "U8") || spells(b, s, e, "I8") || spells(b, s, e, "BOOL") {
+    return 1;
+  }
+  return 0;
+}
+
+// Skip {"key":"value", ...}.
+fn skip_metadata(b : &Vec<u8>, c : &mut Cur) -> void {
+  expect(b, c, 123u8);
+  if peek(b, c) == 125u8 {
+    c.at = c.at + 1;
+    return;
+  }
+  let mut more = true;
+  while more && !c.bad {
+    string(b, c);
+    expect(b, c, 58u8);
+    string(b, c);
+    if peek(b, c) == 44u8 {
+      c.at = c.at + 1;
+    } else {
+      more = false;
+    }
+  }
+  expect(b, c, 125u8);
+}
+
+fn empty_table(error : i32) -> Table {
+  return Table {
+    error: error,
+    data_at: 0i64,
+    name_b: Vec<i32>::new(),
+    name_e: Vec<i32>::new(),
+    dtype: Vec<i32>::new(),
+    dims_b: Vec<i32>::new(),
+    dims_e: Vec<i32>::new(),
+    dims: Vec<i64>::new(),
+    begin: Vec<i64>::new(),
+    end: Vec<i64>::new(),
+  };
+}
+
+fn parse(b : &Vec<u8>) -> Table {
+  let total = i64::from(b.len());
+  if total < 8i64 {
+    return empty_table(bad_length());
+  }
+  let n = read_le(b, 0i64, 8) as i64;
+  if n < 2i64 || n > total - 8i64 {
+    return empty_table(bad_length());
+  }
+  let mut t = empty_table(ok_file());
+  t.data_at = 8i64 + n;
+  let mut c = Cur { at: 8, end: (8i64 + n) as i32, bad: false };
+  expect(b, &mut c, 123u8);
+  let mut more = peek(b, &mut c) != 125u8;
+  while more && !c.bad {
+    let ns = string(b, &mut c);
+    let ne = c.at - 1;
+    expect(b, &mut c, 58u8);
+    if spells(b, ns, ne, "__metadata__") {
+      skip_metadata(b, &mut c);
+    } else {
+      // {"dtype": .., "shape": [..], "data_offsets": [b, e]}, keys in any order.
+      let mut size = -1;
+      let mut offsets = Vec<i64>::new();
+      let db = t.dims.len();
+      let mut seen_shape = false;
+      expect(b, &mut c, 123u8);
+      let mut fields = true;
+      while fields && !c.bad {
+        let ks = string(b, &mut c);
+        let ke = c.at - 1;
+        expect(b, &mut c, 58u8);
+        if spells(b, ks, ke, "dtype") {
+          let vs = string(b, &mut c);
+          size = dtype_size(b, vs, c.at - 1);
+        } else if spells(b, ks, ke, "shape") {
+          numbers(b, &mut c, &mut t.dims);
+          seen_shape = true;
+        } else if spells(b, ks, ke, "data_offsets") {
+          numbers(b, &mut c, &mut offsets);
+        } else {
+          c.bad = true;
+        }
+        if peek(b, &mut c) == 44u8 {
+          c.at = c.at + 1;
+        } else {
+          fields = false;
+        }
+      }
+      expect(b, &mut c, 125u8);
+      if c.bad || !seen_shape || offsets.len() != 2 || size < 0 {
+        return empty_table(bad_json());
+      }
+      if size == 0 {
+        return empty_table(bad_dtype());
+      }
+      // The data range must hold exactly prod(shape) elements.
+      let mut count : i64 = 1;
+      for i in db..t.dims.len() {
+        count = count * t.dims.get(i);
+      }
+      if offsets.get(1) - offsets.get(0) != count * i64::from(size) {
+        return empty_table(bad_size());
+      }
+      t.name_b.push(ns);
+      t.name_e.push(ne);
+      t.dtype.push(size);
+      t.dims_b.push(db);
+      t.dims_e.push(t.dims.len());
+      t.begin.push(offsets.get(0));
+      t.end.push(offsets.get(1));
+    }
+    if peek(b, &mut c) == 44u8 {
+      c.at = c.at + 1;
+    } else {
+      more = false;
+    }
+  }
+  expect(b, &mut c, 125u8);
+  if c.bad {
+    return empty_table(bad_json());
+  }
+  // Only spaces may follow the object inside the header.
+  while c.at < c.end {
+    if b.get(c.at) != 32u8 {
+      return empty_table(bad_json());
+    }
+    c.at = c.at + 1;
+  }
+  // The ranges, taken in order of where they start, must tile the data exactly.
+  let data = total - t.data_at;
+  let mut covered : i64 = 0;
+  for k in 0..t.begin.len() {
+    // The tensor starting at `covered`, if any.
+    let mut found = -1;
+    for i in 0..t.begin.len() {
+      if t.begin.get(i) == covered && t.end.get(i) > t.begin.get(i) {
+        found = i;
+      }
+    }
+    if found < 0 {
+      return empty_table(bad_layout());
+    }
+    covered = t.end.get(found);
+  }
+  if covered != data {
+    return empty_table(bad_layout());
+  }
+  return t;
+}
+
+// --- Printing --------------------------------------------------------------------------------
+
+// The index of the tensor called `name`, or -1.
+fn find(b : &Vec<u8>, t : &Table, name : *const i8) -> i32 {
+  for i in 0..t.name_b.len() {
+    if spells(b, t.name_b.get(i), t.name_e.get(i), name) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+// "name F32 [4, 3]: v v v ..." in the order of the header. build.sh prints the same from
+// Python. f32 values print as f64, which is exact.
+fn show(b : &Vec<u8>, t : &Table) -> void {
+  for i in 0..t.name_b.len() {
+    for k in t.name_b.get(i)..t.name_e.get(i) {
+      let one : Tensor<i8, [2]> = Tensor<i8, [2]>::new();
+      let p = one.as_mut_ptr();
+      unsafe {
+        p[0] = b.get(k) as i8;
+        p[1] = 0;
+      }
+      print!(p as *const i8);
+    }
+    print!(" [");
+    for d in t.dims_b.get(i)..t.dims_e.get(i) {
+      if d > t.dims_b.get(i) {
+        print!(", ");
+      }
+      print!(t.dims.get(d));
+    }
+    print!("]:");
+    let size = t.dtype.get(i);
+    let mut at = t.data_at + t.begin.get(i);
+    while at < t.data_at + t.end.get(i) {
+      print!(" ");
+      if size == 4 {
+        let x = libm_f32_from_bits(read_le(b, at, 4) as u32);
+        print!(f64::from(x));
+      } else {
+        print!(read_le(b, at, 8) as i64);
+      }
+      at = at + i64::from(size);
+    }
+    print!("\n");
+  }
+}
+
+fn main() -> i32 {
+  let argc = unsafe { vx_env_args_count() };
+  if argc < 2 {
+    print!("usage: safetensors <file to write>\n");
+    return 1;
+  }
+  let path = unsafe { vx_env_arg(argc - 1) } as *const i8;
+  let mut failed = 0;
+
+  // 1. Write, read back, check every value.
+  if !write_file(path, &checkpoint(-1i64, 60i64)) {
+    print!("FAIL: could not write the file\n");
+    return 1;
+  }
+  let b = read_file(path);
+  let t = parse(&b);
+  if t.error != ok_file() {
+    print!("FAIL: our own file is refused: ");
+    print!(reason(t.error));
+    print!("\n");
+    return 1;
+  }
+  show(&b, &t);
+  let w = find(&b, &t, "embed.weight");
+  let h = find(&b, &t, "head.bias");
+  let s = find(&b, &t, "steps");
+  let mut same = w >= 0 && h >= 0 && s >= 0;
+  if same {
+    for i in 0..12 {
+      let at = t.data_at + t.begin.get(w) + i64::from(4 * i);
+      if libm_f32_from_bits(read_le(&b, at, 4) as u32) != weight(i) {
+        same = false;
+      }
+    }
+    for i in 0..3 {
+      let at = t.data_at + t.begin.get(h) + i64::from(4 * i);
+      if libm_f32_from_bits(read_le(&b, at, 4) as u32) != bias(i) {
+        same = false;
+      }
+    }
+    if read_le(&b, t.data_at + t.begin.get(s), 8) as i64 != steps() {
+      same = false;
+    }
+  }
+  if !same {
+    print!("FAIL: values read back differ from those written\n");
+    failed = failed + 1;
+  }
+
+  // 2. Broken files, each refused for its own reason.
+  let mut broken = 0;
+  let mut cases = 0;
+  // A header length past the end of the file.
+  let long = checkpoint(100000i64, 60i64);
+  // head.bias claims 16 bytes for 3 f32 values.
+  let wrong_size = checkpoint(-1i64, 64i64);
+  for k in 0..2 {
+    let mut f = Vec<u8>::new();
+    let mut want = bad_length();
+    if k == 0 {
+      for i in 0..long.len() {
+        f.push(long.get(i));
+      }
+    } else {
+      for i in 0..wrong_size.len() {
+        f.push(wrong_size.get(i));
+      }
+      want = bad_size();
+    }
+    cases = cases + 1;
+    let got = parse(&f).error;
+    if got != want {
+      print!("FAIL: broken file ");
+      print!(k);
+      print!(": got \"");
+      print!(reason(got));
+      print!("\", wanted \"");
+      print!(reason(want));
+      print!("\"\n");
+      broken = broken + 1;
+    }
+  }
+  // Byte edits to the good file: the dtype, a lost brace, a hole after the data, a lost byte.
+  let mut good = Vec<u8>::new();
+  for i in 0..b.len() {
+    good.push(b.get(i));
+  }
+  for k in 0..4 {
+    let mut f = Vec<u8>::new();
+    for i in 0..good.len() {
+      f.push(good.get(i));
+    }
+    let mut want = bad_dtype();
+    if k == 0 {
+      // "I64" -> "Q64".
+      let mut i = 8;
+      while !(f.get(i) == 73u8 && f.get(i + 1) == 54u8 && f.get(i + 2) == 52u8) {
+        i = i + 1;
+      }
+      f.set(i, 81u8);
+    } else if k == 1 {
+      f.set(8, 32u8);
+      want = bad_json();
+    } else if k == 2 {
+      f.push(0u8);
+      want = bad_layout();
+    } else {
+      f.pop();
+      want = bad_layout();
+    }
+    cases = cases + 1;
+    let got = parse(&f).error;
+    if got != want {
+      print!("FAIL: edited file ");
+      print!(k);
+      print!(": got \"");
+      print!(reason(got));
+      print!("\", wanted \"");
+      print!(reason(want));
+      print!("\"\n");
+      broken = broken + 1;
+    }
+  }
+  print!("broken files refused for the right reason: ");
+  print!(cases - broken);
+  print!(" of ");
+  print!(cases);
+  print!("\n");
+  if broken > 0 {
+    failed = failed + 1;
+  }
+
+  if failed == 0 {
+    print!("ok\n");
+  }
+  return failed;
+}

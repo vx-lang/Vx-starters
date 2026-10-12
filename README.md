@@ -21,6 +21,10 @@ toolchain. They have two jobs:
 | [`flash-attn`](flash-attn) | FlashAttention's tiled online softmax, checked against naive attention | A project that needs a compiler newer than the last release |
 | [`bpe-tokenizer`](bpe-tokenizer) | A GPT-style byte-pair tokenizer: training, encoding, decoding | Data files from outside the project as test inputs |
 | [`paged-kv`](paged-kv) | A vLLM-style paged KV cache with copy-on-write; contracts prove its index arithmetic | Proofs as part of compiling: a broken contract is a build error |
+| [`batch-sched`](batch-sched) | Continuous vs static batching in a serving simulator, checked against a case worked by hand | Tests with exact expected numbers next to tests of properties |
+| [`safetensors`](safetensors) | The checkpoint format: a JSON header parser, byte layouts, broken files refused; Python reads the same file | A test that needs another language's tools (`python3`) |
+| [`ring-allreduce`](ring-allreduce) | Data-parallel all-reduce as reduce-scatter plus all-gather on simulated ranks; each rank sends 2(N-1)/N of the vector; contracts prove the ring's chunk numbers | A program about parallel hardware with no threads to run on: simulation in place of a runtime |
+| [`reshard`](reshard) | Row- and column-parallel splits with remainders, and direct resharding from k1 to k2 shards; contracts prove the overlap arithmetic | Checkpoint layouts as data the build and tests share |
 
 The three number libraries are for checking the computer-assisted parts of proofs, such as those
 in [openai/math](https://github.com/openai/math), where the checkers need integers of any size,
