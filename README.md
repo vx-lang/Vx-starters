@@ -20,6 +20,7 @@ toolchain. They have two jobs:
 | [`tiny-mlp`](tiny-mlp) | `grad` on training math: textbook derivatives, backprop checked three ways, Adam on XOR | Optional toolchain parts (Enzyme); a program that only runs under `run-jit` |
 | [`flash-attn`](flash-attn) | FlashAttention's tiled online softmax, checked against naive attention | A project that needs a compiler newer than the last release |
 | [`bpe-tokenizer`](bpe-tokenizer) | A GPT-style byte-pair tokenizer: training, encoding, decoding | Data files from outside the project as test inputs |
+| [`paged-kv`](paged-kv) | A vLLM-style paged KV cache with copy-on-write; contracts prove its index arithmetic | Proofs as part of compiling: a broken contract is a build error |
 
 The three number libraries are for checking the computer-assisted parts of proofs, such as those
 in [openai/math](https://github.com/openai/math), where the checkers need integers of any size,

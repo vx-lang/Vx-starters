@@ -1,0 +1,447 @@
+// paged-kv: a paged KV cache, as in vLLM, with its index arithmetic proved by contracts.
+//
+// An inference server keeps the attention keys and values of every running sequence. Giving each
+// sequence one contiguous buffer wastes memory, since nobody knows how long a sequence will get.
+// A paged cache cuts memory into fixed blocks (16 token slots here) and gives each sequence a
+// block table, mapping its i-th block to a physical one, the way page tables map virtual memory.
+//
+// Sequences can share blocks: forking a sequence (for parallel sampling or beam search) copies
+// its block table, not its data, and counts one more reference on each block. Appending to a
+// block that someone else also holds first copies it (copy-on-write). A block goes back on the
+// free list when its last reference is dropped.
+//
+// Here a slot holds one number (a token) instead of a key and a value vector, which is enough to
+// check where everything goes.
+//
+// The checks:
+//   1. Contracts, proved when the program is compiled: a slot index is inside the pool, an offset
+//      stays inside its block, a reference count never drops below zero, and a free-list pop
+//      stays inside the list.
+//   2. A random workload of appends, forks and frees, compared after every step with a plain
+//      model that copies everything: each sequence reads back the same tokens, and the pool's
+//      books balance (every block is either free or referenced, the reference counts equal the
+//      block-table entries, nothing is free twice).
+//   3. Prefix sharing: four samples forked from one 40-token prompt use far fewer blocks than
+//      four copies would.
+//
+// It returns the number of failed checks, and prints "ok" when there are none.
+
+import core::convert;
+import std::vec;
+
+// --- Index arithmetic, with contracts --------------------------------------------------------
+//
+// The prover works in linear integer arithmetic, without `/` or `%`, and knows nothing about a
+// variable after it is reassigned (vx-lang/Vx#1356). So these are small functions of their
+// arguments, and the cache keeps a sequence's length as (blocks, offset in the last block)
+// rather than as a token count it would have to divide by 16.
+
+// Slots per block.
+fn block_size() -> i32
+    ensures return == 16
+{
+  return 16;
+}
+
+// The pool index of slot `off` of physical block `b`, in a pool of `blocks` blocks.
+fn slot(b : i32, off : i32, blocks : i32) -> i32
+    requires b >= 0 && b < blocks && off >= 0 && off < 16
+    ensures return >= 0 && return < 16 * blocks
+{
+  return 16 * b + off;
+}
+
+// The fill of the last block after one more token: 1 to 16, where 16 means full.
+fn advance(off : i32) -> i32
+    requires off >= 0 && off < 16
+    ensures return >= 1 && return <= 16
+{
+  return off + 1;
+}
+
+// Dropping one reference.
+fn release(refs : i32) -> i32
+    requires refs > 0
+    ensures return >= 0 && return == refs - 1
+{
+  return refs - 1;
+}
+
+// The index of the top of a stack of n entries.
+fn top(n : i32) -> i32
+    requires n > 0
+    ensures return >= 0 && return < n
+{
+  return n - 1;
+}
+
+// --- The cache -------------------------------------------------------------------------------
+
+// Every table is a flat Vec, changed with set, push and pop. Sequence s's block table is
+// table[s * per_seq .. s * per_seq + used[s]], and its last block holds fill[s] tokens.
+struct Cache {
+  blocks : i32,
+  seqs : i32,
+  per_seq : i32,
+  kv : Vec<i64>,
+  refs : Vec<i32>,
+  free : Vec<i32>,
+  table : Vec<i32>,
+  used : Vec<i32>,
+  fill : Vec<i32>,
+  live : Vec<i32>,
+}
+
+fn filled(n : i32, v : i32) -> Vec<i32> {
+  let mut out = Vec<i32>::with_capacity(n);
+  for i in 0..n {
+    out.push(v);
+  }
+  return out;
+}
+
+fn new_cache(blocks : i32, seqs : i32, per_seq : i32) -> Cache {
+  let mut kv = Vec<i64>::with_capacity(blocks * block_size());
+  for i in 0..blocks * block_size() {
+    kv.push(0i64);
+  }
+  // Free blocks as a stack, block 0 on top.
+  let mut free = Vec<i32>::with_capacity(blocks);
+  for i in 0..blocks {
+    free.push(blocks - 1 - i);
+  }
+  return Cache {
+    blocks: blocks,
+    seqs: seqs,
+    per_seq: per_seq,
+    kv: kv,
+    refs: filled(blocks, 0),
+    free: free,
+    table: filled(seqs * per_seq, -1),
+    used: filled(seqs, 0),
+    fill: filled(seqs, 0),
+    live: filled(seqs, 0),
+  };
+}
+
+// The pool index of slot `off` of block `b`, for numbers read from the tables. They are checked
+// here, once; after the checks the prover knows what `slot` requires, and without them the
+// program does not compile.
+fn at(b : i32, off : i32, blocks : i32) -> i32 {
+  if b < 0 || b >= blocks {
+    panic("paged-kv: block id outside the pool");
+  }
+  if off < 0 || off >= 16 {
+    panic("paged-kv: offset outside its block");
+  }
+  return slot(b, off, blocks);
+}
+
+// Take a block off the free list, with one reference; -1 if there is none.
+fn take(c : &mut Cache) -> i32 {
+  let n = c.free.len();
+  if n <= 0 {
+    return -1;
+  }
+  let b = c.free.get(top(n));
+  c.free.pop();
+  c.refs.set(b, 1);
+  return b;
+}
+
+// Drop one reference to block b; the last one returns it to the free list.
+fn drop_ref(c : &mut Cache, b : i32) -> void {
+  let r = c.refs.get(b);
+  if r <= 0 {
+    panic("paged-kv: dropping a block nobody holds");
+  }
+  let left = release(r);
+  c.refs.set(b, left);
+  if left == 0 {
+    c.free.push(b);
+  }
+}
+
+// Start an empty sequence; -1 if all sequence slots are in use.
+fn start(c : &mut Cache) -> i32 {
+  for s in 0..c.seqs {
+    if c.live.get(s) == 0 {
+      c.live.set(s, 1);
+      c.used.set(s, 0);
+      c.fill.set(s, 0);
+      return s;
+    }
+  }
+  return -1;
+}
+
+// Append a token to sequence s. False if that needs a block and none is free, or the
+// sequence's table is full; the sequence is then unchanged.
+fn append(c : &mut Cache, s : i32, token : i64) -> bool {
+  let base = s * c.per_seq;
+  let n = c.used.get(s);
+  let mut off = c.fill.get(s);
+  if n == 0 || off == block_size() {
+    // Start a new block.
+    if n == c.per_seq {
+      return false;
+    }
+    let b = take(c);
+    if b < 0 {
+      return false;
+    }
+    c.table.set(base + n, b);
+    c.used.set(s, n + 1);
+    off = 0;
+  } else {
+    let last = c.table.get(base + n - 1);
+    if c.refs.get(last) > 1 {
+      // Shared: copy the filled part into a block of our own first.
+      let mine = take(c);
+      if mine < 0 {
+        return false;
+      }
+      for i in 0..off {
+        c.kv.set(at(mine, i, c.blocks), c.kv.get(at(last, i, c.blocks)));
+      }
+      drop_ref(c, last);
+      c.table.set(base + n - 1, mine);
+    }
+  }
+  // Needed for `advance`: the prover cannot see inside the tables that `off` came from.
+  if off < 0 || off >= 16 {
+    panic("paged-kv: offset outside its block");
+  }
+  let b = c.table.get(base + c.used.get(s) - 1);
+  c.kv.set(at(b, off, c.blocks), token);
+  c.fill.set(s, advance(off));
+  return true;
+}
+
+// A new sequence sharing all of s's blocks; -1 if no sequence slot is free.
+fn fork(c : &mut Cache, s : i32) -> i32 {
+  let t = start(c);
+  if t < 0 {
+    return -1;
+  }
+  let n = c.used.get(s);
+  for i in 0..n {
+    let b = c.table.get(s * c.per_seq + i);
+    c.table.set(t * c.per_seq + i, b);
+    c.refs.set(b, c.refs.get(b) + 1);
+  }
+  c.used.set(t, n);
+  c.fill.set(t, c.fill.get(s));
+  return t;
+}
+
+// End sequence s, dropping its references.
+fn finish(c : &mut Cache, s : i32) -> void {
+  for i in 0..c.used.get(s) {
+    drop_ref(c, c.table.get(s * c.per_seq + i));
+    c.table.set(s * c.per_seq + i, -1);
+  }
+  c.used.set(s, 0);
+  c.fill.set(s, 0);
+  c.live.set(s, 0);
+}
+
+fn length(c : &Cache, s : i32) -> i32 {
+  let n = c.used.get(s);
+  if n == 0 {
+    return 0;
+  }
+  return block_size() * (n - 1) + c.fill.get(s);
+}
+
+// Token `i` of sequence s, reading block by block.
+fn token(c : &Cache, s : i32, i : i32) -> i64 {
+  let k = i / block_size();
+  let b = c.table.get(s * c.per_seq + k);
+  return c.kv.get(at(b, i - block_size() * k, c.blocks));
+}
+
+// --- The model to compare with ---------------------------------------------------------------
+
+// Every sequence as a plain row of tokens, copied in full on a fork.
+struct Model {
+  cap : i32,
+  tokens : Vec<i64>,
+  len : Vec<i32>,
+}
+
+fn model_copy(m : &mut Model, from : i32, to : i32) -> void {
+  for i in 0..m.len.get(from) {
+    m.tokens.set(to * m.cap + i, m.tokens.get(from * m.cap + i));
+  }
+  m.len.set(to, m.len.get(from));
+}
+
+// Whether the cache and the model agree, and the pool's books balance. Prints what is wrong.
+fn consistent(c : &Cache, m : &Model) -> bool {
+  let mut ok = true;
+  let mut entries = 0;
+  for s in 0..c.seqs {
+    if c.live.get(s) == 1 {
+      entries = entries + c.used.get(s);
+      if length(c, s) != m.len.get(s) {
+        print!("FAIL: sequence ");
+        print!(s);
+        print!(" has the wrong length\n");
+        ok = false;
+      } else {
+        for i in 0..m.len.get(s) {
+          if token(c, s, i) != m.tokens.get(s * m.cap + i) {
+            ok = false;
+          }
+        }
+        if !ok {
+          print!("FAIL: sequence ");
+          print!(s);
+          print!(" reads back the wrong tokens\n");
+        }
+      }
+    }
+  }
+  let mut held = 0;
+  let mut ref_sum = 0;
+  for b in 0..c.blocks {
+    if c.refs.get(b) > 0 {
+      held = held + 1;
+      ref_sum = ref_sum + c.refs.get(b);
+    }
+  }
+  if held + c.free.len() != c.blocks {
+    print!("FAIL: blocks are lost or free twice\n");
+    ok = false;
+  }
+  if ref_sum != entries {
+    print!("FAIL: reference counts do not match the block tables\n");
+    ok = false;
+  }
+  for i in 0..c.free.len() {
+    if c.refs.get(c.free.get(i)) != 0 {
+      print!("FAIL: a free block is still referenced\n");
+      ok = false;
+    }
+  }
+  return ok;
+}
+
+struct Rng {
+  s : u64,
+}
+
+impl Rng {
+  fn below(self : &mut Rng, n : i32) -> i32 {
+    let mut x = self.s;
+    x = x ^ (x << 13);
+    x = x ^ (x >> 7);
+    x = x ^ (x << 17);
+    self.s = x;
+    return (x % (n as u64)) as i32;
+  }
+}
+
+fn main() -> i32 {
+  let mut failed = 0;
+
+  // 2. A random workload: 40 blocks, up to 8 sequences of up to 12 blocks each, so the pool
+  //    runs out at times.
+  let mut c = new_cache(40, 8, 12);
+  let cap = 12 * 16;
+  let mut m = Model { cap: cap, tokens: Vec<i64>::new(), len: filled(8, 0) };
+  for i in 0..8 * cap {
+    m.tokens.push(0i64);
+  }
+  let mut rng = Rng { s: 2463534242u64 };
+  let mut appends = 0;
+  let mut refused = 0;
+  let mut forks = 0;
+  let mut finishes = 0;
+  let mut step = 0;
+  let mut ok = true;
+  while ok && step < 20000 {
+    let op = rng.below(100);
+    let s = rng.below(8);
+    if c.live.get(s) == 0 {
+      if op < 50 {
+        start(&mut c);
+        m.len.set(s, 0);
+      }
+    } else if op < 80 {
+      let t = i64::from(step) * 7 + 1;
+      if append(&mut c, s, t) {
+        m.tokens.set(s * cap + m.len.get(s), t);
+        m.len.set(s, m.len.get(s) + 1);
+        appends = appends + 1;
+      } else {
+        refused = refused + 1;
+      }
+    } else if op < 90 {
+      let t = fork(&mut c, s);
+      if t >= 0 {
+        model_copy(&mut m, s, t);
+        forks = forks + 1;
+      }
+    } else if op < 93 {
+      finish(&mut c, s);
+      m.len.set(s, 0);
+      finishes = finishes + 1;
+    }
+    ok = consistent(&c, &m);
+    step = step + 1;
+  }
+  print!("random workload: ");
+  print!(step);
+  print!(" steps, ");
+  print!(appends);
+  print!(" appends (");
+  print!(refused);
+  print!(" refused: no free block, or the table full), ");
+  print!(forks);
+  print!(" forks, ");
+  print!(finishes);
+  print!(" finishes\n");
+  if !ok {
+    failed = failed + 1;
+  }
+
+  // 3. Prefix sharing: a 40-token prompt (two full blocks and half of a third), forked into four
+  //    samples that each add 5 tokens. The two full blocks stay shared; each sample copies the
+  //    half block when it first appends.
+  let mut p = new_cache(64, 8, 12);
+  let prompt = start(&mut p);
+  for i in 0..40 {
+    append(&mut p, prompt, i64::from(i));
+  }
+  for k in 0..4 {
+    let t = fork(&mut p, prompt);
+    for i in 0..5 {
+      append(&mut p, t, i64::from(1000 * (k + 1) + i));
+    }
+  }
+  let in_use = 64 - p.free.len();
+  // Without sharing: the prompt's 3 blocks, and 3 for each sample's 45 tokens.
+  print!("prompt of 40 tokens and 4 samples of 45: ");
+  print!(in_use);
+  print!(" blocks shared, against ");
+  print!(3 + 4 * 3);
+  print!(" copied\n");
+  if in_use != 3 + 4 {
+    print!("FAIL: prefix sharing\n");
+    failed = failed + 1;
+  }
+  // The samples read the prompt and then their own tokens.
+  for s in 1..5 {
+    if token(&p, s, 39) != 39i64 || token(&p, s, 40) != i64::from(1000 * s) {
+      print!("FAIL: a sample reads the wrong tokens\n");
+      failed = failed + 1;
+    }
+  }
+
+  if failed == 0 {
+    print!("ok\n");
+  }
+  return failed;
+}
