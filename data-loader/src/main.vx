@@ -1,0 +1,252 @@
+// data-loader: the sample order of a distributed training run, checked.
+//
+// A training run reads its dataset in a new random order every epoch, split across R ranks
+// (data parallelism). Three properties matter, and each one has bitten real runs:
+//
+//   1. Every epoch, every sample is read exactly once across all ranks (bar a dropped tail when
+//      the dataset does not fill the last batch), and no two ranks read the same sample.
+//   2. The order depends only on (seed, epoch), so a run restarted from a checkpoint at step s
+//      reads exactly what the first run would have read from step s on.
+//   3. A global batch does not depend on how many ranks share it: the run can restart on 2, 4
+//      or 8 ranks (elastic training) and still see the same batches.
+//
+// The loader: each epoch is a Fisher-Yates shuffle of 0..n with a generator seeded from
+// (seed, epoch). Global batch s of the epoch is positions s*B .. s*B + B of the shuffle, and
+// rank r takes its r-th slice of B / R. A partial last batch is dropped.
+//
+// It also checks that the shuffle is uniform: over 20,000 epochs of 8 samples, each sample is
+// first about equally often (chi-square), the bias a common off-by-one in Fisher-Yates causes.
+//
+// It returns the number of failed checks, and prints "ok" when there are none.
+
+import core::convert;
+import std::vec;
+
+// splitmix64, the usual way to seed a generator from a few numbers.
+fn mix(x : u64) -> u64 {
+  let mut z = x + 11400714819323198485u64;
+  z = (z ^ (z >> 30)) * 13787848793156543929u64;
+  z = (z ^ (z >> 27)) * 10723151780794991083u64;
+  return z ^ (z >> 31);
+}
+
+struct Rng {
+  s : u64,
+}
+
+impl Rng {
+  fn next(self : &mut Rng) -> u64 {
+    self.s = mix(self.s);
+    return self.s;
+  }
+
+  // Uniform in 0..n, by rejection, so that no value is more likely than another.
+  fn below(self : &mut Rng, n : i32) -> i32 {
+    let m = u64::from(n as u32);
+    let limit = 18446744073709551615u64 - 18446744073709551615u64 % m;
+    let mut x = self.next();
+    while x >= limit {
+      x = self.next();
+    }
+    return (x % m) as i32;
+  }
+}
+
+// The order of epoch `epoch`: a Fisher-Yates shuffle of 0..n.
+fn shuffle(seed : u64, epoch : i32, n : i32) -> Vec<i32> {
+  let mut rng = Rng { s: mix(seed ^ mix(u64::from(epoch as u32))) };
+  let mut p = Vec<i32>::with_capacity(n);
+  for i in 0..n {
+    p.push(i);
+  }
+  let mut i = n - 1;
+  while i > 0 {
+    // Swap position i with a position in 0..=i (not 0..i: that would never leave a sample
+    // where it is, and the order would be biased).
+    let j = rng.below(i + 1);
+    let t = p.get(i);
+    p.set(i, p.get(j));
+    p.set(j, t);
+    i = i - 1;
+  }
+  return p;
+}
+
+// The run's shape: n samples, global batches of `batch`, `ranks` ranks.
+struct Plan {
+  seed : u64,
+  n : i32,
+  batch : i32,
+  ranks : i32,
+}
+
+impl Copy for Plan {}
+
+fn steps_per_epoch(p : Plan) -> i32 {
+  return p.n / p.batch;
+}
+
+// What rank r reads at step `step` of the run (counting across epochs): B / R sample numbers.
+// `order` must be the shuffle of that step's epoch.
+fn local_batch(p : Plan, order : &Vec<i32>, step : i32, r : i32) -> Vec<i32> {
+  let s = step % steps_per_epoch(p);
+  let local = p.batch / p.ranks;
+  let mut out = Vec<i32>::with_capacity(local);
+  for k in 0..local {
+    out.push(order.get(s * p.batch + r * local + k));
+  }
+  return out;
+}
+
+// A loader's state is just the step; this is what a checkpoint would save. Reads `count` steps for rank r starting at `from`, and appends every sample number to `out`.
+fn read(p : Plan, from : i32, count : i32, r : i32, out : &mut Vec<i32>) -> void {
+  let per = steps_per_epoch(p);
+  let mut epoch = from / per;
+  let mut order = shuffle(p.seed, epoch, p.n);
+  for step in from..from + count {
+    if step / per != epoch {
+      epoch = step / per;
+      order = shuffle(p.seed, epoch, p.n);
+    }
+    let b = local_batch(p, &order, step, r);
+    for k in 0..b.len() {
+      out.push(b.get(k));
+    }
+  }
+  return;
+}
+
+fn same(a : &Vec<i32>, b : &Vec<i32>) -> bool {
+  if a.len() != b.len() {
+    return false;
+  }
+  for i in 0..a.len() {
+    if a.get(i) != b.get(i) {
+      return false;
+    }
+  }
+  return true;
+}
+
+fn main() -> i32 {
+  let mut failed = 0;
+
+  // 1. 1000 samples, global batches of 96, 4 ranks: 10 steps an epoch, 40 samples dropped.
+  let p = Plan { seed: 2026u64, n: 1000, batch: 96, ranks: 4 };
+  let per = steps_per_epoch(p);
+  let mut cover_ok = true;
+  let mut orders_differ = true;
+  let mut previous = shuffle(p.seed, 0, p.n);
+  for epoch in 0..5 {
+    let mut seen = Vec<i32>::with_capacity(p.n);
+    for i in 0..p.n {
+      seen.push(0);
+    }
+    for r in 0..p.ranks {
+      let mut got = Vec<i32>::new();
+      read(p, epoch * per, per, r, &mut got);
+      for i in 0..got.len() {
+        seen.set(got.get(i), seen.get(got.get(i)) + 1);
+      }
+    }
+    let mut once = 0;
+    for i in 0..p.n {
+      if seen.get(i) > 1 {
+        cover_ok = false;
+      }
+      if seen.get(i) == 1 {
+        once = once + 1;
+      }
+    }
+    if once != per * p.batch {
+      cover_ok = false;
+    }
+    if epoch > 0 {
+      let order = shuffle(p.seed, epoch, p.n);
+      if same(&order, &previous) {
+        orders_differ = false;
+      }
+      previous = order;
+    }
+  }
+  print!("1000 samples, batches of 96 on 4 ranks: each epoch reads ");
+  print!(per * p.batch);
+  print!(" distinct samples and drops ");
+  print!(p.n - per * p.batch);
+  print!("\n");
+  if !cover_ok || !orders_differ {
+    print!("FAIL: an epoch reads a sample twice or misses one, or two epochs share an order\n");
+    failed = failed + 1;
+  }
+
+  // 2. Restart from a checkpoint: steps 0..37 then 37..60 equal steps 0..60, on every rank.
+  let mut resume_ok = true;
+  for r in 0..p.ranks {
+    let mut straight = Vec<i32>::new();
+    read(p, 0, 60, r, &mut straight);
+    let mut restarted = Vec<i32>::new();
+    read(p, 0, 37, r, &mut restarted);
+    read(p, 37, 23, r, &mut restarted);
+    if !same(&straight, &restarted) {
+      resume_ok = false;
+    }
+  }
+  print!("restart at step 37 of 60: every rank reads the same samples as without the restart\n");
+  if !resume_ok {
+    print!("FAIL: a restarted run reads different samples\n");
+    failed = failed + 1;
+  }
+
+  // 3. The same global batches on 1, 2, 4, 8 and 16 ranks: rank slices, put back together,
+  //    give the same 96 samples per step.
+  let one = Plan { seed: 2026u64, n: 1000, batch: 96, ranks: 1 };
+  let mut elastic_ok = true;
+  let counts = [2, 4, 8, 16];
+  for c in 0..4 {
+    let q = Plan { seed: 2026u64, n: 1000, batch: 96, ranks: counts[c] };
+    let mut joined = Vec<i32>::new();
+    for step in 0..25 {
+      for r in 0..q.ranks {
+        read(q, step, 1, r, &mut joined);
+      }
+    }
+    let mut base = Vec<i32>::new();
+    read(one, 0, 25, 0, &mut base);
+    if !same(&joined, &base) {
+      elastic_ok = false;
+    }
+  }
+  print!("the same global batches on 1, 2, 4, 8 and 16 ranks\n");
+  if !elastic_ok {
+    print!("FAIL: global batches depend on the number of ranks\n");
+    failed = failed + 1;
+  }
+
+  // 4. Uniformity: which of 8 samples comes first, over 20,000 epochs. Each count should be
+  //    about 2500; chi-square with 7 degrees of freedom stays under 24.32 with probability 0.999.
+  let mut first = Vec<i32>::new();
+  for i in 0..8 {
+    first.push(0);
+  }
+  for epoch in 0..20000 {
+    let o = shuffle(7u64, epoch, 8);
+    first.set(o.get(0), first.get(o.get(0)) + 1);
+  }
+  let mut chi : f64 = 0.0;
+  for i in 0..8 {
+    let d = f64::from(first.get(i)) - 2500.0f64;
+    chi = chi + d * d / 2500.0f64;
+  }
+  print!("first of 8 over 20000 shuffles: chi-square ");
+  print!(chi);
+  print!(" (7 degrees of freedom, limit 24.32)\n");
+  if !(chi < 24.32f64) {
+    print!("FAIL: the shuffle is not uniform\n");
+    failed = failed + 1;
+  }
+
+  if failed == 0 {
+    print!("ok\n");
+  }
+  return failed;
+}
