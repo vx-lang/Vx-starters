@@ -228,7 +228,18 @@ fail in another.
   parameter name`, with nothing saying why (as with `across`,
   [vx-lang/Vx#1650](https://github.com/vx-lang/Vx/issues/1650)).
 
+- **reshard, main 39a12e0a: a keyword as a name gives a vague error.** `let mut across = ..` is
+  `Expected identifier after let`; `across` is a keyword, and the message does not say so
+  ([vx-lang/Vx#1650](https://github.com/vx-lang/Vx/issues/1650)). Renamed to `span`.
+- **ring-allreduce, main 39a12e0a: `f64::from` has no `i64` version.** `f64::from(x)` with
+  `x : i64` is `E3036`, since the conversion can round; it stays `x as f64`, which gives no
+  warning. (`quantize` hit the same.)
+
 ## Standard library
+
+- **ring-allreduce, main 39a12e0a: no threads, so ranks are simulated.** `core::sync::atomic`
+  says "Vx has no threads yet", and `spawn on` is device dispatch. The ranks are rows of one
+  array, and a step buffers every send before applying any.
 
 - **wordcount, v0.0.3: no command-line arguments in `std`.** The runtime has `vx_env_args_count`
   and `vx_env_arg`; wordcount declares them in an `extern` block itself.
