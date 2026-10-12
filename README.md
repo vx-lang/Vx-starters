@@ -18,6 +18,8 @@ toolchain. They have two jobs:
 | [`cycle-clique`](cycle-clique) | A published proof's computer check, ported and run natively | Optimization level as a build setting; expected output that comes from another project |
 | [`hellinger`](hellinger) | Traits over three number types, `i128`, an interval proof by branch and bound, `grad` to check its derivatives | A build that goes through LLVM IR and the bundled `clang`, because `vxc -O1` is too slow |
 | [`tiny-mlp`](tiny-mlp) | `grad` on training math: textbook derivatives, backprop checked three ways, Adam on XOR | Optional toolchain parts (Enzyme); a program that only runs under `run-jit` |
+| [`flash-attn`](flash-attn) | FlashAttention's tiled online softmax, checked against naive attention | A project that needs a compiler newer than the last release |
+| [`bpe-tokenizer`](bpe-tokenizer) | A GPT-style byte-pair tokenizer: training, encoding, decoding | Data files from outside the project as test inputs |
 
 The three number libraries are for checking the computer-assisted parts of proofs, such as those
 in [openai/math](https://github.com/openai/math), where the checkers need integers of any size,
@@ -39,6 +41,11 @@ curl -fsSL https://vxlang.org/install.sh | sh
 ```
 
 Every project builds with `./build.sh` against `~/.vx/current`, or the toolchain `VX_HOME` names.
+
+The projects up to `tiny-mlp` were written against v0.0.3. From `flash-attn` on, they use Vx
+built from `main` (39a12e0a or later), which has fixes the release lacks; there is no nightly
+installer yet, so that means building Vx and packaging it with `scripts/release/package.sh`.
+Every project passes with that build too.
 
 ## One rule for the package manager
 

@@ -1,6 +1,7 @@
 # Friction log
 
-Everything that got in the way while writing these projects with a released Vx toolchain.
+Everything that got in the way while writing these projects with a Vx toolchain: v0.0.3, and
+from `flash-attn` on, Vx built from `main`.
 Each entry is a requirement for the build system or package manager
 ([vx-lang/Vx#1275](https://github.com/vx-lang/Vx/issues/1275)), or a gap in the language or
 standard library. Add to it as you go; do not tidy it into a design.
@@ -8,6 +9,12 @@ standard library. Add to it as you go; do not tidy it into a design.
 Format: the project, the toolchain version, what happened, and what we did instead.
 
 ## Building
+
+- **flash-attn, main 39a12e0a: no way to get a toolchain newer than the release.** The bug fixes
+  since v0.0.3 are only on `main`. Using them meant building Vx (a full `cargo build --release
+  --workspace`) and packaging it with `scripts/release/package.sh`, borrowing
+  the LLVM directory from the installed v0.0.3. A package needs a way to say "needs Vx newer than
+  v0.0.3", and the installer a way to install a nightly.
 
 - **wordcount, v0.0.3: no way to build an executable.** `vxc` can run a program (`run-jit`) or
   emit an object file (`emit-obj`), but not link one. `build.sh` links the object against
@@ -116,6 +123,12 @@ fail in another.
   ([vx-lang/Vx#1590](https://github.com/vx-lang/Vx/issues/1590)). The checker's intervals have no
   contracts.
 
+- **bigint, main 39a12e0a: a loop that swaps values is now a borrow error.** In `gcd`,
+  `let r = a.rem(&b); a = b; b = r;` inside a `while` is `E4007: b is moved while it is
+  borrowed`; v0.0.3 accepts it, and `r` holds no borrow
+  ([vx-lang/Vx#1646](https://github.com/vx-lang/Vx/issues/1646)). Binding the borrow first,
+  `let by = &b; let r = a.rem(by);`, is accepted.
+
 ## Running
 
 - **wordcount, v0.0.3: `run-jit` and a built binary see different arguments.** Under `run-jit`
@@ -137,6 +150,14 @@ fail in another.
   `self.count = self.count + 1`.
 
 ## Language
+
+- **flash-attn, main 39a12e0a: every widening `as` is a warning.** `(d as f64)` with `d : i32`
+  is `W1007: this cast only widens ... f64::from(..) says so`. The older projects print many
+  of these; new code uses `f64::from` and imports `core::convert`.
+- **bpe-tokenizer: no way to print one byte.** `b as char` is `Unsupported cast: cannot cast
+  from Scalar(U8) to Struct("char")`. The program writes the byte and a zero into a
+  two-byte buffer and prints that as a C string. In v0.0.3 even that fails, since a `*mut i8`
+  cannot be cast to `*const i8`.
 
 - **textkit, v0.0.3: `unsafe { .. } as T` does not parse.** `let n = unsafe { f() } as i64;` is
   a parse error (`Unexpected token As`); the cast goes inside: `unsafe { f() as i64 }`
