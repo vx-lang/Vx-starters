@@ -1,0 +1,402 @@
+// sampler: how an LLM picks the next token from its logits.
+//
+// The model gives one logit per token. Sampling turns them into probabilities with a softmax at
+// some temperature, optionally cuts the list down, and draws one token:
+//
+//   greedy       the most likely token (ties go to the lower token id);
+//   temperature  softmax(logits / T): small T sharpens toward greedy, large T flattens toward
+//                uniform;
+//   top-k        keep only the k most likely tokens;
+//   top-p        keep the smallest set of most likely tokens whose total is at least p
+//                ("nucleus" sampling);
+//   min-p        keep tokens at least p times as likely as the most likely one.
+//
+// After a cut, the kept probabilities are scaled to add up to 1. A logit of -infinity is a
+// masked token (say, one a grammar forbids): its probability is exactly 0 and it is never drawn.
+//
+// The checks:
+//   1. Greedy picks the largest logit, the lower id on a tie, and never a masked token.
+//   2. Temperature 0.01 always draws the greedy token; temperature 1000 is within 0.001 of
+//      uniform over the unmasked tokens.
+//   3. Top-k, top-p and min-p keep exactly the right tokens, and top-p's set is the smallest
+//      one that reaches p.
+//   4. 200,000 draws for each setting match the intended probabilities: a chi-square test, and
+//      no frequency more than 0.005 off. Nothing outside the kept set is ever drawn.
+//   5. The same seed gives the same tokens, and another seed does not.
+//
+// It returns the number of failed checks, and prints "ok" when there are none.
+
+import core::convert;
+import core::num;
+import std::rand;
+import std::vec;
+
+fn neg_inf() -> f64 {
+  return -1.0f64 / 0.0f64;
+}
+
+// The test logits: tokens 0 and 2 tie for the largest, token 4 is masked.
+fn logits() -> Vec<f64> {
+  let mut l = Vec<f64>::new();
+  l.push(2.0f64);
+  l.push(1.0f64);
+  l.push(2.0f64);
+  l.push(0.5f64);
+  l.push(neg_inf());
+  l.push(-1.0f64);
+  l.push(0.0f64);
+  l.push(1.5f64);
+  return l;
+}
+
+// The most likely token; the lower id on a tie. Masked tokens never win while any is unmasked.
+fn greedy(l : &Vec<f64>) -> i32 {
+  let mut best = 0;
+  for i in 1..l.len() {
+    if l.get(i) > l.get(best) {
+      best = i;
+    }
+  }
+  return best;
+}
+
+// softmax(l / t). The largest logit is subtracted first, so nothing overflows; exp(-inf) is 0.
+fn softmax(l : &Vec<f64>, t : f64) -> Vec<f64> {
+  let top = l.get(greedy(l));
+  let mut p = Vec<f64>::with_capacity(l.len());
+  let mut sum : f64 = 0.0;
+  for i in 0..l.len() {
+    let e = ((l.get(i) - top) / t).exp();
+    p.push(e);
+    sum = sum + e;
+  }
+  for i in 0..p.len() {
+    p.set(i, p.get(i) / sum);
+  }
+  return p;
+}
+
+// Token ids from most to least likely; ties keep the lower id first (insertion sort, which
+// is stable).
+fn ranked(p : &Vec<f64>) -> Vec<i32> {
+  let mut order = Vec<i32>::with_capacity(p.len());
+  for i in 0..p.len() {
+    order.push(i);
+  }
+  for i in 1..order.len() {
+    let id = order.get(i);
+    let mut j = i;
+    let mut moving = true;
+    while moving && j > 0 {
+      let before = order.get(j - 1);
+      if p.get(before) < p.get(id) {
+        order.set(j, before);
+        j = j - 1;
+      } else {
+        moving = false;
+      }
+    }
+    order.set(j, id);
+  }
+  return order;
+}
+
+// p with only the tokens marked in `keep`, scaled to add up to 1.
+fn renormalized(p : &Vec<f64>, keep : &Vec<bool>) -> Vec<f64> {
+  let mut sum : f64 = 0.0;
+  for i in 0..p.len() {
+    if keep.get(i) {
+      sum = sum + p.get(i);
+    }
+  }
+  let mut out = Vec<f64>::with_capacity(p.len());
+  for i in 0..p.len() {
+    if keep.get(i) {
+      out.push(p.get(i) / sum);
+    } else {
+      out.push(0.0f64);
+    }
+  }
+  return out;
+}
+
+fn none_kept(n : i32) -> Vec<bool> {
+  let mut keep = Vec<bool>::with_capacity(n);
+  for i in 0..n {
+    keep.push(false);
+  }
+  return keep;
+}
+
+// The k most likely tokens.
+fn top_k(p : &Vec<f64>, k : i32) -> Vec<bool> {
+  let order = ranked(p);
+  let mut keep = none_kept(p.len());
+  for r in 0..k {
+    keep.set(order.get(r), true);
+  }
+  return keep;
+}
+
+// The most likely tokens, in order, until their total reaches `mass`.
+fn top_p(p : &Vec<f64>, mass : f64) -> Vec<bool> {
+  let order = ranked(p);
+  let mut keep = none_kept(p.len());
+  let mut total : f64 = 0.0;
+  let mut r = 0;
+  while r < order.len() && total < mass {
+    let id = order.get(r);
+    keep.set(id, true);
+    total = total + p.get(id);
+    r = r + 1;
+  }
+  return keep;
+}
+
+// The tokens at least `ratio` times as likely as the most likely one.
+fn min_p(p : &Vec<f64>, ratio : f64) -> Vec<bool> {
+  let top = p.get(greedy(p));
+  let mut keep = none_kept(p.len());
+  for i in 0..p.len() {
+    if p.get(i) >= ratio * top && p.get(i) > 0.0f64 {
+      keep.set(i, true);
+    }
+  }
+  return keep;
+}
+
+// A token drawn from p with u uniform in [0, 1): the first whose running total passes u. Zero
+// probabilities never pass, so a masked token is never drawn.
+fn draw(p : &Vec<f64>, u : f64) -> i32 {
+  let mut total : f64 = 0.0;
+  let mut last = 0;
+  for i in 0..p.len() {
+    if p.get(i) > 0.0f64 {
+      total = total + p.get(i);
+      last = i;
+      if u < total {
+        return i;
+      }
+    }
+  }
+  // Rounding can leave the total just under 1.
+  return last;
+}
+
+fn max_diff(a : &Vec<f64>, b : &Vec<f64>) -> f64 {
+  let mut worst : f64 = 0.0;
+  for i in 0..a.len() {
+    let e = (a.get(i) - b.get(i)).abs();
+    if !(e <= worst) {
+      worst = e;
+    }
+  }
+  return worst;
+}
+
+fn same_set(a : &Vec<bool>, b : &Vec<bool>) -> bool {
+  for i in 0..a.len() {
+    if a.get(i) != b.get(i) {
+      return false;
+    }
+  }
+  return true;
+}
+
+fn set_of(ids : &Vec<i32>, n : i32) -> Vec<bool> {
+  let mut keep = none_kept(n);
+  for i in 0..ids.len() {
+    keep.set(ids.get(i), true);
+  }
+  return keep;
+}
+
+// Draw `n` tokens from p and compare the counts with p. Prints the result; returns the number
+// of failures (0 or 1).
+fn empirical(name : *const i8, p : &Vec<f64>, n : i32, seed : u64) -> i32 {
+  let mut rng = Rng::seeded(seed);
+  let mut counts = Vec<i32>::new();
+  for i in 0..p.len() {
+    counts.push(0);
+  }
+  for d in 0..n {
+    let t = draw(p, rng.next_f64());
+    counts.set(t, counts.get(t) + 1);
+  }
+  // Chi-square over the tokens that can be drawn, and the largest frequency error.
+  let total = f64::from(n);
+  let mut chi : f64 = 0.0;
+  let mut cells = 0;
+  let mut worst : f64 = 0.0;
+  let mut outside = 0;
+  for i in 0..p.len() {
+    let seen = f64::from(counts.get(i));
+    if p.get(i) > 0.0f64 {
+      let want = total * p.get(i);
+      chi = chi + (seen - want) * (seen - want) / want;
+      cells = cells + 1;
+    } else if counts.get(i) > 0 {
+      outside = outside + counts.get(i);
+    }
+    worst = worst.max((seen / total - p.get(i)).abs());
+  }
+  // The chi-square value that a correct sampler exceeds with chance 0.001, for 1 to 7 degrees
+  // of freedom.
+  let limits = [10.83f64, 13.82f64, 16.27f64, 18.47f64, 20.52f64, 22.46f64, 24.32f64];
+  let limit = limits[cells - 2];
+  print!(name);
+  print!(": chi-square ");
+  print!(chi);
+  print!(" (");
+  print!(cells - 1);
+  print!(" degrees of freedom, limit ");
+  print!(limit);
+  print!("), largest frequency error ");
+  print!(worst);
+  print!("\n");
+  if outside > 0 || !(chi < limit) || !(worst < 0.005f64) {
+    print!("FAIL: ");
+    print!(name);
+    print!(" draws do not match\n");
+    return 1;
+  }
+  return 0;
+}
+
+fn main() -> i32 {
+  let l = logits();
+  let n = l.len();
+  let mut failed = 0;
+
+  // 1. Greedy.
+  if greedy(&l) != 0 {
+    print!("FAIL: greedy should pick token 0 (tied with 2, lower id)\n");
+    failed = failed + 1;
+  }
+  let mut only = Vec<f64>::new();
+  for i in 0..n {
+    only.push(neg_inf());
+  }
+  only.set(5, -3.0f64);
+  if greedy(&only) != 5 {
+    print!("FAIL: greedy with everything masked but token 5\n");
+    failed = failed + 1;
+  }
+
+  let p = softmax(&l, 1.0f64);
+  if p.get(4) != 0.0f64 {
+    print!("FAIL: a masked token has a probability\n");
+    failed = failed + 1;
+  }
+
+  // 2. Temperature. At 0.01 the two tied tokens share everything; drawing goes to the first.
+  let cold = softmax(&l, 0.01f64);
+  let mut rng = Rng::seeded(7u64);
+  let mut not_greedy = 0;
+  for d in 0..10000 {
+    let t = draw(&cold, rng.next_f64());
+    if t != 0 && t != 2 {
+      not_greedy = not_greedy + 1;
+    }
+  }
+  print!("temperature 0.01: ");
+  print!(not_greedy);
+  print!(" of 10000 draws were neither of the two tied top tokens\n");
+  if not_greedy > 0 {
+    print!("FAIL: temperature 0.01 should act like greedy\n");
+    failed = failed + 1;
+  }
+  let hot = softmax(&l, 1000.0f64);
+  let mut uniform = Vec<f64>::new();
+  for i in 0..n {
+    if i == 4 {
+      uniform.push(0.0f64);
+    } else {
+      uniform.push(1.0f64 / 7.0f64);
+    }
+  }
+  print!("temperature 1000: largest difference from uniform ");
+  print!(max_diff(&hot, &uniform));
+  print!("\n");
+  if !(max_diff(&hot, &uniform) < 0.001f64) {
+    print!("FAIL: temperature 1000 should be nearly uniform\n");
+    failed = failed + 1;
+  }
+
+  // 3. The kept sets, worked out by hand from p = softmax(l): in order the tokens are
+  //    0, 2 (0.296 each), 7 (0.179), 1 (0.109), 3 (0.066), 6 (0.040), 5 (0.015), 4 (masked).
+  let mut want = Vec<i32>::new();
+  want.push(0);
+  want.push(2);
+  want.push(7);
+  if !same_set(&top_k(&p, 3), &set_of(&want, n)) {
+    print!("FAIL: top-k 3\n");
+    failed = failed + 1;
+  }
+  // 0.296 + 0.296 + 0.179 = 0.771 < 0.8, and adding token 1 makes 0.879.
+  want.push(1);
+  if !same_set(&top_p(&p, 0.8f64), &set_of(&want, n)) {
+    print!("FAIL: top-p 0.8\n");
+    failed = failed + 1;
+  }
+  // 0.2 * 0.296 = 0.059: tokens 0, 2, 7, 1 and 3 (0.066) pass; 6 (0.040) does not.
+  want.push(3);
+  if !same_set(&min_p(&p, 0.2f64), &set_of(&want, n)) {
+    print!("FAIL: min-p 0.2\n");
+    failed = failed + 1;
+  }
+  // Top-p for many p: the kept total reaches p, and without its least likely token it would
+  // not.
+  let mut minimal = true;
+  for step in 1..100 {
+    let mass = f64::from(step) / 100.0f64;
+    let keep = top_p(&p, mass);
+    let mut total : f64 = 0.0;
+    let mut smallest : f64 = 2.0;
+    for i in 0..n {
+      if keep.get(i) {
+        total = total + p.get(i);
+        smallest = smallest.min(p.get(i));
+      }
+    }
+    if total < mass || total - smallest >= mass {
+      minimal = false;
+    }
+  }
+  if !minimal {
+    print!("FAIL: top-p does not keep the smallest set that reaches p\n");
+    failed = failed + 1;
+  }
+
+  // 4. Draws against the intended probabilities.
+  failed = failed + empirical("temperature 1", &p, 200000, 1u64);
+  failed = failed + empirical("temperature 0.7", &softmax(&l, 0.7f64), 200000, 2u64);
+  failed = failed + empirical("top-k 3", &renormalized(&p, &top_k(&p, 3)), 200000, 3u64);
+  failed = failed + empirical("top-p 0.8", &renormalized(&p, &top_p(&p, 0.8f64)), 200000, 4u64);
+  failed = failed + empirical("min-p 0.2", &renormalized(&p, &min_p(&p, 0.2f64)), 200000, 5u64);
+
+  // 5. Seeds.
+  let mut a = Rng::seeded(42u64);
+  let mut b = Rng::seeded(42u64);
+  let mut c = Rng::seeded(43u64);
+  let mut same = true;
+  let mut differs = false;
+  for d in 0..1000 {
+    let x = draw(&p, a.next_f64());
+    if x != draw(&p, b.next_f64()) {
+      same = false;
+    }
+    if x != draw(&p, c.next_f64()) {
+      differs = true;
+    }
+  }
+  if !same || !differs {
+    print!("FAIL: seeds\n");
+    failed = failed + 1;
+  }
+
+  if failed == 0 {
+    print!("ok\n");
+  }
+  return failed;
+}
