@@ -35,18 +35,13 @@ toolchain. They have two jobs:
 | [`moe-router`](moe-router) | Mixture-of-experts top-k routing with expert capacity, dropped tokens, the balance loss, and dispatch/combine | One more project of the same shape: what a template or `vx new` would generate |
 | [`layernorm`](layernorm) | Variance in f32 (one pass fails, two-pass and Welford do not), merging statistics across shards, LayerNorm's backward against `grad` | Numerical tolerances as part of a test's contract |
 | [`ffi-zlib`](ffi-zlib) | Calling a C library: zlib's crc32, adler32, compress2 and uncompress through an `extern` block, checked against known values and a CRC-32 written in Vx | Linking native libraries: `vxc` cannot add `-lz`, so the build compiles to an object and links it by hand |
+| [`will-it-fit`](will-it-fit) | `--machine`: one program admitted or refused per GPU (A100 40 GB, H100); capacity (E6010) and dtype (E6026) errors predicted by a run-time calculation and matched exactly | Machine models as build inputs, per target: the same source, one compile per machine file |
+| [`prefill-decode`](prefill-decode) | `spawn on` GPU and NPU regions, `transfer` / `to_device` of a KV cache, `--verify-seams` proving every hop and refusing a relaxed one | Optional tools (`z3`) in the test step: skipped with a message when missing |
 
 The three number libraries are for checking the computer-assisted parts of proofs, such as those
 in [openai/math](https://github.com/openai/math), where the checkers need integers of any size,
 exact fractions and interval bounds, and Vx's `std` has none of them. `cycle-clique` and `hellinger` are the
 first such checks ([vx-lang/Vx#1489](https://github.com/vx-lang/Vx/issues/1489)).
-
-Planned, each adding one new question:
-
-| Project | Shows | Build-system question |
-| --- | --- | --- |
-| `will-it-fit` | `--machine`, capacity and dtype errors | Machine models as build inputs, per target |
-| `prefill-decode` | `spawn on`, `transfer`, `--verify-seams` | Optional tools (`z3`) in the test step |
 
 ## Getting the toolchain
 

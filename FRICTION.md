@@ -289,6 +289,25 @@ fail in another.
   ([vx-lang/Vx#1656](https://github.com/vx-lang/Vx/issues/1656)). Calling `grad` from a small
   function with an `i32` parameter works.
 
+- **will-it-fit, main 39a12e0a: code for fp8 tensors is not written.** An fp8 program admitted
+  against the H100 fails in codegen ("sub-8-bit float element types are capacity/declaration-
+  only"), so admission uses `-a print-ast`, which runs every check and stops before codegen.
+  vxc also reads stdin, so a `while read` loop in build.sh must give it `< /dev/null`.
+- **will-it-fit, main 39a12e0a: an int4 weight counts as a whole byte.** That is what Vx
+  allocates (vx-lang/Vx#1202), so int4 weights look twice their packed size (vx-lang/Vx#1437).
+  `h200.vx` and `mi300x.vx` have no GPU-to-host edge, so a program reading its tensors back
+  cannot be admitted on them (vx-lang/Vx#1403).
+- **prefill-decode, main 39a12e0a: model code cannot be shared between devices.** A function
+  belongs to one topology (`E6001: Function 'embed' requires topology 'CPU', but is called from
+  'GPU[0]'`). Formulas became macros, but a macro can only stand for an expression (`Expected
+  expression, found Let`), so the decode step is written twice, once `on Topology::NPU[0]` and
+  once for the host.
+- **prefill-decode, main 39a12e0a: macro calls break in two places.** A macro call as another
+  macro's argument, `print!` included, fails with `Macro failed to expand`, six times, with no
+  location ([vx-lang/Vx#1655](https://github.com/vx-lang/Vx/issues/1655)). A macro call ending
+  an `if` condition swallows the `{` ([vx-lang/Vx#1657](https://github.com/vx-lang/Vx/issues/1657)).
+  Both are worked around with a `let`.
+
 ## Standard library
 
 - **ring-allreduce, main 39a12e0a: no threads, so ranks are simulated.** `core::sync::atomic`
