@@ -260,6 +260,10 @@ fail in another.
   allow a trailing comma, and `10000.0f64.powf(..)` does not parse (`Unknown element type
   'f64.powf'`); a typed `let` first works.
 
+- **lr-schedule, main 39a12e0a: no exponent in number literals.** `1e-15`, `1.0e-15` and `1.5E3`
+  are `Unknown element type 'e'` ([vx-lang/Vx#1654](https://github.com/vx-lang/Vx/issues/1654)).
+  Tolerances are written out as `0.000000000000001f64`.
+
 ## Standard library
 
 - **ring-allreduce, main 39a12e0a: no threads, so ranks are simulated.** `core::sync::atomic`

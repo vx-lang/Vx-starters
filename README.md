@@ -29,6 +29,7 @@ toolchain. They have two jobs:
 | [`bf16`](bf16) | bf16 and fp16 rounding as bit operations, checked against Vx's own types; a stalled bf16 sum, loss scaling, dynamic loss scaling | Checking against the toolchain's own number types, whose conversions depend on the CPU |
 | [`sampler`](sampler) | Greedy, temperature, top-k, top-p and min-p sampling, with masked tokens; 200,000 draws per setting checked by chi-square | Statistical tests in the test step: a seeded RNG from `std::rand` and a pass threshold |
 | [`rope`](rope) | Rotary position embeddings: rotation keeps length, attention sees only relative positions; constants computed by `comptime` | Values worked out by the compiler, and checked against the run-time library |
+| [`lr-schedule`](lr-schedule) | Warmup and cosine decay, clipping by global norm, gradient accumulation checked with `grad`; one bad label that clipping survives | The same optional toolchain part (Enzyme) in a second project |
 
 The three number libraries are for checking the computer-assisted parts of proofs, such as those
 in [openai/math](https://github.com/openai/math), where the checkers need integers of any size,
