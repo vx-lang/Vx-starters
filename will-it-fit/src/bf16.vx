@@ -1,0 +1,36 @@
+// will-it-fit, bf16: an 8B-class model served from one GPU, everything in bf16.
+//
+//   vxc --machine <machine file> --host <host file> -a emit-mlir src/bf16.vx
+//
+// Compiling is the check: the compiler adds up what is placed in the machine's HBM and refuses
+// the program if it does not fit. This program is never run; its tensors are tens of GiB.
+//
+// The model: 32 layers, 32 query heads and 8 KV heads of 128 (hidden size 4096), as in
+// Llama-3-8B. Served at batch 32 with 8192 tokens of context each.
+//
+//   weights      12 * LAYERS * DIM^2            (attention 4 DIM^2, MLP 8 DIM^2)
+//   KV cache     2 * LAYERS * BATCH * CTX * KVDIM
+//   activations  BATCH * CTX * DIM
+//
+// with DIM = HEADS * HDIM and KVDIM = KVHEADS * HDIM, two bytes each. src/sizes.vx works out
+// the same numbers at run time.
+
+fn admit<const LAYERS : i32, const HEADS : i32, const KVHEADS : i32, const HDIM : i32, const CTX : i32, const BATCH : i32>() -> i32 {
+  let w : Tensor<bf16, [12 * LAYERS * HEADS * HDIM, HEADS * HDIM]> = Tensor<bf16>([12 * LAYERS * HEADS * HDIM, HEADS * HDIM]);
+  let weights = transfer(w, Memory::HBM);
+  let kv : Tensor<bf16, [2 * LAYERS * BATCH * CTX, KVHEADS * HDIM]> = Tensor<bf16>([2 * LAYERS * BATCH * CTX, KVHEADS * HDIM]);
+  let cache = transfer(kv, Memory::HBM);
+  let a : Tensor<bf16, [BATCH * CTX, HEADS * HDIM]> = Tensor<bf16>([BATCH * CTX, HEADS * HDIM]);
+  let acts = transfer(a, Memory::HBM);
+  // A decode step holds all three at once. Reading them back after the last placement is what
+  // tells the compiler so: a tensor nobody reads is released where it is made.
+  let _w = transfer(weights, Memory::CPU_DRAM);
+  let _k = transfer(cache, Memory::CPU_DRAM);
+  let _a = transfer(acts, Memory::CPU_DRAM);
+  return 0;
+}
+
+fn main() -> i32 {
+  //   admit<LAYERS, HEADS, KVHEADS, HDIM, CTX, BATCH>
+  return admit<32, 32, 8, 128, 8192, 32>();
+}
