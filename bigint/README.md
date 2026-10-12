@@ -4,7 +4,7 @@ Integers of any size. The first of three libraries for checking the computer-ass
 proofs, where every digit has to be right: `bigint`, then [`rational`](../rational) and
 [`interval`](../interval).
 
-```
+```console
 $ ./build.sh
 ok
 ```
@@ -13,7 +13,7 @@ ok
 first: add, subtract, multiply (schoolbook), shift, and long division (Knuth's algorithm D).
 `int.vx` puts a sign on them as `BigInt`:
 
-```
+```rust
 import bigint::int;
 
 let a = BigInt::parse("-123456789012345678901234567890").unwrap();

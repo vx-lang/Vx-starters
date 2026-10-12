@@ -3,7 +3,7 @@
 The statistics behind LayerNorm and RMSNorm, computed without losing them in f32, and
 LayerNorm's backward formula checked against `grad`.
 
-```
+```console
 $ ./build.sh
 variance of 20 f32 rows of 4096 around 1000, spread 0.1, relative error:
   one pass E[x^2] - E[x]^2: 3623.723577027836 (0 rows negative)

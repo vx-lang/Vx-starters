@@ -3,7 +3,7 @@
 A small library for counting things in text: words, numbers, runs of capital letters.
 [`textstat`](../textstat) is a tool that uses it.
 
-```
+```console
 $ ./build.sh
 ok
 ```
@@ -13,7 +13,7 @@ ok
 the runs of bytes in class `C`. Text can be fed to it in pieces, and a run that crosses two
 pieces counts once:
 
-```
+```rust
 import textkit::runs;
 
 let mut w = words();             // Runs<Not<Space>>
@@ -28,7 +28,7 @@ paths are the toolchain's `stdlib/` and the current directory, so the directory 
 `textkit/` must be added. `VX_STD_PATH` does that, but it replaces the stdlib paths, so they are
 listed again:
 
-```
+```sh
 export VX_STD_PATH="$VX_HOME/stdlib/std:$VX_HOME/stdlib:.."
 ```
 

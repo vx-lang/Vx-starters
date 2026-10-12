@@ -3,7 +3,7 @@
 The parts of a training loop around the gradient: the learning-rate schedule, gradient clipping
 and gradient accumulation, with gradients from Vx's `grad`.
 
-```
+```console
 $ ./build.sh
 schedule: step 0 0.0000029999999999999997, step 99 0.0003, step 550 0.00016499999999999997, step 999 0.000030000822466198297
 clipping: norm 5 to 1 gives norm 1, same direction (cosine 1)

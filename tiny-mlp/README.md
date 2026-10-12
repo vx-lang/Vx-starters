@@ -2,7 +2,7 @@
 
 The math of a training run, differentiated by Vx's `grad`.
 
-```
+```console
 $ ./build.sh
 textbook derivatives: sigmoid, tanh, logistic loss, softmax cross-entropy at 20 points
 gradient of the XOR loss, 9 weights: grad vs backprop differ by at most 5.6e-17, vs central differences by at most 7.9e-11

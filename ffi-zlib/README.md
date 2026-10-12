@@ -2,7 +2,7 @@
 
 Vx calling a C library: the system's zlib, through an `extern` block.
 
-```
+```console
 $ ./build.sh
 zlib 1.3.1
 crc32("123456789") = 3421780262, adler32("Wikipedia") = 300286872

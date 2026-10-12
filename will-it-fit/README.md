@@ -3,7 +3,7 @@
 "Will this model fit on this GPU?", answered by the compiler: the same program is compiled
 against two machine files, an A100 40 GB and an H100 80 GB, and refused where it does not fit.
 
-```
+```console
 $ ./build.sh
 weights, 32 x 4096 x 4096 x 12:
   bf16 12884901888 bytes (12 GiB)
@@ -50,7 +50,7 @@ decode step:
 `src/bf16.vx` declares the three tensors with these sizes, as const-generic arithmetic, and
 places them in `Memory::HBM`. It is never run, only compiled:
 
-```
+```sh
 vxc --machine $VX_HOME/fleet/a100-40.vx --host $VX_HOME/fleet/host-x86-e5-2666v3.vx -a print-ast src/bf16.vx
 Error[E6010]: the working set placed in memory space 'HBM' (3 tiles) sums to 49392123904 bytes, over its 42949672960 byte capacity
 ```

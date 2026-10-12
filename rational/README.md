@@ -2,14 +2,14 @@
 
 Exact fractions, built on [`bigint`](../bigint).
 
-```
+```console
 $ ./build.sh
 ok
 ```
 
 `rat.vx` defines `Rational`, always in lowest terms with a positive denominator:
 
-```
+```rust
 import bigint::int;
 import rational::rat;
 

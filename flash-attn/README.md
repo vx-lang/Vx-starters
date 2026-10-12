@@ -2,7 +2,7 @@
 
 Attention computed two ways: the textbook way, and the way FlashAttention does it. They agree.
 
-```
+```console
 $ ./build.sh
 non-causal: tiled vs naive, 6 tile shapes, largest difference 2.8e-16
 causal:     tiled vs naive, 6 tile shapes, largest difference 1.7e-16

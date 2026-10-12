@@ -2,7 +2,7 @@
 
 Byte-pair encoding, the tokenizer behind GPT models: train it, encode with it, decode with it.
 
-```
+```console
 $ ./build.sh
 aaabdaaabac: 3 merges, 5 tokens
 trained on ../FRICTION.md: 13975 bytes, 500 merges

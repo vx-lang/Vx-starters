@@ -6,7 +6,7 @@ function" bound. The proof is "Hellinger contraction with arbitrary Boolean outp
 [openai/math](https://github.com/openai/math)
 (`preprints/Hellinger-contraction-with-arbitrary-Boolean-output-bias-September-24-2026`).
 
-```
+```console
 $ ./build.sh
 ok: pass (798493 boxes)
 ok: 6282 points, value and three derivatives each

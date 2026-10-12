@@ -2,7 +2,7 @@
 
 Write and read `.safetensors`, the checkpoint format most model weights ship in today.
 
-```
+```console
 $ ./build.sh
 embed.weight [4, 3]: -1 -0.75 -0.5 -0.25 0 0.25 0.5 0.75 1 1.25 1.5 1.75
 head.bias [3]: 0.5 -1.5 3
