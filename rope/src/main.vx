@@ -1,0 +1,302 @@
+// rope: rotary position embeddings, with their constants worked out at compile time.
+//
+// RoPE (used in LLaMA and most recent LLMs) encodes a token's position m by rotating its query
+// and key vectors. The vector is split into pairs (x[2i], x[2i+1]), and pair i is turned by the
+// angle m * theta_i, with theta_i = base^(-2i/d). Because a rotation by a and then by -b is a
+// rotation by a - b, the dot product of a query at position m with a key at position n depends
+// only on m - n: attention sees relative positions.
+//
+// The cos and sin of each theta_i are computed in `comptime` blocks, so the program carries them
+// as constants. The compile-time evaluator cannot call `cos` or `sin`, so they come from plain
+// arithmetic: theta_1 = base^(-2/d) by Newton's method, then Taylor series. The table for every
+// position is built from them at run time, by turning position m once more to get m + 1.
+//
+// The checks:
+//   1. The compile-time constants equal `cos` and `sin` at run time to 1e-15, and the table
+//      made from them to 1e-14.
+//   2. Position 0 changes nothing.
+//   3. Rotation keeps a vector's length.
+//   4. For every pair of positions, q(m) . k(n) equals q(m - n) . k(0) (or q(0) . k(n - m)).
+//   5. The result equals the complex-number form: pair i as z = x[2i] + i x[2i+1], times
+//      e^(i m theta_i), with `cos` and `sin` at run time.
+//
+// It returns the number of failed checks, and prints "ok" when there are none.
+
+import core::convert;
+import core::num;
+
+// Head size 8 (four pairs), positions 0 to 15, base 10000.
+
+fn pi() -> f64 {
+  return 3.141592653589793f64;
+}
+
+// sin(x): reduce to [-pi, pi], then 30 terms of the Taylor series.
+fn sin_series(x0 : f64) -> f64 {
+  let mut x = x0;
+  while x > pi() {
+    x = x - 2.0f64 * pi();
+  }
+  while x < 0.0f64 - pi() {
+    x = x + 2.0f64 * pi();
+  }
+  let mut term = x;
+  let mut sum = x;
+  let mut n : f64 = 1.0;
+  for k in 0..30 {
+    term = 0.0f64 - term * x * x / ((n + 1.0f64) * (n + 2.0f64));
+    n = n + 2.0f64;
+    sum = sum + term;
+  }
+  return sum;
+}
+
+fn cos_series(x : f64) -> f64 {
+  return sin_series(x + pi() / 2.0f64);
+}
+
+// The x > 0 with x^4 = c, by Newton's method from x = 1.
+fn fourth_root(c : f64) -> f64 {
+  let mut x : f64 = 1.0;
+  for k in 0..60 {
+    x = x - (x * x * x * x - c) / (4.0f64 * x * x * x);
+  }
+  return x;
+}
+
+fn zeros8() -> Tensor<f64, [8]> {
+  return [0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64];
+}
+
+fn zeros64() -> Tensor<f64, [64]> {
+  return [
+    0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64,
+    0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64,
+    0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64,
+    0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64,
+    0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64,
+    0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64,
+    0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64,
+    0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64
+  ];
+}
+
+// theta_k = 10000^(-2k/8) = r^k, with r = 10000^(-1/4).
+fn freq(k : i32) -> f64 {
+  let r = fourth_root(1.0f64 / 10000.0f64);
+  let mut t : f64 = 1.0;
+  for j in 0..k {
+    t = t * r;
+  }
+  return t;
+}
+
+// The cos and sin of each theta_i, worked out by the compiler. Each is its own `comptime`
+// block, because a tensor of f64 made at compile time comes out as whole numbers or f32
+// (vx-lang/Vx#1649); single f64 values come out exactly.
+struct Steps {
+  c : Tensor<f64, [4]>,
+  s : Tensor<f64, [4]>,
+}
+
+fn steps() -> Steps {
+  let c0 = comptime { cos_series(freq(0)) };
+  let c1 = comptime { cos_series(freq(1)) };
+  let c2 = comptime { cos_series(freq(2)) };
+  let c3 = comptime { cos_series(freq(3)) };
+  let s0 = comptime { sin_series(freq(0)) };
+  let s1 = comptime { sin_series(freq(1)) };
+  let s2 = comptime { sin_series(freq(2)) };
+  let s3 = comptime { sin_series(freq(3)) };
+  return Steps { c: [c0, c1, c2, c3], s: [s0, s1, s2, s3] };
+}
+
+// The tables of cos(m theta_i) and sin(m theta_i), entry 4 m + i, for m in 0..16: position
+// m + 1 is position m turned once more by theta_i (the angle-addition formulas).
+struct Table {
+  cs : Tensor<f64, [64]>,
+  sn : Tensor<f64, [64]>,
+}
+
+fn table(st : &Steps) -> Table {
+  let mut cs = zeros64();
+  let mut sn = zeros64();
+  for i in 0..4 {
+    cs[i] = 1.0f64;
+    sn[i] = 0.0f64;
+  }
+  for m in 1..16 {
+    for i in 0..4 {
+      let c = cs[4 * (m - 1) + i];
+      let s = sn[4 * (m - 1) + i];
+      cs[4 * m + i] = c * st.c[i] - s * st.s[i];
+      sn[4 * m + i] = s * st.c[i] + c * st.s[i];
+    }
+  }
+  return Table { cs: cs, sn: sn };
+}
+
+// The same angles at run time, from `powf`, `cos` and `sin`.
+fn theta(i : i32) -> f64 {
+  let base : f64 = 10000.0;
+  return base.powf(-2.0f64 * f64::from(i) / 8.0f64);
+}
+
+// x rotated to position m, using the table.
+fn rope(x : &Tensor<f64, [8]>, m : i32, cs : &Tensor<f64, [64]>, sn : &Tensor<f64, [64]>)
+    -> Tensor<f64, [8]> {
+  let mut out = zeros8();
+  for i in 0..4 {
+    let c = cs[4 * m + i];
+    let s = sn[4 * m + i];
+    let a = x[2 * i];
+    let b = x[2 * i + 1];
+    out[2 * i] = a * c - b * s;
+    out[2 * i + 1] = a * s + b * c;
+  }
+  return out;
+}
+
+// The complex form: pair i is z = x[2i] + i x[2i+1], multiplied by w = e^(i m theta_i).
+fn rope_complex(x : &Tensor<f64, [8]>, m : i32) -> Tensor<f64, [8]> {
+  let mut out = zeros8();
+  for i in 0..4 {
+    let angle = f64::from(m) * theta(i);
+    let w_re = angle.cos();
+    let w_im = angle.sin();
+    let z_re = x[2 * i];
+    let z_im = x[2 * i + 1];
+    out[2 * i] = z_re * w_re - z_im * w_im;
+    out[2 * i + 1] = z_re * w_im + z_im * w_re;
+  }
+  return out;
+}
+
+fn dot(a : &Tensor<f64, [8]>, b : &Tensor<f64, [8]>) -> f64 {
+  let mut s : f64 = 0.0;
+  for i in 0..8 {
+    s = s + a[i] * b[i];
+  }
+  return s;
+}
+
+struct Rng {
+  s : u64,
+}
+
+impl Rng {
+  fn unit(self : &mut Rng) -> f64 {
+    let mut x = self.s;
+    x = x ^ (x << 13);
+    x = x ^ (x >> 7);
+    x = x ^ (x << 17);
+    self.s = x;
+    let n = (x % 2000001u64) as i64;
+    return ((n - 1000000) as f64) / 1000000.0f64;
+  }
+}
+
+fn random_vector(rng : &mut Rng) -> Tensor<f64, [8]> {
+  let mut v = zeros8();
+  for i in 0..8 {
+    v[i] = rng.unit();
+  }
+  return v;
+}
+
+fn report(what : *const i8, worst : f64, limit : f64) -> i32 {
+  print!(what);
+  print!(": largest difference ");
+  print!(worst);
+  print!("\n");
+  if !(worst < limit) {
+    print!("FAIL: ");
+    print!(what);
+    print!("\n");
+    return 1;
+  }
+  return 0;
+}
+
+fn main() -> i32 {
+  let st = steps();
+  let tab = table(&st);
+  let cs = tab.cs;
+  let sn = tab.sn;
+  let mut failed = 0;
+
+  // 1. The compile-time constants, and the table made from them, against `cos` and `sin`.
+  let mut worst : f64 = 0.0;
+  for i in 0..4 {
+    let e = (st.c[i] - theta(i).cos()).abs().max((st.s[i] - theta(i).sin()).abs());
+    if !(e <= worst) {
+      worst = e;
+    }
+  }
+  failed = failed + report("compile-time cos and sin of the 4 frequencies vs run time", worst,
+                           0.000000000000001f64);
+  worst = 0.0;
+  for m in 0..16 {
+    for i in 0..4 {
+      let angle = f64::from(m) * theta(i);
+      let e = (cs[4 * m + i] - angle.cos()).abs().max((sn[4 * m + i] - angle.sin()).abs());
+      if !(e <= worst) {
+        worst = e;
+      }
+    }
+  }
+  failed = failed + report("table vs cos and sin, 16 positions x 4 frequencies", worst,
+                           0.00000000000001f64);
+
+  let mut rng = Rng { s: 88172645463325252u64 };
+  let mut zero : f64 = 0.0;
+  let mut norm : f64 = 0.0;
+  let mut complex : f64 = 0.0;
+  let mut relative : f64 = 0.0;
+  for trial in 0..20 {
+    let q = random_vector(&mut rng);
+    let k = random_vector(&mut rng);
+
+    // 2. Position 0.
+    let q0 = rope(&q, 0, &cs, &sn);
+    for i in 0..8 {
+      zero = zero.max((q0[i] - q[i]).abs());
+    }
+
+    for m in 0..16 {
+      let qm = rope(&q, m, &cs, &sn);
+      // 3. Length.
+      norm = norm.max((dot(&qm, &qm).sqrt() - dot(&q, &q).sqrt()).abs());
+      // 5. The complex form.
+      let z = rope_complex(&q, m);
+      for i in 0..8 {
+        complex = complex.max((qm[i] - z[i]).abs());
+      }
+      // 4. Only m - n matters.
+      for n in 0..16 {
+        let kn = rope(&k, n, &cs, &sn);
+        let here = dot(&qm, &kn);
+        let mut there : f64 = 0.0;
+        if m >= n {
+          let qd = rope(&q, m - n, &cs, &sn);
+          there = dot(&qd, &k);
+        } else {
+          let kd = rope(&k, n - m, &cs, &sn);
+          there = dot(&q, &kd);
+        }
+        relative = relative.max((here - there).abs());
+      }
+    }
+  }
+  failed = failed + report("position 0 is the identity", zero, 0.000000000000001f64);
+  failed = failed + report("rotation keeps the length", norm, 0.000000000001f64);
+  failed = failed + report("q(m) . k(n) = q(m - n) . k(0), all 256 pairs", relative,
+                           0.000000000001f64);
+  failed = failed + report("table rotation vs complex multiplication", complex,
+                           0.000000000001f64);
+
+  if failed == 0 {
+    print!("ok\n");
+  }
+  return failed;
+}
