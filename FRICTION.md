@@ -129,6 +129,15 @@ fail in another.
   ([vx-lang/Vx#1646](https://github.com/vx-lang/Vx/issues/1646)). Binding the borrow first,
   `let by = &b; let r = a.rem(by);`, is accepted.
 
+- **paged-kv, main 39a12e0a: the prover knows nothing about `let mut`, `/` or `%`.** A loop
+  invariant about a variable the loop changes cannot be proved even on entry, and
+  `let mut r = pos; r = r + 1;` loses `pos >= 0` (vx-lang/Vx#1353, #1356). Contracts went on
+  small straight-line functions, and the cache keeps lengths as (blocks, fill) so that nothing
+  proved needs a division.
+- **paged-kv, main 39a12e0a: a parameter used only in a contract is "unused".** `W1009: Unused
+  function parameter 'blocks'`, with no location, for the pool size in `slot`'s `requires`
+  ([vx-lang/Vx#1647](https://github.com/vx-lang/Vx/issues/1647)).
+
 ## Running
 
 - **wordcount, v0.0.3: `run-jit` and a built binary see different arguments.** Under `run-jit`
