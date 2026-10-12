@@ -31,6 +31,7 @@ toolchain. They have two jobs:
 | [`rope`](rope) | Rotary position embeddings: rotation keeps length, attention sees only relative positions; constants computed by `comptime` | Values worked out by the compiler, and checked against the run-time library |
 | [`lr-schedule`](lr-schedule) | Warmup and cosine decay, clipping by global norm, gradient accumulation checked with `grad`; one bad label that clipping survives | The same optional toolchain part (Enzyme) in a second project |
 | [`data-loader`](data-loader) | Per-epoch shuffling, sharding across ranks, exact resume, the same global batches on any number of ranks | A program whose output must not change between runs or machines |
+| [`spec-decode`](spec-decode) | Speculative decoding: accept/reject keeps the target model's distribution exactly; tokens per pass match the formula | Randomized tests with fixed seeds and statistical limits |
 
 The three number libraries are for checking the computer-assisted parts of proofs, such as those
 in [openai/math](https://github.com/openai/math), where the checkers need integers of any size,
