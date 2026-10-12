@@ -10,6 +10,14 @@ Format: the project, the toolchain version, what happened, and what we did inste
 
 ## Building
 
+- **ffi-zlib, main 39a12e0a: no way to link a C library.** `vxc -a run-jit` links a fixed list of
+  libraries and has no flag, environment variable or `extern` attribute to add `-lz`, so calls
+  to zlib fail with `undefined reference to 'crc32'`
+  ([vx-lang/Vx#1652](https://github.com/vx-lang/Vx/issues/1652)). build.sh compiles with
+  `vxc -a emit-obj` and links with the toolchain's clang, naming `libvx_std_core`,
+  `libmlir_c_runner_utils` and `libmlir_runner_utils` (each with an rpath), then `-lz -lm`. That
+  list was read from Vx's `src/jit.rs`, since nothing documents it (#1499).
+
 - **flash-attn, main 39a12e0a: no way to get a toolchain newer than the release.** The bug fixes
   since v0.0.3 are only on `main`. Using them meant building Vx (a full `cargo build --release
   --workspace`) and packaging it with `scripts/release/package.sh`, borrowing
@@ -263,6 +271,14 @@ fail in another.
 - **lr-schedule, main 39a12e0a: no exponent in number literals.** `1e-15`, `1.0e-15` and `1.5E3`
   are `Unknown element type 'e'` ([vx-lang/Vx#1654](https://github.com/vx-lang/Vx/issues/1654)).
   Tolerances are written out as `0.000000000000001f64`.
+
+- **ffi-zlib, main 39a12e0a: `comptime` cannot run bit operations.** `&`, `|`, `^`, `<<` and `>>`
+  all make a `comptime` block fail with `E3033`, even `comptime { 10 >> 1 }`
+  ([vx-lang/Vx#1653](https://github.com/vx-lang/Vx/issues/1653)). The CRC-32 table is built at
+  run time.
+- **ffi-zlib, main 39a12e0a: a string literal cannot be passed as `*const u8`.** `"..." as *const
+  u8` is `Unsupported cast: ... Pointer(Scalar(I8)) to Pointer(Scalar(U8))`; the bytes are
+  copied into a `Vec<u8>` first.
 
 ## Standard library
 
