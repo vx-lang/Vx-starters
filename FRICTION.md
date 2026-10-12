@@ -231,6 +231,15 @@ fail in another.
 - **reshard, main 39a12e0a: a keyword as a name gives a vague error.** `let mut across = ..` is
   `Expected identifier after let`; `across` is a keyword, and the message does not say so
   ([vx-lang/Vx#1650](https://github.com/vx-lang/Vx/issues/1650)). Renamed to `span`.
+- **quantize, main 39a12e0a: a contract makes the prover warn about a float division.** In a
+  function with `requires`, `let s = big / f64::from(lim);` prints `the prover ignores a
+  condition here: it cannot reason about the Div operator`, with no location, though nothing in
+  the contract involves `s`. The division went into a small function with no contract.
+- **bf16, main 39a12e0a: `grad` is a keyword.** `let mut grad : f32 = ..` is `Expected identifier
+  after let`, so the variable is `gradient`.
+- **bf16, main 39a12e0a: `x as bf16` cannot be the reference.** `core::libm` says it flushes
+  subnormals to zero on CPUs with AVX512-BF16, and offers `libm_bf16_bits_from_f32` instead. The
+  bf16 check compares with that function; the fp16 check uses `x as f16`.
 - **ring-allreduce, main 39a12e0a: `f64::from` has no `i64` version.** `f64::from(x)` with
   `x : i64` is `E3036`, since the conversion can round; it stays `x as f64`, which gives no
   warning. (`quantize` hit the same.)
