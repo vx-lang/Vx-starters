@@ -25,6 +25,8 @@ toolchain. They have two jobs:
 | [`safetensors`](safetensors) | The checkpoint format: a JSON header parser, byte layouts, broken files refused; Python reads the same file | A test that needs another language's tools (`python3`) |
 | [`ring-allreduce`](ring-allreduce) | Data-parallel all-reduce as reduce-scatter plus all-gather on simulated ranks; each rank sends 2(N-1)/N of the vector; contracts prove the ring's chunk numbers | A program about parallel hardware with no threads to run on: simulation in place of a runtime |
 | [`reshard`](reshard) | Row- and column-parallel splits with remainders, and direct resharding from k1 to k2 shards; contracts prove the overlap arithmetic | Checkpoint layouts as data the build and tests share |
+| [`quantize`](quantize) | int8/int4 weight quantization per tensor and per group, int4 packing, an int8 matmul within its rounding bound; contracts prove the clamp and packing ranges | A test step that is partly a proof: some breaks fail the compile, others the run |
+| [`bf16`](bf16) | bf16 and fp16 rounding as bit operations, checked against Vx's own types; a stalled bf16 sum, loss scaling, dynamic loss scaling | Checking against the toolchain's own number types, whose conversions depend on the CPU |
 
 The three number libraries are for checking the computer-assisted parts of proofs, such as those
 in [openai/math](https://github.com/openai/math), where the checkers need integers of any size,
