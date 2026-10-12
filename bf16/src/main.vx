@@ -1,0 +1,336 @@
+// bf16: the two 16-bit float formats of mixed-precision training, built from bit operations.
+//
+// bf16 keeps f32's 8-bit exponent and cuts the mantissa to 7 bits: the same range as f32, but
+// only 2 to 3 significant digits. fp16 (IEEE half) has a 5-bit exponent and a 10-bit mantissa:
+// more precision, but nothing above 65504 and nothing below about 6e-8.
+//
+// Both conversions from f32 are written here as integer operations on the f32's bits, rounding
+// to nearest with ties to even, and checked against Vx's own `bf16` and `f16`. Then three things
+// every mixed-precision training run has to deal with:
+//   (a) a sum kept in bf16 stops growing: 1 + 0.001 rounds back to 1;
+//   (b) small gradients vanish in fp16, and loss scaling (multiply the loss by 2^k, divide the
+//       gradients by 2^k in f32) brings them back;
+//   (c) dynamic loss scaling: a step whose scaled gradients overflow fp16 is skipped and the
+//       scale halved; after enough good steps the scale doubles again.
+//
+// It returns the number of failed checks, and prints "ok" when there are none.
+
+import core::convert;
+import core::libm;
+import core::num;
+
+// --- Conversions, as bit operations -------------------------------------------------------------
+
+// The bf16 nearest to x (ties to even), as its 16 bits in a u32: the top half of the f32, rounded.
+fn to_bf16(x : f32) -> u32 {
+  let b = libm_f32_to_bits(x);
+  // NaN: keep it a NaN, whatever rounding would do to the payload.
+  if (b & 2147483647u32) > 2139095040u32 {
+    return (b >> 16u32) | 64u32;
+  }
+  // Add just under half of the dropped part, plus one if the kept part is odd, then drop it.
+  let round = 32767u32 + ((b >> 16u32) & 1u32);
+  return (b + round) >> 16u32;
+}
+
+fn from_bf16(h : u32) -> f32 {
+  return libm_f32_from_bits(h << 16u32);
+}
+
+// `v >> shift`, rounded to nearest with ties to even.
+fn shift_round(v : u32, shift : u32) -> u32 {
+  let q = v >> shift;
+  let rest = v & ((1u32 << shift) - 1u32);
+  let half = 1u32 << (shift - 1u32);
+  if rest > half || (rest == half && (q & 1u32) == 1u32) {
+    return q + 1u32;
+  }
+  return q;
+}
+
+// The fp16 nearest to x (ties to even), as its 16 bits in a u32.
+fn to_f16(x : f32) -> u32 {
+  let b = libm_f32_to_bits(x);
+  let sign = (b >> 16u32) & 32768u32;
+  let exp = ((b >> 23u32) & 255u32) as i32;
+  let man = b & 8388607u32;
+  if exp == 255 {
+    // Infinity stays infinity; a NaN stays a quiet NaN.
+    if man == 0u32 {
+      return sign | 31744u32;
+    }
+    return sign | 32256u32;
+  }
+  // The exponent re-biased from 127 to 15.
+  let e = exp - 112;
+  if e >= 31 {
+    return sign | 31744u32;
+  }
+  if e <= 0 {
+    // Below the smallest normal fp16: a subnormal, counted in steps of 2^-24. The f32 is
+    // (man + 2^23) * 2^(exp - 150), so that is (man + 2^23) >> (14 - e), rounded.
+    if e < -10 {
+      return sign;
+    }
+    return sign | shift_round(man | 8388608u32, (14 - e) as u32);
+  }
+  // A normal number: exponent and the top 10 mantissa bits, rounded. A carry out of the
+  // mantissa moves into the exponent, which is right, up to infinity (31744) itself.
+  return sign | shift_round(((e as u32) << 23u32) | man, 13u32);
+}
+
+fn from_f16(h : u32) -> f32 {
+  let sign = (h & 32768u32) << 16u32;
+  let exp = (h >> 10u32) & 31u32;
+  let man = h & 1023u32;
+  if exp == 0u32 {
+    // Zero or subnormal: man * 2^-24, exact in f32.
+    let v = f32::from(man as u16) * 0.000000059604644775390625f32;
+    if sign != 0u32 {
+      return 0.0f32 - v;
+    }
+    return v;
+  }
+  if exp == 31u32 {
+    return libm_f32_from_bits(sign | 2139095040u32 | (man << 13u32));
+  }
+  return libm_f32_from_bits(sign | ((exp + 112u32) << 23u32) | (man << 13u32));
+}
+
+// x rounded through fp16 and back.
+fn via_f16(x : f32) -> f32 {
+  return from_f16(to_f16(x));
+}
+
+fn via_bf16(x : f32) -> f32 {
+  return from_bf16(to_bf16(x));
+}
+
+// --- Random f32 bit patterns ------------------------------------------------------------------
+
+struct Rng {
+  s : u64,
+}
+
+impl Rng {
+  fn next(self : &mut Rng) -> u64 {
+    let mut x = self.s;
+    x = x ^ (x << 13);
+    x = x ^ (x >> 7);
+    x = x ^ (x << 17);
+    self.s = x;
+    return x;
+  }
+
+  fn bits(self : &mut Rng) -> u32 {
+    return (self.next() >> 32u64) as u32;
+  }
+}
+
+fn expect(what : *const i8, got : u32, want : u32) -> i32 {
+  print!("  ");
+  print!(what);
+  print!(" = ");
+  print!(got);
+  if got != want {
+    print!(", want ");
+    print!(want);
+    print!("  FAIL\n");
+    return 1;
+  }
+  print!("\n");
+  return 0;
+}
+
+fn main() -> i32 {
+  let mut failed = 0;
+
+  // Known bit patterns. 0.1 is 0x3DCCCCCD in f32; its bf16 rounds up to 0x3DCD, its fp16 is
+  // 0x2E66. pi (0x40490FDB) rounds down to 0x4049 in bf16. 65504 is the largest fp16 (0x7BFF);
+  // 65520 is exactly halfway to the next step and rounds to even, which is infinity (0x7C00).
+  // 2^-24 is the smallest fp16 subnormal (1); 2^-25 is halfway to it and rounds to even, zero.
+  print!("known values (decimal bits):\n");
+  failed = failed + expect("bf16(1.0)  0x3F80", to_bf16(1.0f32), 16256u32);
+  failed = failed + expect("bf16(0.1)  0x3DCD", to_bf16(0.1f32), 15821u32);
+  failed = failed + expect("bf16(pi)   0x4049", to_bf16(3.14159265f32), 16457u32);
+  failed = failed + expect("fp16(1.0)  0x3C00", to_f16(1.0f32), 15360u32);
+  failed = failed + expect("fp16(0.1)  0x2E66", to_f16(0.1f32), 11878u32);
+  failed = failed + expect("fp16(65504) 0x7BFF", to_f16(65504.0f32), 31743u32);
+  failed = failed + expect("fp16(65520) 0x7C00", to_f16(65520.0f32), 31744u32);
+  failed = failed + expect("fp16(2^-24) 0x0001", to_f16(0.000000059604644775390625f32), 1u32);
+  failed = failed + expect("fp16(2^-25) 0x0000", to_f16(0.0000000298023223876953125f32), 0u32);
+
+  // Against Vx's own types, on random f32 bit patterns of every kind (normal, subnormal,
+  // infinite, NaN) and on every value near the fp16 range limits.
+  let mut rng = Rng { s: 88172645463325252u64 };
+  let mut bf_bad = 0;
+  let mut f16_bad = 0;
+  let n = 200000;
+  for i in 0..n {
+    let b = rng.bits();
+    let x = libm_f32_from_bits(b);
+    if to_bf16(x) != u32::from(libm_bf16_bits_from_f32(x)) {
+      bf_bad = bf_bad + 1;
+    }
+    let native = u32::from(libm_f16_to_bits(x as f16));
+    let mine = to_f16(x);
+    // NaNs only need to stay NaNs: payloads differ between converters.
+    let both_nan = (mine & 31744u32) == 31744u32 && (mine & 1023u32) != 0u32 &&
+                   (native & 31744u32) == 31744u32 && (native & 1023u32) != 0u32;
+    if mine != native && !both_nan {
+      f16_bad = f16_bad + 1;
+    }
+  }
+  // f32s from 2^-27 to 2^15 (below fp16's subnormals, through all its normals), and more
+  // closely from 2^15 to 2^16, past the overflow at 65520. Odd steps vary the low bits too.
+  let mut edge = 0;
+  let mut b = 838860800u32;
+  while b < 1191182336u32 {
+    let x = libm_f32_from_bits(b);
+    if to_f16(x) != u32::from(libm_f16_to_bits(x as f16)) {
+      f16_bad = f16_bad + 1;
+    }
+    edge = edge + 1;
+    b = b + 4093u32;
+  }
+  b = 1191182336u32;
+  while b < 1199570944u32 {
+    let x = libm_f32_from_bits(b);
+    if to_f16(x) != u32::from(libm_f16_to_bits(x as f16)) {
+      f16_bad = f16_bad + 1;
+    }
+    edge = edge + 1;
+    b = b + 257u32;
+  }
+  print!("against Vx's bf16 and f16: ");
+  print!(n);
+  print!(" random f32s and ");
+  print!(edge);
+  print!(" across the fp16 range; ");
+  print!(bf_bad);
+  print!(" bf16 and ");
+  print!(f16_bad);
+  print!(" fp16 differ\n");
+  if bf_bad != 0 || f16_bad != 0 {
+    print!("FAIL: the bit-level conversions differ from Vx's\n");
+    failed = failed + 1;
+  }
+  // Rounding through fp16 and back changes nothing an fp16 can hold.
+  let mut bad_back = 0;
+  for h in 0..31744 {
+    if to_f16(from_f16(h as u32)) != (h as u32) {
+      bad_back = bad_back + 1;
+    }
+  }
+  if bad_back != 0 {
+    print!("FAIL: an fp16 value does not survive f32 and back\n");
+    failed = failed + 1;
+  }
+
+  // (a) Add 0.001 a thousand times to 1. In bf16 the step next to 1 is 2^-7 = 0.0078, so each
+  //     1 + 0.001 rounds back to 1 and the sum never moves. Summing in f32 and rounding once at
+  //     the end gives 2.
+  let tiny : f32 = 0.001f32;
+  let mut in_bf16 = via_bf16(1.0f32);
+  let mut in_f32 : f32 = 1.0;
+  for i in 0..1000 {
+    in_bf16 = via_bf16(in_bf16 + via_bf16(tiny));
+    in_f32 = in_f32 + tiny;
+  }
+  print!("(a) 1 + 1000 x 0.001: summed in bf16 ");
+  print!(in_bf16);
+  print!(", summed in f32 then rounded to bf16 ");
+  print!(via_bf16(in_f32));
+  print!("\n");
+  if in_bf16 != 1.0f32 || via_bf16(in_f32) != 2.0f32 {
+    print!("FAIL: the bf16 sum\n");
+    failed = failed + 1;
+  }
+
+  // (b) Gradients between 1e-9 and 1e-5, a usual range late in training. Stored in fp16, the ones
+  //     below 2^-25 become 0, and the subnormal ones keep only a few bits. Multiplying the loss,
+  //     and so every gradient, by 2^16 first moves them all into fp16's normal range; dividing by
+  //     2^16 again in f32 is exact.
+  let scale : f32 = 65536.0f32;
+  let mut lost = 0;
+  let mut lost_scaled = 0;
+  let mut worst : f32 = 0.0;
+  let mut worst_scaled : f32 = 0.0;
+  let mut g : f32 = 0.000000001f32;
+  let mut count = 0;
+  while g < 0.00001f32 {
+    let plain = via_f16(g);
+    let scaled = via_f16(g * scale) / scale;
+    if plain == 0.0f32 {
+      lost = lost + 1;
+    }
+    if scaled == 0.0f32 {
+      lost_scaled = lost_scaled + 1;
+    }
+    worst = worst.max((plain - g).abs() / g);
+    worst_scaled = worst_scaled.max((scaled - g).abs() / g);
+    count = count + 1;
+    g = g * 1.01f32;
+  }
+  print!("(b) ");
+  print!(count);
+  print!(" gradients from 1e-9 to 1e-5 in fp16: ");
+  print!(lost);
+  print!(" become 0, worst relative error ");
+  print!(worst);
+  print!("; with loss scale 2^16: ");
+  print!(lost_scaled);
+  print!(" become 0, worst relative error ");
+  print!(worst_scaled);
+  print!("\n");
+  // 2^-11 is half of fp16's relative step: what rounding a normal number can cost.
+  if lost == 0 || lost_scaled != 0 || !(worst_scaled <= 0.00048828125f32) {
+    print!("FAIL: loss scaling\n");
+    failed = failed + 1;
+  }
+
+  // (c) Dynamic loss scaling over 10 steps of SGD on one weight, gradient 0.001 each step, except
+  //     step 4, where a spike of 4.0 times the scale overflows fp16. Start at 2^15; halve on
+  //     overflow and skip the step; double after 3 good steps in a row.
+  //     Steps 0-2 are good: scale 2^16. Step 3 good. Step 4 overflows: skipped, 2^15. Steps 5-7
+  //     good: 2^16. Steps 8-9 good. So 9 steps apply, and the scale ends at 2^16.
+  let mut s : f32 = 32768.0f32;
+  let mut good = 0;
+  let mut skipped = 0;
+  let mut w : f32 = 1.0;
+  for step in 0..10 {
+    let mut gradient : f32 = 0.001f32;
+    if step == 4 {
+      gradient = 4.0f32;
+    }
+    let scaled = via_f16(gradient * s);
+    if (to_f16(gradient * s) & 31744u32) == 31744u32 {
+      skipped = skipped + 1;
+      s = s * 0.5f32;
+      good = 0;
+    } else {
+      w = w - scaled / s;
+      good = good + 1;
+      if good == 3 {
+        s = s * 2.0f32;
+        good = 0;
+      }
+    }
+  }
+  print!("(c) dynamic loss scaling, 10 steps with one spike: ");
+  print!(skipped);
+  print!(" skipped, scale ends at ");
+  print!(s);
+  print!(", weight 1 - 9 x 0.001 = ");
+  print!(w);
+  print!("\n");
+  if skipped != 1 || s != 65536.0f32 || !((w - 0.991f32).abs() < 0.00001f32) {
+    print!("FAIL: dynamic loss scaling\n");
+    failed = failed + 1;
+  }
+
+  if failed == 0 {
+    print!("ok\n");
+  }
+  return failed;
+}

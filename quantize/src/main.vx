@@ -1,0 +1,326 @@
+// quantize: int8 and int4 weight quantization, as used to shrink models for inference.
+//
+// Symmetric absmax quantization: a block of weights gets one scale, s = max |w| / L, where L is
+// 127 for int8 and 7 for int4. Each weight is stored as q = round(w / s), clamped to [-L, L],
+// and read back as q * s. The block is either the whole tensor or a group of 64 weights along a
+// row; a group's scale is set by its own largest weight, so one outlier spoils only its group.
+//
+// The checks:
+//   1. A worked example: [0.5, -1, 0.25, 1] in int8 is [64, -127, 32, 127].
+//   2. Every weight comes back within s / 2 of where it was, for int8 and int4, per tensor and
+//      per group.
+//   3. With one outlier in the matrix, per-group int4 has a much smaller error than per-tensor.
+//   4. int4 packing (two values in a byte) round-trips every pair exactly.
+//   5. An int8 x int8 matrix product, summed in i32 and scaled back once, is within the bound
+//      that half a step of rounding in each factor allows of the f64 product.
+//   6. Contracts, proved while compiling: a clamped value is in [-L, L], and a packed byte is in
+//      [0, 255].
+//
+// It returns the number of failed checks, and prints "ok" when there are none.
+
+import core::convert;
+import core::num;
+import std::vec;
+
+// --- Integer parts, with contracts -----------------------------------------------------------
+
+// q clamped to [-lim, lim].
+fn clamp(q : i32, lim : i32) -> i32
+    requires lim > 0
+    ensures return >= 0 - lim && return <= lim
+{
+  if q > lim {
+    return lim;
+  }
+  if q < 0 - lim {
+    return 0 - lim;
+  }
+  return q;
+}
+
+// Two int4 values in one byte: lo + 8 in the low four bits, hi + 8 in the high four.
+fn pack(lo : i32, hi : i32) -> i32
+    requires lo >= -8 && lo <= 7 && hi >= -8 && hi <= 7
+    ensures return >= 0 && return <= 255
+{
+  return (lo + 8) + 16 * (hi + 8);
+}
+
+fn unpack_lo(byte : i32) -> i32 {
+  return (byte & 15) - 8;
+}
+
+fn unpack_hi(byte : i32) -> i32 {
+  return ((byte >> 4) & 15) - 8;
+}
+
+// --- Quantization ----------------------------------------------------------------------------
+
+// The levels on each side of zero: 127 for int8, 7 for int4.
+fn levels(bits : i32) -> i32
+    requires bits == 4 || bits == 8
+    ensures return > 0
+{
+  if bits == 8 {
+    return 127;
+  }
+  return 7;
+}
+
+// One weight quantized with scale s. A zero scale (an all-zero block) stores zero.
+fn quant(w : f64, s : f64, lim : i32) -> i32
+    requires lim > 0
+{
+  if s == 0.0f64 {
+    return 0;
+  }
+  return clamp((w / s).round() as i32, lim);
+}
+
+// The scale of a block whose largest |w| is big. Kept out of `quantize`: there, with a contract
+// on the function, `let s = big / ..` makes the prover warn that it cannot reason about `/`.
+fn step(big : f64, lim : i32) -> f64 {
+  return big / f64::from(lim);
+}
+
+// Quantized weights and one scale per block of `group` weights (the blocks run along the rows,
+// so a group never spans two rows when group divides the row length).
+struct Quantized {
+  q : Vec<i32>,
+  scales : Vec<f64>,
+  group : i32,
+}
+
+fn quantize(w : &Vec<f64>, group : i32, bits : i32) -> Quantized
+    requires bits == 4 || bits == 8
+{
+  let lim = levels(bits);
+  let mut q = Vec<i32>::with_capacity(w.len());
+  let mut scales = Vec<f64>::new();
+  let mut g0 = 0;
+  while g0 < w.len() {
+    let end = (g0 + group).min(w.len());
+    let mut big : f64 = 0.0;
+    for i in g0..end {
+      big = big.max(w.get(i).abs());
+    }
+    let s = step(big, lim);
+    scales.push(s);
+    for i in g0..end {
+      q.push(quant(w.get(i), s, lim));
+    }
+    g0 = end;
+  }
+  return Quantized { q: q, scales: scales, group: group };
+}
+
+fn dequant(z : &Quantized, i : i32) -> f64 {
+  return f64::from(z.q.get(i)) * z.scales.get(i / z.group);
+}
+
+// Whether every weight came back within half a step (plus rounding of the division itself).
+fn within_half_step(w : &Vec<f64>, z : &Quantized) -> bool {
+  for i in 0..w.len() {
+    let s = z.scales.get(i / z.group);
+    if (w.get(i) - dequant(z, i)).abs() > s * 0.5f64 * (1.0f64 + 0.000000000001f64) {
+      return false;
+    }
+  }
+  return true;
+}
+
+fn mean_error(w : &Vec<f64>, z : &Quantized) -> f64 {
+  let mut sum : f64 = 0.0;
+  for i in 0..w.len() {
+    sum = sum + (w.get(i) - dequant(z, i)).abs();
+  }
+  return sum / f64::from(w.len());
+}
+
+fn max_error(w : &Vec<f64>, z : &Quantized) -> f64 {
+  let mut worst : f64 = 0.0;
+  for i in 0..w.len() {
+    worst = worst.max((w.get(i) - dequant(z, i)).abs());
+  }
+  return worst;
+}
+
+// --- Random numbers --------------------------------------------------------------------------
+
+struct Rng {
+  s : u64,
+}
+
+impl Rng {
+  fn next(self : &mut Rng) -> u64 {
+    let mut x = self.s;
+    x = x ^ (x << 13);
+    x = x ^ (x >> 7);
+    x = x ^ (x << 17);
+    self.s = x;
+    return x;
+  }
+
+  // Uniform in [-1, 1].
+  fn unit(self : &mut Rng) -> f64 {
+    let n = (self.next() % 2000001u64) as i64;
+    return ((n - 1000000) as f64) / 1000000.0f64;
+  }
+
+  // Roughly normal, mean 0 and standard deviation 1: the sum of 12 uniforms on [-1, 1] has
+  // variance 4, so halve it.
+  fn normal(self : &mut Rng) -> f64 {
+    let mut sum : f64 = 0.0;
+    for i in 0..12 {
+      sum = sum + self.unit();
+    }
+    return sum * 0.5f64;
+  }
+}
+
+fn random(rng : &mut Rng, n : i32, scale : f64) -> Vec<f64> {
+  let mut out = Vec<f64>::with_capacity(n);
+  for i in 0..n {
+    out.push(scale * rng.normal());
+  }
+  return out;
+}
+
+fn print_row(name : *const i8, w : &Vec<f64>, z : &Quantized) -> void {
+  print!(name);
+  print!(": mean error ");
+  print!(mean_error(w, z));
+  print!(", max error ");
+  print!(max_error(w, z));
+  print!("\n");
+}
+
+fn main() -> i32 {
+  let mut failed = 0;
+
+  // 1. The worked example: s = 1 / 127, and 0.5 * 127 = 63.5 rounds away from zero to 64.
+  let mut ex = Vec<f64>::new();
+  ex.push(0.5f64);
+  ex.push(-1.0f64);
+  ex.push(0.25f64);
+  ex.push(1.0f64);
+  let ez = quantize(&ex, 4, 8);
+  print!("[0.5, -1, 0.25, 1] in int8: [");
+  for i in 0..4 {
+    if i > 0 {
+      print!(", ");
+    }
+    print!(ez.q.get(i));
+  }
+  print!("]\n");
+  if ez.q.get(0) != 64 || ez.q.get(1) != -127 || ez.q.get(2) != 32 || ez.q.get(3) != 127 {
+    print!("FAIL: the worked example\n");
+    failed = failed + 1;
+  }
+
+  // 2. A 64 x 256 weight matrix, weights about 0.02 in size, as in a trained layer.
+  let rows = 64;
+  let cols = 256;
+  let mut rng = Rng { s: 88172645463325252u64 };
+  let w = random(&mut rng, rows * cols, 0.02f64);
+  let t8 = quantize(&w, rows * cols, 8);
+  let g8 = quantize(&w, 64, 8);
+  let t4 = quantize(&w, rows * cols, 4);
+  let g4 = quantize(&w, 64, 4);
+  print!("64 x 256 weights, no outlier\n");
+  print_row("  int8 per tensor  ", &w, &t8);
+  print_row("  int8 groups of 64", &w, &g8);
+  print_row("  int4 per tensor  ", &w, &t4);
+  print_row("  int4 groups of 64", &w, &g4);
+  if !within_half_step(&w, &t8) || !within_half_step(&w, &g8) || !within_half_step(&w, &t4) ||
+     !within_half_step(&w, &g4) {
+    print!("FAIL: a weight came back more than half a step away\n");
+    failed = failed + 1;
+  }
+
+  // 3. One outlier, 50 times the typical size. Per tensor, every weight's step grows with it;
+  //    per group, only the outlier's group does.
+  let mut wo = random(&mut rng, rows * cols, 0.02f64);
+  wo.set(1000, 1.0f64);
+  let ot4 = quantize(&wo, rows * cols, 4);
+  let og4 = quantize(&wo, 64, 4);
+  print!("the same with one outlier of 1.0\n");
+  print_row("  int4 per tensor  ", &wo, &ot4);
+  print_row("  int4 groups of 64", &wo, &og4);
+  if !within_half_step(&wo, &ot4) || !within_half_step(&wo, &og4) {
+    print!("FAIL: a weight came back more than half a step away\n");
+    failed = failed + 1;
+  }
+  if !(mean_error(&wo, &og4) * 4.0f64 < mean_error(&wo, &ot4)) {
+    print!("FAIL: groups should cut the error at least fourfold with an outlier\n");
+    failed = failed + 1;
+  }
+
+  // 4. int4 packing: every pair of values in [-8, 7].
+  let mut bad = 0;
+  for a in -8..8 {
+    for b in -8..8 {
+      let byte = pack(a, b);
+      if unpack_lo(byte) != a || unpack_hi(byte) != b {
+        bad = bad + 1;
+      }
+    }
+  }
+  print!("int4 packing: 256 pairs, ");
+  print!(bad);
+  print!(" wrong\n");
+  if bad != 0 {
+    print!("FAIL: int4 packing\n");
+    failed = failed + 1;
+  }
+
+  // 5. y = x W^T for 8 inputs. x is quantized per row (one scale per input), W per row (one
+  //    scale per output). The sum of int8 products fits in i32 (256 * 127 * 127 < 2^31), and is
+  //    scaled back once per output.
+  let n = 8;
+  let x = random(&mut rng, n * cols, 1.0f64);
+  let qx = quantize(&x, cols, 8);
+  let qw = quantize(&w, cols, 8);
+  let mut worst : f64 = 0.0;
+  let mut biggest : f64 = 0.0;
+  let mut worst_share : f64 = 0.0;
+  for i in 0..n {
+    for j in 0..rows {
+      let sx = qx.scales.get(i);
+      let sw = qw.scales.get(j);
+      let mut acc : i32 = 0;
+      let mut exact : f64 = 0.0;
+      let mut bound : f64 = 0.0;
+      for k in 0..cols {
+        let a = x.get(i * cols + k);
+        let b = w.get(j * cols + k);
+        acc = acc + qx.q.get(i * cols + k) * qw.q.get(j * cols + k);
+        exact = exact + a * b;
+        // Each factor is off by at most half its step, so a product is off by at most
+        // |a| sw / 2 + |b| sx / 2 + sx sw / 4.
+        bound = bound + a.abs() * sw * 0.5f64 + b.abs() * sx * 0.5f64 + sx * sw * 0.25f64;
+      }
+      let y = f64::from(acc) * sx * sw;
+      let e = (y - exact).abs();
+      worst = worst.max(e);
+      biggest = biggest.max(exact.abs());
+      worst_share = worst_share.max(e / bound);
+    }
+  }
+  print!("int8 matmul, 8 x 256 by 256 x 64: largest error ");
+  print!(worst);
+  print!(" (");
+  print!(100.0f64 * worst / biggest);
+  print!("% of the largest output), at most ");
+  print!(100.0f64 * worst_share);
+  print!("% of its worst-case bound\n");
+  if !(worst_share <= 1.0f64) {
+    print!("FAIL: the int8 product is off by more than its rounding allows\n");
+    failed = failed + 1;
+  }
+
+  if failed == 0 {
+    print!("ok\n");
+  }
+  return failed;
+}
