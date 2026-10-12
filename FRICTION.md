@@ -212,6 +212,22 @@ fail in another.
 - **bigint, v0.0.3: `panic!` does not exist.** It is the function `panic("..")`; `panic!(..)` is
   `Macro panic not found`.
 
+- **batch-sched, main 39a12e0a: `==` on two C strings compares pointers.** `name != "static"`,
+  with `name : *const i8` passed `"static"`, is true: the two literals are different pointers.
+  It compiles without a warning, and it is also what pushed the program off the flat code
+  generator (`emitter gap at src/codegen/flat/emit/arith.rs:302`). The function takes a `bool`
+  instead.
+
+- **safetensors, main 39a12e0a: a `void` function ending in `if`/`else` sends the program to the
+  old code generator, where more things fail.** On that path `print!(k)` of a range variable is
+  `print cannot print a value of type index`, while `print!(k as i32)` gets `W1013: the cast does
+  nothing`; and `f32::from(i16)` fails in `mlir-translate`
+  ([vx-lang/Vx#1651](https://github.com/vx-lang/Vx/issues/1651)). A `return;` at the end keeps
+  the program on the flat path.
+- **safetensors, main 39a12e0a: `on` is a keyword.** A parameter called `on` is `Expected
+  parameter name`, with nothing saying why (as with `across`,
+  [vx-lang/Vx#1650](https://github.com/vx-lang/Vx/issues/1650)).
+
 ## Standard library
 
 - **wordcount, v0.0.3: no command-line arguments in `std`.** The runtime has `vx_env_args_count`
