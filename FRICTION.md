@@ -244,6 +244,22 @@ fail in another.
   `x : i64` is `E3036`, since the conversion can round; it stays `x as f64`, which gives no
   warning. (`quantize` hit the same.)
 
+- **rope, main 39a12e0a: a tensor of `f64` made at compile time comes out wrong.** Its element
+  type follows the values, not the declared type: whole numbers become `i32` and others `f32`.
+  Indexed directly, the values are silently cut (0.5 becomes 0); passed by reference, codegen
+  fails with `memref.cast ... memref<4xi32> ... memref<4xf64>`
+  ([vx-lang/Vx#1649](https://github.com/vx-lang/Vx/issues/1649)). A single `f64` comes out
+  exactly, so each constant is its own `comptime` block and the table is built at run time.
+- **rope, main 39a12e0a: `comptime` cannot call `cos`, `sin`, `powf` or `Tensor::new()`, nor run
+  a cast inside a called function.** `i as f64` or `f64::from(i)` in a function that a `comptime`
+  block calls is `E3033`, though the same cast in the block itself works
+  ([vx-lang/Vx#1648](https://github.com/vx-lang/Vx/issues/1648)). Sines come from Newton's
+  method and Taylor series, and zero tensors are written out as literals.
+- **rope, main 39a12e0a: small syntax surprises.** Passing a `Tensor<f64, [8]>` to a function
+  moves it, so using it twice is `E4001`; the functions take `&Tensor`. Array literals do not
+  allow a trailing comma, and `10000.0f64.powf(..)` does not parse (`Unknown element type
+  'f64.powf'`); a typed `let` first works.
+
 ## Standard library
 
 - **ring-allreduce, main 39a12e0a: no threads, so ranks are simulated.** `core::sync::atomic`

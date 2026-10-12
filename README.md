@@ -27,6 +27,8 @@ toolchain. They have two jobs:
 | [`reshard`](reshard) | Row- and column-parallel splits with remainders, and direct resharding from k1 to k2 shards; contracts prove the overlap arithmetic | Checkpoint layouts as data the build and tests share |
 | [`quantize`](quantize) | int8/int4 weight quantization per tensor and per group, int4 packing, an int8 matmul within its rounding bound; contracts prove the clamp and packing ranges | A test step that is partly a proof: some breaks fail the compile, others the run |
 | [`bf16`](bf16) | bf16 and fp16 rounding as bit operations, checked against Vx's own types; a stalled bf16 sum, loss scaling, dynamic loss scaling | Checking against the toolchain's own number types, whose conversions depend on the CPU |
+| [`sampler`](sampler) | Greedy, temperature, top-k, top-p and min-p sampling, with masked tokens; 200,000 draws per setting checked by chi-square | Statistical tests in the test step: a seeded RNG from `std::rand` and a pass threshold |
+| [`rope`](rope) | Rotary position embeddings: rotation keeps length, attention sees only relative positions; constants computed by `comptime` | Values worked out by the compiler, and checked against the run-time library |
 
 The three number libraries are for checking the computer-assisted parts of proofs, such as those
 in [openai/math](https://github.com/openai/math), where the checkers need integers of any size,
