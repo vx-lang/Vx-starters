@@ -22,6 +22,7 @@ toolchain. They have two jobs:
 | [`bpe-tokenizer`](bpe-tokenizer) | A GPT-style byte-pair tokenizer: training, encoding, decoding | Data files from outside the project as test inputs |
 | [`paged-kv`](paged-kv) | A vLLM-style paged KV cache with copy-on-write; contracts prove its index arithmetic | Proofs as part of compiling: a broken contract is a build error |
 | [`batch-sched`](batch-sched) | Continuous vs static batching in a serving simulator, checked against a case worked by hand | Tests with exact expected numbers next to tests of properties |
+| [`safetensors`](safetensors) | The checkpoint format: a JSON header parser, byte layouts, broken files refused; Python reads the same file | A test that needs another language's tools (`python3`) |
 
 The three number libraries are for checking the computer-assisted parts of proofs, such as those
 in [openai/math](https://github.com/openai/math), where the checkers need integers of any size,
