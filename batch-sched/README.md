@@ -2,7 +2,7 @@
 
 Continuous batching against static batching, in a small simulator of an LLM server.
 
-```
+```console
 $ ./build.sh
 by hand, continuous: first tokens at 8 11 15
                      done at 13 13 15

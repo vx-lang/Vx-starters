@@ -2,7 +2,7 @@
 
 Counts the lines, words and bytes in a file, like `wc`.
 
-```
+```console
 $ ./build.sh
 ok: 4 9 47
 $ build/wordcount sample.txt
@@ -11,7 +11,7 @@ $ build/wordcount sample.txt
 
 Or run it without building, through the JIT:
 
-```
+```sh
 vxc -a run-jit src/main.vx -- sample.txt
 ```
 

@@ -3,7 +3,7 @@
 One request served the way large deployments split it: prefill on one device, decode on another,
 with the KV cache moved between them by explicit transfers that the compiler proves safe.
 
-```
+```console
 $ ./build.sh
 prompt:      3 8 13 2 7 12 1 6
 GPU + NPU:   14 4 9 11 15 5 10 0
@@ -54,7 +54,7 @@ nothing can be stale. That is why the check is a proof and not a test.
 z3 is optional. When it is not on `PATH`, `--verify-seams` refuses every compile (`E6024`, which
 names the hop and says how to install z3), so `build.sh` skips that step and says so:
 
-```
+```text
 skipped: seam verification needs z3 on PATH
 ```
 

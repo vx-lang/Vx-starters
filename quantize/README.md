@@ -3,7 +3,7 @@
 int8 and int4 weight quantization, the way models are shrunk for inference, and an int8 matrix
 product.
 
-```
+```console
 $ ./build.sh
 [0.5, -1, 0.25, 1] in int8: [64, -127, 32, 127]
 64 x 256 weights, no outlier

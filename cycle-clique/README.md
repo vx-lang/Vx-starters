@@ -9,7 +9,7 @@ the cycle-clique conjecture of Erdős, Faudree, Rousseau and Schelp (1978). The 
 (`preprints/Cycle-clique-Ramsey-numbers-September-25-2026`). Its argument reduces the remaining
 cases to 3,099 small graph patterns, and a program has to rule out each one.
 
-```
+```console
 $ ./build.sh
 ok: the same table as the paper
 ```

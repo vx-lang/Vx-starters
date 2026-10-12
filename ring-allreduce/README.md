@@ -2,7 +2,7 @@
 
 The all-reduce of data-parallel training, done the way NCCL's ring does it, on simulated ranks.
 
-```
+```console
 $ ./build.sh
 2 ranks: each sends 1 vectors (at most 1000 numbers); through rank 0 it would send 1; reals off by 0
 3 ranks: each sends 1.3333333333333333 vectors (at most 1334 numbers); through rank 0 it would send 2; reals off by 4.4e-16

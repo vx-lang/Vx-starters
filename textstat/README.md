@@ -3,7 +3,7 @@
 Counts the words, numbers and runs of capital letters in a file, using the
 [`textkit`](../textkit) library.
 
-```
+```console
 $ ./build.sh
 ok:
 words 25

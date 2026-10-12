@@ -3,7 +3,7 @@
 Speculative decoding: a small model guesses, the large one checks, and the output is still
 exactly the large model's.
 
-```
+```console
 $ ./build.sh
 400000 speculative tokens: chi-square against the target 1.4791583333333334 (limit 18.47), against the draft 571845.823145238
 guesses kept: 0.5999875, sum of min(p, q) = 0.6000000000000001

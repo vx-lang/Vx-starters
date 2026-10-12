@@ -3,7 +3,7 @@
 A paged KV cache, the memory manager inside vLLM-style inference servers, with its index
 arithmetic proved by contracts when the program compiles.
 
-```
+```console
 $ ./build.sh
 Warning[W1009]: Unused function parameter 'blocks'
 random workload: 20000 steps, 15223 appends (422 refused: no free block, or the table full), 286 forks, 534 finishes

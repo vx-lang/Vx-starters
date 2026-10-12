@@ -4,12 +4,12 @@ Closed intervals with exact rational ends, built on [`rational`](../rational). T
 tool for proving an inequality over a range by computer: if a computation on intervals says
 `f(X) > 0`, then `f(x) > 0` for every `x` in `X`.
 
-```
+```console
 $ ./build.sh
 ok
 ```
 
-```
+```rust
 import bigint::int;
 import rational::rat;
 import interval::ival;

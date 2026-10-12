@@ -3,7 +3,7 @@
 The two 16-bit float formats of mixed-precision training, built from bit operations, and the
 three problems every mixed-precision run has to handle.
 
-```
+```console
 $ ./build.sh
 known values (decimal bits):
   bf16(1.0)  0x3F80 = 16256

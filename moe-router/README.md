@@ -3,7 +3,7 @@
 Routing tokens to experts in a mixture-of-experts layer: top-k gating, expert capacity, dropped
 tokens and the load-balancing loss.
 
-```
+```console
 $ ./build.sh
 by hand: capacity 3, loads 3 3 1, 1 dropped (token 3's choice of expert 0), weights 0.7310585786300048 and 0.26894142136999516
 512 tokens, 8 experts, top 2, capacity factor 1: capacity 128, 33 of 1024 assignments dropped, balance loss 1.003089347576322

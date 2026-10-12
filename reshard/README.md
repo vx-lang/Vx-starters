@@ -3,7 +3,7 @@
 Split a weight matrix for tensor parallelism, and reshard a checkpoint from k1 shards to k2
 without gathering it first.
 
-```
+```console
 $ ./build.sh
 Warning[W1009]: Unused function parameter 'hi'
 rows, 3 -> 5 shards: 7 pieces, 598 of 851 numbers change rank

@@ -72,7 +72,7 @@ first such checks ([vx-lang/Vx#1489](https://github.com/vx-lang/Vx/issues/1489))
 
 ## Getting the toolchain
 
-```
+```sh
 curl -fsSL https://vxlang.org/install.sh | sh
 ```
 

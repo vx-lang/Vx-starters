@@ -3,7 +3,7 @@
 Rotary position embeddings (RoPE), the way LLaMA and most recent LLMs encode positions, with
 their constants worked out by the compiler.
 
-```
+```console
 $ ./build.sh
 compile-time cos and sin of the 4 frequencies vs run time: largest difference 1.1e-16
 table vs cos and sin, 16 positions x 4 frequencies: largest difference 1.7e-15

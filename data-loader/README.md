@@ -3,7 +3,7 @@
 The sample order of a distributed training run: shuffled every epoch, split across ranks, and
 the same after a restart.
 
-```
+```console
 $ ./build.sh
 1000 samples, batches of 96 on 4 ranks: each epoch reads 960 distinct samples and drops 40
 restart at step 37 of 60: every rank reads the same samples as without the restart

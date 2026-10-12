@@ -3,7 +3,7 @@
 How an LLM picks its next token from the logits: greedy, temperature, top-k, top-p (nucleus) and
 min-p sampling, checked by drawing.
 
-```
+```console
 $ ./build.sh
 temperature 0.01: 0 of 10000 draws were neither of the two tied top tokens
 temperature 1000: largest difference from uniform 0.00026513483977655405
