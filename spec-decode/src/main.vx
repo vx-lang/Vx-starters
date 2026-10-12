@@ -1,0 +1,274 @@
+// spec-decode: speculative decoding's accept/reject rule, and the proof that it costs nothing.
+//
+// A large target model p is slow; a small draft model q is fast. Speculative decoding lets q
+// guess k tokens, and p checks all k in one pass. Each guess x is kept with probability
+// min(1, p(x) / q(x)). At the first rejection, a token is drawn instead from the leftover
+// distribution, max(0, p - q) normalized, and the rest of the guesses are thrown away. If all k
+// are kept, p's pass gives one more token for free.
+//
+// The point (Leviathan et al. 2023, Chen et al. 2023) is that the tokens come out distributed
+// exactly as if p had sampled them itself, whatever q is. This checks that, and the speed-up:
+//
+//   1. One step from fixed p and q over 6 tokens: 400,000 draws match p (chi-square), not q.
+//   2. The chance a guess is kept equals sum over x of min(p(x), q(x)), measured against exact.
+//   3. With k guesses per check and acceptance a, the tokens per target pass average
+//      (1 - a^(k+1)) / (1 - a). Measured on a toy "language" for k = 1 .. 6.
+//   4. When q = p every guess is kept; when q puts no weight where p does, none are.
+//
+// It returns the number of failed checks, and prints "ok" when there are none.
+
+import core::convert;
+import core::num;
+import std::vec;
+
+struct Rng {
+  s : u64,
+}
+
+impl Rng {
+  fn next(self : &mut Rng) -> u64 {
+    let mut x = self.s;
+    x = x ^ (x << 13);
+    x = x ^ (x >> 7);
+    x = x ^ (x << 17);
+    self.s = x;
+    return x;
+  }
+
+  // Uniform in [0, 1), with 53 random bits.
+  fn unit(self : &mut Rng) -> f64 {
+    return ((self.next() >> 11) as f64) / 9007199254740992.0f64;
+  }
+}
+
+// A draw from the distribution d (which sums to 1).
+fn draw(rng : &mut Rng, d : &Vec<f64>) -> i32 {
+  let u = rng.unit();
+  let mut c : f64 = 0.0;
+  for i in 0..d.len() {
+    c = c + d.get(i);
+    if u < c {
+      return i;
+    }
+  }
+  // Rounding left u above the total: the last token with any weight.
+  let mut last = d.len() - 1;
+  while last > 0 && d.get(last) == 0.0f64 {
+    last = last - 1;
+  }
+  return last;
+}
+
+// max(0, p - q), normalized: what to draw from after a rejection.
+fn leftover(p : &Vec<f64>, q : &Vec<f64>) -> Vec<f64> {
+  let mut r = Vec<f64>::with_capacity(p.len());
+  let mut total : f64 = 0.0;
+  for i in 0..p.len() {
+    let x = (p.get(i) - q.get(i)).max(0.0f64);
+    r.push(x);
+    total = total + x;
+  }
+  for i in 0..p.len() {
+    r.set(i, r.get(i) / total);
+  }
+  return r;
+}
+
+// One speculative token: q guesses, p accepts or replaces. `kept` gets 1 if the guess was kept.
+struct Step {
+  token : i32,
+  kept : i32,
+}
+
+fn speculate(rng : &mut Rng, p : &Vec<f64>, q : &Vec<f64>, rest : &Vec<f64>) -> Step {
+  let x = draw(rng, q);
+  if rng.unit() < (p.get(x) / q.get(x)).min(1.0f64) {
+    return Step { token: x, kept: 1 };
+  }
+  return Step { token: draw(rng, rest), kept: 0 };
+}
+
+fn dist(a : f64, b : f64, c : f64, d : f64, e : f64, f : f64) -> Vec<f64> {
+  let mut v = Vec<f64>::new();
+  v.push(a);
+  v.push(b);
+  v.push(c);
+  v.push(d);
+  v.push(e);
+  v.push(f);
+  return v;
+}
+
+// Chi-square of counts against expected probabilities, over `n` draws, skipping zero ones.
+fn chi_square(counts : &Vec<i32>, want : &Vec<f64>, n : i32) -> f64 {
+  let mut chi : f64 = 0.0;
+  for i in 0..counts.len() {
+    let e = want.get(i) * f64::from(n);
+    if e > 0.0f64 {
+      let d = f64::from(counts.get(i)) - e;
+      chi = chi + d * d / e;
+    }
+  }
+  return chi;
+}
+
+// A toy language model of 6 tokens: the next-token distribution depends on the previous token.
+// The target puts most weight on (prev + 1) mod 6; the draft is the same idea but blurrier.
+fn target(prev : i32) -> Vec<f64> {
+  let mut v = Vec<f64>::new();
+  for i in 0..6 {
+    if i == (prev + 1) % 6 {
+      v.push(0.75f64);
+    } else {
+      v.push(0.05f64);
+    }
+  }
+  return v;
+}
+
+fn draft(prev : i32) -> Vec<f64> {
+  let mut v = Vec<f64>::new();
+  for i in 0..6 {
+    if i == (prev + 1) % 6 {
+      v.push(0.5f64);
+    } else if i == (prev + 2) % 6 {
+      v.push(0.2f64);
+    } else {
+      v.push(0.075f64);
+    }
+  }
+  return v;
+}
+
+fn overlap(p : &Vec<f64>, q : &Vec<f64>) -> f64 {
+  let mut a : f64 = 0.0;
+  for i in 0..p.len() {
+    a = a + p.get(i).min(q.get(i));
+  }
+  return a;
+}
+
+fn main() -> i32 {
+  let mut failed = 0;
+  let mut rng = Rng { s: 88172645463325252u64 };
+
+  // 1 and 2. A fixed p and a q that is wrong in several ways: too much on 0, too little on 2,
+  //          some on 5, where p has none.
+  let p = dist(0.1f64, 0.2f64, 0.4f64, 0.15f64, 0.15f64, 0.0f64);
+  let q = dist(0.35f64, 0.2f64, 0.1f64, 0.15f64, 0.05f64, 0.15f64);
+  let rest = leftover(&p, &q);
+  let n = 400000;
+  let mut counts = Vec<i32>::new();
+  for i in 0..6 {
+    counts.push(0);
+  }
+  let mut kept = 0;
+  for t in 0..n {
+    let s = speculate(&mut rng, &p, &q, &rest);
+    counts.set(s.token, counts.get(s.token) + 1);
+    kept = kept + s.kept;
+  }
+  // p has 5 tokens with weight, so 4 degrees of freedom: below 18.47 with probability 0.999.
+  let chi_p = chi_square(&counts, &p, n);
+  let chi_q = chi_square(&counts, &q, n);
+  print!("400000 speculative tokens: chi-square against the target ");
+  print!(chi_p);
+  print!(" (limit 18.47), against the draft ");
+  print!(chi_q);
+  print!("\n");
+  if !(chi_p < 18.47f64) || counts.get(5) != 0 {
+    print!("FAIL: speculative sampling does not give the target distribution\n");
+    failed = failed + 1;
+  }
+  let rate = f64::from(kept) / f64::from(n);
+  let exact = overlap(&p, &q);
+  print!("guesses kept: ");
+  print!(rate);
+  print!(", sum of min(p, q) = ");
+  print!(exact);
+  print!("\n");
+  // The kept count is binomial: 5 standard deviations is about 0.004 here.
+  if !((rate - exact).abs() < 0.004f64) {
+    print!("FAIL: the acceptance rate is not sum min(p, q)\n");
+    failed = failed + 1;
+  }
+
+  // 3. The toy language: k guesses per target pass. Every context has the same acceptance a,
+  //    so the tokens per pass should average (1 - a^(k+1)) / (1 - a).
+  let a = overlap(&target(0), &draft(0));
+  let mut speed_ok = true;
+  for k in 1..7 {
+    let mut prev = 0;
+    let mut tokens = 0;
+    let mut passes = 0;
+    while tokens < 200000 {
+      // The draft guesses k tokens, each from the context so far.
+      let mut ctx = prev;
+      let mut stopped = false;
+      let mut g = 0;
+      while g < k && !stopped {
+        let s = speculate(&mut rng, &target(ctx), &draft(ctx), &leftover(&target(ctx), &draft(ctx)));
+        tokens = tokens + 1;
+        ctx = s.token;
+        if s.kept == 0 {
+          stopped = true;
+        }
+        g = g + 1;
+      }
+      // All k kept: the target's pass gives one more token.
+      if !stopped {
+        ctx = draw(&mut rng, &target(ctx));
+        tokens = tokens + 1;
+      }
+      prev = ctx;
+      passes = passes + 1;
+    }
+    let got = f64::from(tokens) / f64::from(passes);
+    let mut ak : f64 = 1.0;
+    for i in 0..k + 1 {
+      ak = ak * a;
+    }
+    let want = (1.0f64 - ak) / (1.0f64 - a);
+    print!("k = ");
+    print!(k);
+    print!(": ");
+    print!(got);
+    print!(" tokens per target pass, expected ");
+    print!(want);
+    print!("\n");
+    if !((got - want).abs() < 0.02f64 * want) {
+      speed_ok = false;
+    }
+  }
+  if !speed_ok {
+    print!("FAIL: tokens per target pass\n");
+    failed = failed + 1;
+  }
+
+  // 4. The two ends: a perfect draft is always kept; a draft with no overlap never is.
+  // With q = p a guess is never rejected, so the leftover is never used.
+  let mut all_kept = true;
+  for t in 0..1000 {
+    if speculate(&mut rng, &p, &p, &p).kept != 1 {
+      all_kept = false;
+    }
+  }
+  let far = dist(0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 1.0f64);
+  let far_rest = leftover(&p, &far);
+  let mut none_kept = true;
+  for t in 0..1000 {
+    if speculate(&mut rng, &p, &far, &far_rest).kept != 0 {
+      none_kept = false;
+    }
+  }
+  print!("draft equal to the target: every guess kept; draft with no overlap: none kept\n");
+  if !all_kept || !none_kept {
+    print!("FAIL: the two ends\n");
+    failed = failed + 1;
+  }
+
+  if failed == 0 {
+    print!("ok\n");
+  }
+  return failed;
+}
