@@ -250,7 +250,10 @@ impl BigInt {
     let mut a = self.abs();
     let mut b = other.abs();
     while !b.is_zero() {
-      let r = a.rem(&b);
+      // The borrow goes through a local: written `a.rem(&b)`, Vx after v0.0.3 counts `b` as
+      // still borrowed when it is moved below (vx-lang/Vx#1646).
+      let by = &b;
+      let r = a.rem(by);
       a = b;
       b = r;
     }
