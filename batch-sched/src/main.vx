@@ -1,0 +1,441 @@
+// batch-sched: continuous batching against static batching, in a small serving simulator.
+//
+// A request is a prompt to read (prefill) and some tokens to write (decode). A GPU step runs
+// a batch of tokens; here a step of n tokens takes `overhead + per_token * n` microseconds.
+//
+// Static batching takes the requests that are waiting, prefills them together, and decodes
+// until the longest one is done; a request that finishes early leaves its place empty, and new
+// requests wait for the whole batch.
+//
+// Continuous batching, as in Orca and vLLM, decides again at every step: each running request
+// that is decoding gets one token, the rest of the step's token budget goes to prefill (a long
+// prompt is split over several steps, "chunked prefill"), and a finished request's place goes
+// to the next waiting one at once. A request is admitted only if the KV cache has room for its
+// prompt and all its output, so nothing ever has to be evicted.
+//
+// The checks:
+//   1. A three-request case worked out by hand (in the README), for both policies: the time
+//      of every first token and every finish.
+//   2. A random workload of 300 requests: every request gets exactly its tokens, no step goes
+//      over its token budget or its places, the KV cache never holds more than it has, and
+//      requests are admitted in arrival order.
+//   3. On that workload, continuous batching has the higher throughput and the lower median
+//      time to first token.
+//
+// It returns the number of failed checks, and prints "ok" when there are none.
+
+import core::convert;
+import std::vec;
+
+// The requests, as flat columns. Times are in microseconds.
+struct Load {
+  n : i32,
+  arrive : Vec<i64>,
+  prompt : Vec<i32>,
+  output : Vec<i32>,
+}
+
+// What the scheduler may do in one step, and what a step costs.
+struct Engine {
+  budget : i32,
+  places : i32,
+  kv : i32,
+  overhead : i64,
+  per_token : i64,
+}
+
+// What happened to each request, and a few totals that the checks look at.
+struct Run {
+  first : Vec<i64>,
+  done : Vec<i64>,
+  made : Vec<i32>,
+  admitted : Vec<i32>,
+  end : i64,
+  steps : i32,
+  worst_step : i32,
+  worst_places : i32,
+  worst_kv : i32,
+}
+
+fn filled32(n : i32, v : i32) -> Vec<i32> {
+  let mut out = Vec<i32>::with_capacity(n);
+  for i in 0..n {
+    out.push(v);
+  }
+  return out;
+}
+
+fn filled64(n : i32, v : i64) -> Vec<i64> {
+  let mut out = Vec<i64>::with_capacity(n);
+  for i in 0..n {
+    out.push(v);
+  }
+  return out;
+}
+
+fn new_run(n : i32) -> Run {
+  return Run {
+    first: filled64(n, -1i64),
+    done: filled64(n, -1i64),
+    made: filled32(n, 0),
+    admitted: Vec<i32>::new(),
+    end: 0i64,
+    steps: 0,
+    worst_step: 0,
+    worst_places: 0,
+    worst_kv: 0,
+  };
+}
+
+fn cost(e : &Engine, tokens : i32) -> i64 {
+  return e.overhead + e.per_token * i64::from(tokens);
+}
+
+// Continuous batching. `fed[r]` is how much of r's prompt has been prefilled.
+fn continuous(w : &Load, e : &Engine) -> Run {
+  let mut run = new_run(w.n);
+  let mut fed = filled32(w.n, 0);
+  let mut running = Vec<i32>::new();
+  let mut next = 0;
+  let mut finished = 0;
+  let mut t : i64 = 0;
+  while finished < w.n {
+    // Nothing to do until the next arrival.
+    if running.len() == 0 && next < w.n && w.arrive.get(next) > t {
+      t = w.arrive.get(next);
+    }
+    let mut left = e.budget;
+    // Decodes first: one token for each running request that is past its prompt.
+    for i in 0..running.len() {
+      let r = running.get(i);
+      if fed.get(r) == w.prompt.get(r) && left > 0 {
+        run.made.set(r, run.made.get(r) + 1);
+        left = left - 1;
+      }
+    }
+    // Then prefill for requests already running.
+    for i in 0..running.len() {
+      let r = running.get(i);
+      let need = w.prompt.get(r) - fed.get(r);
+      if need > 0 && left > 0 {
+        let take = need.min(left);
+        fed.set(r, fed.get(r) + take);
+        left = left - take;
+        // The step that finishes the prompt also writes the first token.
+        if fed.get(r) == w.prompt.get(r) {
+          run.made.set(r, 1);
+        }
+      }
+    }
+    // Then admit new requests in arrival order, while there is a place, budget and cache.
+    let mut held = 0;
+    for i in 0..running.len() {
+      let r = running.get(i);
+      held = held + w.prompt.get(r) + w.output.get(r);
+    }
+    let mut admitting = true;
+    while admitting && next < w.n && left > 0 && running.len() < e.places {
+      let r = next;
+      if w.arrive.get(r) > t || held + w.prompt.get(r) + w.output.get(r) > e.kv {
+        admitting = false;
+      } else {
+        let take = w.prompt.get(r).min(left);
+        fed.set(r, take);
+        left = left - take;
+        if take == w.prompt.get(r) {
+          run.made.set(r, 1);
+        }
+        held = held + w.prompt.get(r) + w.output.get(r);
+        running.push(r);
+        run.admitted.push(r);
+        next = next + 1;
+      }
+    }
+    let used = e.budget - left;
+    t = t + cost(e, used);
+    run.steps = run.steps + 1;
+    run.worst_step = run.worst_step.max(used);
+    run.worst_places = run.worst_places.max(running.len());
+    run.worst_kv = run.worst_kv.max(held);
+    // Record first tokens and finishes at the end of the step, and free the places.
+    let mut keep = Vec<i32>::new();
+    for i in 0..running.len() {
+      let r = running.get(i);
+      if run.made.get(r) >= 1 && run.first.get(r) < 0 {
+        run.first.set(r, t);
+      }
+      if run.made.get(r) == w.output.get(r) {
+        run.done.set(r, t);
+        finished = finished + 1;
+      } else {
+        keep.push(r);
+      }
+    }
+    while running.len() > 0 {
+      running.pop();
+    }
+    for i in 0..keep.len() {
+      running.push(keep.get(i));
+    }
+  }
+  run.end = t;
+  return run;
+}
+
+// Static batching: take every waiting request (up to the places, and what the cache holds),
+// prefill them in one step, decode until all are done, repeat.
+fn static_batches(w : &Load, e : &Engine) -> Run {
+  let mut run = new_run(w.n);
+  let mut next = 0;
+  let mut t : i64 = 0;
+  while next < w.n {
+    if w.arrive.get(next) > t {
+      t = w.arrive.get(next);
+    }
+    let start = next;
+    let mut held = 0;
+    let mut prompts = 0;
+    let mut taking = true;
+    while taking && next < w.n && next - start < e.places {
+      let r = next;
+      if w.arrive.get(r) > t || held + w.prompt.get(r) + w.output.get(r) > e.kv {
+        taking = false;
+      } else {
+        held = held + w.prompt.get(r) + w.output.get(r);
+        prompts = prompts + w.prompt.get(r);
+        run.admitted.push(r);
+        next = next + 1;
+      }
+    }
+    // One step for all the prompts, which writes every first token.
+    t = t + cost(e, prompts);
+    run.steps = run.steps + 1;
+    run.worst_step = run.worst_step.max(prompts);
+    run.worst_places = run.worst_places.max(next - start);
+    run.worst_kv = run.worst_kv.max(held);
+    let mut active = 0;
+    for r in start..next {
+      run.made.set(r, 1);
+      run.first.set(r, t);
+      if w.output.get(r) == 1 {
+        run.done.set(r, t);
+      } else {
+        active = active + 1;
+      }
+    }
+    // Decode steps; the batch is held until its last request is done.
+    while active > 0 {
+      t = t + cost(e, active);
+      run.steps = run.steps + 1;
+      run.worst_step = run.worst_step.max(active);
+      for r in start..next {
+        if run.made.get(r) < w.output.get(r) {
+          run.made.set(r, run.made.get(r) + 1);
+          if run.made.get(r) == w.output.get(r) {
+            run.done.set(r, t);
+            active = active - 1;
+          }
+        }
+      }
+    }
+  }
+  run.end = t;
+  return run;
+}
+
+// The median of times[r] - w.arrive[r] over all requests.
+fn median_wait(w : &Load, times : &Vec<i64>) -> i64 {
+  let mut v = Vec<i64>::with_capacity(w.n);
+  for r in 0..w.n {
+    v.push(times.get(r) - w.arrive.get(r));
+  }
+  // Insertion sort; 300 values.
+  for i in 1..w.n {
+    let x = v.get(i);
+    let mut j = i;
+    while j > 0 && v.get(j - 1) > x {
+      v.set(j, v.get(j - 1));
+      j = j - 1;
+    }
+    v.set(j, x);
+  }
+  return v.get(w.n / 2);
+}
+
+// The checks every run must pass on any workload. Prints what is wrong.
+// Static batching has no token budget: its prefill step takes every prompt in the batch.
+fn sound(w : &Load, e : &Engine, run : &Run, name : *const i8, budgeted : bool) -> bool {
+  let mut ok = true;
+  for r in 0..w.n {
+    if run.made.get(r) != w.output.get(r) || run.done.get(r) < run.first.get(r) ||
+       run.first.get(r) <= w.arrive.get(r) {
+      ok = false;
+    }
+  }
+  if !ok {
+    print!("FAIL: ");
+    print!(name);
+    print!(": a request got the wrong tokens, or its times are out of order\n");
+  }
+  if budgeted && run.worst_step > e.budget {
+    print!("FAIL: ");
+    print!(name);
+    print!(": a step went over the token budget\n");
+    ok = false;
+  }
+  if run.worst_places > e.places || run.worst_kv > e.kv {
+    print!("FAIL: ");
+    print!(name);
+    print!(": over the places or the cache\n");
+    ok = false;
+  }
+  let mut order = run.admitted.len() == w.n;
+  for i in 0..run.admitted.len() {
+    if run.admitted.get(i) != i {
+      order = false;
+    }
+  }
+  if !order {
+    ok = false;
+    print!("FAIL: ");
+    print!(name);
+    print!(": not admitted once each in arrival order\n");
+  }
+  return ok;
+}
+
+fn same(a : &Vec<i64>, want : &Vec<i64>) -> bool {
+  for i in 0..want.len() {
+    if a.get(i) != want.get(i) {
+      return false;
+    }
+  }
+  return true;
+}
+
+fn three(a : i64, b : i64, c : i64) -> Vec<i64> {
+  let mut v = Vec<i64>::new();
+  v.push(a);
+  v.push(b);
+  v.push(c);
+  return v;
+}
+
+fn show(what : *const i8, v : &Vec<i64>) -> void {
+  print!(what);
+  for i in 0..v.len() {
+    print!(" ");
+    print!(v.get(i));
+  }
+  print!("\n");
+}
+
+struct Rng {
+  s : u64,
+}
+
+impl Rng {
+  fn below(self : &mut Rng, n : i32) -> i32 {
+    let mut x = self.s;
+    x = x ^ (x << 13);
+    x = x ^ (x >> 7);
+    x = x ^ (x << 17);
+    self.s = x;
+    return (x % u64::from(n as u32)) as i32;
+  }
+}
+
+fn main() -> i32 {
+  let mut failed = 0;
+
+  // 1. By hand: a budget of 8 tokens, 2 places, a step costs one unit per token.
+  //    A arrives at 0 with a 4-token prompt and 3 to write, B at 0 with 6 and 2, C at 1 with 2
+  //    and 1.
+  let mut tiny = Load { n: 3, arrive: Vec<i64>::new(), prompt: Vec<i32>::new(),
+                        output: Vec<i32>::new() };
+  tiny.arrive.push(0i64);
+  tiny.prompt.push(4);
+  tiny.output.push(3);
+  tiny.arrive.push(0i64);
+  tiny.prompt.push(6);
+  tiny.output.push(2);
+  tiny.arrive.push(1i64);
+  tiny.prompt.push(2);
+  tiny.output.push(1);
+  let unit = Engine { budget: 8, places: 2, kv: 100, overhead: 0i64, per_token: 1i64 };
+  let c = continuous(&tiny, &unit);
+  let s = static_batches(&tiny, &unit);
+  show("by hand, continuous: first tokens at", &c.first);
+  show("                     done at", &c.done);
+  show("by hand, static:     first tokens at", &s.first);
+  show("                     done at", &s.done);
+  if !same(&c.first, &three(8i64, 11i64, 15i64)) || !same(&c.done, &three(13i64, 13i64, 15i64)) {
+    print!("FAIL: continuous batching, worked example\n");
+    failed = failed + 1;
+  }
+  if !same(&s.first, &three(10i64, 10i64, 15i64)) || !same(&s.done, &three(13i64, 12i64, 15i64)) {
+    print!("FAIL: static batching, worked example\n");
+    failed = failed + 1;
+  }
+
+  // 2. A random workload: 300 requests, one every 0 to 40 ms, prompts of 32 to 1024 tokens,
+  //    outputs of 8 to 512. Steps of up to 512 tokens and 32 places, a cache of 16384 tokens;
+  //    a step costs 4 ms plus 20 us per token.
+  let mut rng = Rng { s: 88172645463325252u64 };
+  let n = 300;
+  let mut w = Load { n: n, arrive: Vec<i64>::new(), prompt: Vec<i32>::new(),
+                     output: Vec<i32>::new() };
+  let mut t : i64 = 0;
+  let mut out_total : i64 = 0;
+  for i in 0..n {
+    t = t + i64::from(rng.below(40001));
+    w.arrive.push(t);
+    w.prompt.push(32 + rng.below(993));
+    let o = 8 + rng.below(505);
+    w.output.push(o);
+    out_total = out_total + i64::from(o);
+  }
+  let e = Engine { budget: 512, places: 32, kv: 16384, overhead: 4000i64, per_token: 20i64 };
+  let cr = continuous(&w, &e);
+  let sr = static_batches(&w, &e);
+  if !sound(&w, &e, &cr, "continuous", true) {
+    failed = failed + 1;
+  }
+  if !sound(&w, &e, &sr, "static", false) {
+    failed = failed + 1;
+  }
+
+  // 3. Throughput (output tokens per second) and median time to first token and to done.
+  let c_tput = (out_total as f64) * 1000000.0f64 / (cr.end as f64);
+  let s_tput = (out_total as f64) * 1000000.0f64 / (sr.end as f64);
+  print!("300 requests, ");
+  print!(out_total);
+  print!(" output tokens\n");
+  print!("continuous: ");
+  print!(cr.steps);
+  print!(" steps, ");
+  print!(c_tput);
+  print!(" tokens/s, median first token ");
+  print!(median_wait(&w, &cr.first) / 1000i64);
+  print!(" ms, median done ");
+  print!(median_wait(&w, &cr.done) / 1000i64);
+  print!(" ms\n");
+  print!("static:     ");
+  print!(sr.steps);
+  print!(" steps, ");
+  print!(s_tput);
+  print!(" tokens/s, median first token ");
+  print!(median_wait(&w, &sr.first) / 1000i64);
+  print!(" ms, median done ");
+  print!(median_wait(&w, &sr.done) / 1000i64);
+  print!(" ms\n");
+  if !(c_tput > s_tput) || median_wait(&w, &cr.first) >= median_wait(&w, &sr.first) {
+    print!("FAIL: continuous batching should beat static batching here\n");
+    failed = failed + 1;
+  }
+
+  if failed == 0 {
+    print!("ok\n");
+  }
+  return failed;
+}

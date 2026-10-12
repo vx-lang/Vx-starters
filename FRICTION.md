@@ -212,6 +212,12 @@ fail in another.
 - **bigint, v0.0.3: `panic!` does not exist.** It is the function `panic("..")`; `panic!(..)` is
   `Macro panic not found`.
 
+- **batch-sched, main 39a12e0a: `==` on two C strings compares pointers.** `name != "static"`,
+  with `name : *const i8` passed `"static"`, is true: the two literals are different pointers.
+  It compiles without a warning, and it is also what pushed the program off the flat code
+  generator (`emitter gap at src/codegen/flat/emit/arith.rs:302`). The function takes a `bool`
+  instead.
+
 ## Standard library
 
 - **wordcount, v0.0.3: no command-line arguments in `std`.** The runtime has `vx_env_args_count`
