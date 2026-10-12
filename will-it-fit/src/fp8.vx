@@ -1,0 +1,27 @@
+// will-it-fit, fp8: the model of src/bf16.vx with weights in fp8 (`f8e4m3`), the rest in bf16.
+//
+//   vxc --machine <machine file> --host <host file> -a emit-mlir src/fp8.vx
+//
+// The question here is the element type, not the size: a machine file lists the types its
+// hardware has (`dtypes:`), and placing a tensor of any other type in its memory is refused.
+// The A100 has int4 and no fp8; the H100 has fp8 and no int4. Never run.
+
+fn admit<const LAYERS : i32, const HEADS : i32, const KVHEADS : i32, const HDIM : i32, const CTX : i32, const BATCH : i32>() -> i32 {
+  let w : Tensor<f8e4m3, [12 * LAYERS * HEADS * HDIM, HEADS * HDIM]> = Tensor<f8e4m3>([12 * LAYERS * HEADS * HDIM, HEADS * HDIM]);
+  let weights = transfer(w, Memory::HBM);
+  let kv : Tensor<bf16, [2 * LAYERS * BATCH * CTX, KVHEADS * HDIM]> = Tensor<bf16>([2 * LAYERS * BATCH * CTX, KVHEADS * HDIM]);
+  let cache = transfer(kv, Memory::HBM);
+  let a : Tensor<bf16, [BATCH * CTX, HEADS * HDIM]> = Tensor<bf16>([BATCH * CTX, HEADS * HDIM]);
+  let acts = transfer(a, Memory::HBM);
+  // A decode step holds all three at once. Reading them back after the last placement is what
+  // tells the compiler so: a tensor nobody reads is released where it is made.
+  let _w = transfer(weights, Memory::CPU_DRAM);
+  let _k = transfer(cache, Memory::CPU_DRAM);
+  let _a = transfer(acts, Memory::CPU_DRAM);
+  return 0;
+}
+
+fn main() -> i32 {
+  //   admit<LAYERS, HEADS, KVHEADS, HDIM, CTX, BATCH>
+  return admit<32, 32, 8, 128, 8192, 32>();
+}

@@ -1,0 +1,104 @@
+// will-it-fit, sizes: the memory arithmetic done by hand, at run time, to predict what the
+// compiler will say about src/bf16.vx, src/fp8.vx and src/int4.vx on each machine.
+//
+//   vxc -a run-jit src/sizes.vx
+//
+// For each program and machine it prints one line, "<program> <machine> admitted" or
+// "<program> <machine> rejected <code>", and build.sh checks that the compiler agrees. The
+// machine facts below are copied from the machine files' `spec:` lines: HBM capacity, and
+// whether the hardware has fp8 and int4.
+
+import core::convert;
+
+// The model: 32 layers, 32 query heads and 8 KV heads of 128, at 8192 tokens of context.
+fn layers() -> i64 {
+  return 32i64;
+}
+fn dim() -> i64 {
+  return 32i64 * 128i64;
+}
+fn kv_dim() -> i64 {
+  return 8i64 * 128i64;
+}
+fn ctx() -> i64 {
+  return 8192i64;
+}
+
+fn gib() -> i64 {
+  return 1073741824i64;
+}
+
+// Bytes of weights at `size` bytes each: 2 for bf16, 1 for fp8, and 1 for int4 too, since Vx
+// stores a 4-bit value in a whole byte and its capacity check counts it so (vx-lang/Vx#1202;
+// packing two to a byte is vx-lang/Vx#1437).
+fn weight_bytes(size : i64) -> i64 {
+  return 12i64 * layers() * dim() * dim() * size;
+}
+
+// Bytes of KV cache and of activations, in bf16, for `batch` sequences.
+fn cache_bytes(batch : i64) -> i64 {
+  return 2i64 * layers() * batch * ctx() * kv_dim() * 2i64;
+}
+fn act_bytes(batch : i64) -> i64 {
+  return batch * ctx() * dim() * 2i64;
+}
+
+fn show_gib(what : *const i8, bytes : i64) -> void {
+  print!(what);
+  print!(bytes);
+  print!(" bytes (");
+  print!((bytes as f64) / (gib() as f64));
+  print!(" GiB)\n");
+}
+
+// The verdict for one program on one machine: a type the machine lacks is E6026; otherwise
+// a total over capacity is E6010; otherwise admitted.
+fn verdict(name : *const i8, machine : *const i8, total : i64, capacity : i64, has_type : bool) -> void {
+  print!(name);
+  print!(" ");
+  print!(machine);
+  if !has_type {
+    print!(" rejected E6026\n");
+  } else if total > capacity {
+    print!(" rejected E6010\n");
+  } else {
+    print!(" admitted\n");
+  }
+  // Keeps the program on the flat code generator (vx-lang/Vx#1651).
+  return;
+}
+
+fn main() -> i32 {
+  let a100 = 40i64 * gib();
+  let h100 = 80i64 * gib();
+  let batch = 32i64;
+  print!("weights, 32 x 4096 x 4096 x 12:\n");
+  show_gib("  bf16 ", weight_bytes(2i64));
+  show_gib("  fp8  ", weight_bytes(1i64));
+  show_gib("  int4 ", weight_bytes(1i64));
+  show_gib("KV cache, batch 32 x 8192 tokens, bf16: ", cache_bytes(batch));
+  show_gib("activations, bf16: ", act_bytes(batch));
+
+  let rest = cache_bytes(batch) + act_bytes(batch);
+  let bf16 = weight_bytes(2i64) + rest;
+  let fp8 = weight_bytes(1i64) + rest;
+  let int4 = weight_bytes(1i64) + rest;
+  show_gib("total with bf16 weights: ", bf16);
+  show_gib("total with fp8 weights:  ", fp8);
+  show_gib("total with int4 weights: ", int4);
+  // int4 at batch 32 fills the A100's 40 GiB exactly. One more sequence does not fit; build.sh
+  // makes that program from src/int4.vx.
+  let int4_33 = weight_bytes(1i64) + cache_bytes(33i64) + act_bytes(33i64);
+  show_gib("total with int4 weights and batch 33: ", int4_33);
+
+  // The A100 has int4 and no fp8; the H100 has fp8 and no int4.
+  verdict("bf16", "a100-40", bf16, a100, true);
+  verdict("bf16", "h100-sxm", bf16, h100, true);
+  verdict("fp8", "a100-40", fp8, a100, false);
+  verdict("fp8", "h100-sxm", fp8, h100, true);
+  verdict("int4", "a100-40", int4, a100, true);
+  verdict("int4", "h100-sxm", int4, h100, false);
+  verdict("int4-33", "a100-40", int4_33, a100, true);
+  verdict("int4-33", "h100-sxm", int4_33, h100, false);
+  return 0;
+}

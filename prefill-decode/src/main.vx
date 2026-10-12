@@ -1,0 +1,202 @@
+// prefill-decode: one request, prefilled on one device and decoded on another, with the KV
+// cache moved between them by explicit transfers.
+//
+// Large serving systems split the two phases of a request ("disaggregated serving"). Prefill
+// reads the whole prompt at once and is limited by compute; decode writes one token at a time
+// and is limited by memory bandwidth. So they can run on different machines, and the KV cache
+// that prefill builds has to be shipped to the decoder.
+//
+// Here:
+//   1. `spawn on(Topology::GPU)` prefills: it writes a key/value row for each prompt token into
+//      a cache placed in GPU memory.
+//   2. The cache moves GPU memory -> host memory -> NPU memory, by `transfer` and `to_device`.
+//   3. `spawn on(Topology::NPU[0])` decodes 8 tokens greedily, appending to the cache.
+//   4. The tokens come back to the host, and must equal what the same model gives when it runs
+//      entirely on the host.
+//
+// On a machine without a GPU or NPU, Vx runs the regions on the host; the types, placements and
+// transfers are checked all the same. With `--verify-seams`, the compiler also proves (with z3)
+// that every transfer the decoder reads from is a synchronizing one.
+//
+// The model is a toy with whole-number state so both runs agree exactly: a token's key and
+// value are its embedding (4 numbers from a formula), and a decode step weights every cached
+// value by (score + 4)^2, then picks the token whose embedding best matches the result, never
+// one it has seen already.
+//
+// It returns the number of failed checks, and prints "ok" when there are none.
+
+// Functions in Vx belong to one topology: an ordinary function is host code, and a region on a
+// device cannot call it. The model's formulas are written as macros instead, so that the GPU
+// region, the NPU region and the host reference all expand the same text. One macro call cannot
+// be an argument of another (vx-lang/Vx#1655), so results go through a `let` first.
+
+// Coordinate i of token t's embedding: a small whole number. The 16 tokens get 16 different
+// embeddings.
+macro_rules! embed {
+  ($t:expr, $i:expr) => {
+    (((($t) >> ($i)) & 1) * 2 - 2 + ($t) % (($i) + 2)) as f32
+  };
+}
+
+// The prompt's p-th token.
+macro_rules! prompt {
+  ($p:expr) => {
+    (($p) * 5 + 3) % 16
+  };
+}
+
+// The dot product of cache rows a and b.
+macro_rules! dot {
+  ($c:expr, $a:expr, $b:expr) => {
+    $c[$a][0] * $c[$b][0] + $c[$a][1] * $c[$b][1] + $c[$a][2] * $c[$b][2] + $c[$a][3] * $c[$b][3]
+  };
+}
+
+// One decode step over cache rows 0..len: the next token. Scores are q . k_j with q the last
+// row; weights (score + 4)^2 are summed against the values; the token whose embedding has the
+// largest dot product with that sum wins, the smaller id on a tie. A token already in the cache
+// cannot be chosen again (a strict repetition penalty).
+//
+// A macro can only stand for an expression, not for a loop, so this step is a function, and a
+// function belongs to one topology. So there are two copies, one for the NPU and one for the
+// host. If they drift apart, the check in `main` fails.
+fn next_on_npu(c : &Tensor<f32, [16, 4], Memory::NPU_HBM>, len : i32) on Topology::NPU[0] -> i32 {
+  let mut mix = [0.0f32, 0.0f32, 0.0f32, 0.0f32];
+  for j in 0..len {
+    let s = dot!(c, len - 1, j);
+    let w = (s + 4.0f32) * (s + 4.0f32);
+    for i in 0..4 {
+      mix[i] = mix[i] + w * c[j][i];
+    }
+  }
+  let mut best = -1;
+  let mut best_score : f32 = 0.0;
+  for t in 0..16 {
+    let e0 = embed!(t, 0);
+    let e1 = embed!(t, 1);
+    let e2 = embed!(t, 2);
+    let e3 = embed!(t, 3);
+    let mut seen = false;
+    for j in 0..len {
+      if c[j][0] == e0 && c[j][1] == e1 && c[j][2] == e2 && c[j][3] == e3 {
+        seen = true;
+      }
+    }
+    let score = e0 * mix[0] + e1 * mix[1] + e2 * mix[2] + e3 * mix[3];
+    if !seen && (best < 0 || score > best_score) {
+      best = t;
+      best_score = score;
+    }
+  }
+  return best;
+}
+
+fn next_on_host(c : &Tensor<f32, [16, 4]>, len : i32) -> i32 {
+  let mut mix = [0.0f32, 0.0f32, 0.0f32, 0.0f32];
+  for j in 0..len {
+    let s = dot!(c, len - 1, j);
+    let w = (s + 4.0f32) * (s + 4.0f32);
+    for i in 0..4 {
+      mix[i] = mix[i] + w * c[j][i];
+    }
+  }
+  let mut best = -1;
+  let mut best_score : f32 = 0.0;
+  for t in 0..16 {
+    let e0 = embed!(t, 0);
+    let e1 = embed!(t, 1);
+    let e2 = embed!(t, 2);
+    let e3 = embed!(t, 3);
+    let mut seen = false;
+    for j in 0..len {
+      if c[j][0] == e0 && c[j][1] == e1 && c[j][2] == e2 && c[j][3] == e3 {
+        seen = true;
+      }
+    }
+    let score = e0 * mix[0] + e1 * mix[1] + e2 * mix[2] + e3 * mix[3];
+    if !seen && (best < 0 || score > best_score) {
+      best = t;
+      best_score = score;
+    }
+  }
+  return best;
+}
+
+fn main() -> i32 {
+  let mut failed = 0;
+
+  // 1. Prefill on the GPU: 8 prompt tokens into a cache of 16 rows placed in GPU memory.
+  let mut cache = Tensor<f32, [16, 4], Memory::GPU_HBM>::new();
+  spawn on(Topology::GPU) {
+    for p in 0..8 {
+      let tok = prompt!(p);
+      for i in 0..4 {
+        cache[p][i] = embed!(tok, i);
+      }
+    }
+  }
+
+  // 2. Ship the cache to the decoder: GPU memory to the host, the host to the NPU.
+  let staged = transfer(cache, Memory::CPU_DRAM);
+  let mut on_npu = staged.to_device();
+
+  // 3. Decode 8 tokens on the NPU, appending each one's row to the cache.
+  let mut tokens = Tensor<i32, [8], Memory::NPU_HBM>::new();
+  spawn on(Topology::NPU[0]) {
+    for step in 0..8 {
+      let t = next_on_npu(&on_npu, 8 + step);
+      tokens[step] = t;
+      for i in 0..4 {
+        on_npu[8 + step][i] = embed!(t, i);
+      }
+    }
+  }
+  let got = transfer(tokens, Memory::CPU_DRAM);
+
+  // 4. The same model, entirely on the host.
+  let mut ref_cache = Tensor<f32, [16, 4]>::new();
+  for p in 0..8 {
+    let tok = prompt!(p);
+    for i in 0..4 {
+      ref_cache[p][i] = embed!(tok, i);
+    }
+  }
+  let mut want = Tensor<i32, [8]>::new();
+  for step in 0..8 {
+    let t = next_on_host(&ref_cache, 8 + step);
+    want[step] = t;
+    for i in 0..4 {
+      ref_cache[8 + step][i] = embed!(t, i);
+    }
+  }
+
+  print!("prompt:     ");
+  for p in 0..8 {
+    let tok = prompt!(p);
+    print!(" ");
+    print!(tok);
+  }
+  print!("\nGPU + NPU:  ");
+  for step in 0..8 {
+    print!(" ");
+    print!(got[step]);
+  }
+  print!("\nhost alone: ");
+  let mut differ = 0;
+  for step in 0..8 {
+    print!(" ");
+    print!(want[step]);
+    if got[step] != want[step] {
+      differ = differ + 1;
+    }
+  }
+  print!("\n");
+  if differ > 0 {
+    print!("FAIL: the split run and the host-only run decode different tokens\n");
+    failed = failed + 1;
+  }
+  if failed == 0 {
+    print!("ok\n");
+  }
+  return failed;
+}
