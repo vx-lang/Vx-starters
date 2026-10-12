@@ -1,0 +1,299 @@
+// flash-attn: attention computed two ways, and shown to agree.
+//
+// Naive attention builds the whole n x n score matrix S = Q K^T / sqrt(d), takes a softmax of
+// each row, and multiplies by V. FlashAttention never builds S: it walks over K and V in tiles,
+// and for each query row keeps a running maximum m, a running sum l of exp(s - m), and a running
+// output, rescaling the old values by exp(m_old - m_new) whenever the maximum grows. That is
+// "online softmax". At the end it divides by l. The result is the same up to rounding, while the
+// memory for scores falls from n * n to one tile.
+//
+// This checks, on random inputs:
+//   - the tiled result equals the naive one for several tile sizes, including ones that do not
+//     divide n, with and without a causal mask;
+//   - with large scores (up to about 1000) both stay finite, because both subtract the maximum,
+//     while a softmax that does not subtract it overflows to NaN.
+//
+// It returns the number of failed checks, and prints "ok" when there are none.
+
+import core::convert;
+import core::num;
+import std::vec;
+
+// xorshift64, so runs are repeatable.
+struct Rng {
+  s : u64,
+}
+
+impl Rng {
+  fn next(self : &mut Rng) -> u64 {
+    let mut x = self.s;
+    x = x ^ (x << 13);
+    x = x ^ (x >> 7);
+    x = x ^ (x << 17);
+    self.s = x;
+    return x;
+  }
+
+  // Uniform in [-1, 1].
+  fn unit(self : &mut Rng) -> f64 {
+    let n = (self.next() % 2000001u64) as i64;
+    return ((n - 1000000) as f64) / 1000000.0f64;
+  }
+}
+
+// A rows x cols matrix of random numbers in [-scale, scale], stored by rows.
+fn random(rng : &mut Rng, rows : i32, cols : i32, scale : f64) -> Vec<f64> {
+  let mut out = Vec<f64>::with_capacity(rows * cols);
+  for i in 0..rows * cols {
+    out.push(scale * rng.unit());
+  }
+  return out;
+}
+
+fn zeros(n : i32) -> Vec<f64> {
+  let mut out = Vec<f64>::with_capacity(n);
+  for i in 0..n {
+    out.push(0.0f64);
+  }
+  return out;
+}
+
+// Row i of Q dotted with row j of K, over d columns, divided by sqrt(d).
+fn score(q : &Vec<f64>, k : &Vec<f64>, i : i32, j : i32, d : i32) -> f64 {
+  let mut s : f64 = 0.0;
+  for c in 0..d {
+    s = s + q.get(i * d + c) * k.get(j * d + c);
+  }
+  return s / f64::from(d).sqrt();
+}
+
+// Whether query i may look at key j: with a causal mask, only keys at or before it.
+fn visible(i : i32, j : i32, causal : bool) -> bool {
+  if causal {
+    return j <= i;
+  }
+  return true;
+}
+
+fn neg_inf() -> f64 {
+  return -1.0f64 / 0.0f64;
+}
+
+// Attention the textbook way: the full n x n score matrix, a softmax per row, then P V.
+// With `stable` false, the softmax does not subtract the row maximum.
+fn naive(q : &Vec<f64>, k : &Vec<f64>, v : &Vec<f64>, n : i32, d : i32, causal : bool,
+         stable : bool) -> Vec<f64> {
+  let mut s = zeros(n * n);
+  for i in 0..n {
+    for j in 0..n {
+      if visible(i, j, causal) {
+        s.set(i * n + j, score(q, k, i, j, d));
+      } else {
+        s.set(i * n + j, neg_inf());
+      }
+    }
+  }
+  let mut out = zeros(n * d);
+  for i in 0..n {
+    let mut m : f64 = 0.0;
+    if stable {
+      m = neg_inf();
+      for j in 0..n {
+        if s.get(i * n + j) > m {
+          m = s.get(i * n + j);
+        }
+      }
+    }
+    let mut l : f64 = 0.0;
+    for j in 0..n {
+      let p = (s.get(i * n + j) - m).exp();
+      s.set(i * n + j, p);
+      l = l + p;
+    }
+    for j in 0..n {
+      let p = s.get(i * n + j) / l;
+      for c in 0..d {
+        out.set(i * d + c, out.get(i * d + c) + p * v.get(j * d + c));
+      }
+    }
+  }
+  return out;
+}
+
+// FlashAttention's loop: query tiles of br rows, key/value tiles of bc rows. For each query row
+// it keeps m (the largest score so far), l (the sum of exp(score - m)) and acc (the sum of
+// exp(score - m) times rows of V). No n x n matrix exists; `tile` holds br x bc scores.
+fn flash(q : &Vec<f64>, k : &Vec<f64>, v : &Vec<f64>, n : i32, d : i32, causal : bool, br : i32,
+         bc : i32) -> Vec<f64> {
+  let mut out = zeros(n * d);
+  let mut tile = zeros(br * bc);
+  let mut m = zeros(br);
+  let mut l = zeros(br);
+  let mut acc = zeros(br * d);
+  let mut i0 = 0;
+  while i0 < n {
+    let rows = (n - i0).min(br);
+    for r in 0..rows {
+      m.set(r, neg_inf());
+      l.set(r, 0.0f64);
+      for c in 0..d {
+        acc.set(r * d + c, 0.0f64);
+      }
+    }
+    let mut j0 = 0;
+    while j0 < n {
+      let cols = (n - j0).min(bc);
+      for r in 0..rows {
+        // Scores of this row against the tile, and the tile's largest.
+        let mut tmax = neg_inf();
+        for t in 0..cols {
+          let mut s = neg_inf();
+          if visible(i0 + r, j0 + t, causal) {
+            s = score(q, k, i0 + r, j0 + t, d);
+          }
+          tile.set(r * bc + t, s);
+          if s > tmax {
+            tmax = s;
+          }
+        }
+        let m_old = m.get(r);
+        let m_new = m_old.max(tmax);
+        // A row with nothing visible yet has nothing to add.
+        if m_new > neg_inf() {
+          // Rescale what was summed against the old maximum.
+          let alpha = (m_old - m_new).exp();
+          let mut lsum = l.get(r) * alpha;
+          for c in 0..d {
+            acc.set(r * d + c, acc.get(r * d + c) * alpha);
+          }
+          for t in 0..cols {
+            let p = (tile.get(r * bc + t) - m_new).exp();
+            lsum = lsum + p;
+            for c in 0..d {
+              acc.set(r * d + c, acc.get(r * d + c) + p * v.get((j0 + t) * d + c));
+            }
+          }
+          l.set(r, lsum);
+          m.set(r, m_new);
+        }
+      }
+      j0 = j0 + bc;
+    }
+    for r in 0..rows {
+      for c in 0..d {
+        out.set((i0 + r) * d + c, acc.get(r * d + c) / l.get(r));
+      }
+    }
+    i0 = i0 + br;
+  }
+  return out;
+}
+
+// The largest |a - b| over the two matrices; NaN anywhere counts as infinitely far.
+fn max_diff(a : &Vec<f64>, b : &Vec<f64>) -> f64 {
+  let mut worst : f64 = 0.0;
+  for i in 0..a.len() {
+    let e = (a.get(i) - b.get(i)).abs();
+    if !(e <= worst) {
+      worst = e;
+    }
+  }
+  return worst;
+}
+
+fn all_finite(a : &Vec<f64>) -> bool {
+  for i in 0..a.len() {
+    let x = a.get(i);
+    if !(x - x == 0.0f64) {
+      return false;
+    }
+  }
+  return true;
+}
+
+fn main() -> i32 {
+  let mut rng = Rng { s: 88172645463325252u64 };
+  let n = 50;
+  let d = 16;
+  let mut failed = 0;
+
+  // Tile sizes: square, tall, wide, ones that do not divide 50, and one tile for everything.
+  let brs = [8, 16, 5, 7, 50, 4];
+  let bcs = [8, 4, 16, 13, 50, 1];
+
+  for pass in 0..2 {
+    let causal = pass == 1;
+    let q = random(&mut rng, n, d, 1.0f64);
+    let k = random(&mut rng, n, d, 1.0f64);
+    let v = random(&mut rng, n, d, 1.0f64);
+    let want = naive(&q, &k, &v, n, d, causal, true);
+    let mut worst : f64 = 0.0;
+    for t in 0..6 {
+      let got = flash(&q, &k, &v, n, d, causal, brs[t], bcs[t]);
+      let e = max_diff(&want, &got);
+      if !(e <= worst) {
+        worst = e;
+      }
+    }
+    if causal {
+      print!("causal:     ");
+    } else {
+      print!("non-causal: ");
+    }
+    print!("tiled vs naive, 6 tile shapes, largest difference ");
+    print!(worst);
+    print!("\n");
+    if !(worst < 0.000000000001f64) {
+      print!("FAIL: tiled attention differs from naive\n");
+      failed = failed + 1;
+    }
+  }
+
+  // Large scores: entries up to 25 give scores up to about 25 * 25 * 16 / 4 = 2500.
+  let q = random(&mut rng, n, d, 25.0f64);
+  let k = random(&mut rng, n, d, 25.0f64);
+  let v = random(&mut rng, n, d, 1.0f64);
+  let stable = naive(&q, &k, &v, n, d, false, true);
+  let unstable = naive(&q, &k, &v, n, d, false, false);
+  // One key per tile makes the running maximum matter most: rescaling by exp(m_old - m_new)
+  // with m_new below m_old would overflow.
+  let mut e : f64 = 0.0;
+  let mut finite = all_finite(&stable);
+  for t in 0..6 {
+    let tiled = flash(&q, &k, &v, n, d, false, brs[t], bcs[t]);
+    let x = max_diff(&stable, &tiled);
+    if !(x <= e) {
+      e = x;
+    }
+    if !all_finite(&tiled) {
+      finite = false;
+    }
+  }
+  print!("large scores: tiled vs naive differ by ");
+  print!(e);
+  if all_finite(&unstable) {
+    print!("; softmax without the max subtracted stays finite\n");
+  } else {
+    print!("; softmax without the max subtracted gives NaN\n");
+  }
+  if !finite || !(e < 0.000000000001f64) {
+    print!("FAIL: attention with large scores\n");
+    failed = failed + 1;
+  }
+  if all_finite(&unstable) {
+    print!("FAIL: expected the unstable softmax to overflow\n");
+    failed = failed + 1;
+  }
+
+  // Memory for scores: naive holds n x n, tiled holds one br x bc tile.
+  print!("score memory at n = 50: naive ");
+  print!(n * n);
+  print!(" numbers, tiled (16 x 16 tiles) ");
+  print!(16 * 16);
+  print!("\n");
+
+  if failed == 0 {
+    print!("ok\n");
+  }
+  return failed;
+}

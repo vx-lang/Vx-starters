@@ -1,0 +1,370 @@
+// bpe-tokenizer: train a byte-pair-encoding tokenizer, then encode and decode with it.
+//
+// Byte-pair encoding, as GPT models use it: start from the 256 byte values as tokens, and
+// repeatedly merge the most frequent adjacent pair of tokens into a new token. The list of
+// merges is the tokenizer. To encode new text, apply the merges in the order they were learned;
+// to decode, expand each token back into its bytes.
+//
+// As in GPT-2, text is first cut into words, each starting at a space or a newline, and pairs are
+// never counted or merged across a cut, so a token never spans two words.
+//
+// The checks:
+//   1. Wikipedia's example, "aaabdaaabac": the merges are aa, ab, then (aa)(ab), leaving five
+//      tokens, "XdXac".
+//   2. Trained on ../FRICTION.md, encoding that file again gives exactly the tokens training
+//      ended with.
+//   3. Decoding gives back the bytes exactly, for the training file and for ../README.md, which
+//      it never saw.
+//
+// It prints the first merges and how many bytes a token covers, returns the number of failed
+// checks, and prints "ok" when there are none.
+
+import core::convert;
+import std::fs;
+import std::vec;
+
+// A word cut, in a sequence of tokens.
+fn cut() -> i32 {
+  return -1;
+}
+
+fn is_space(b : i32) -> bool {
+  return b == 32 || b == 10;
+}
+
+// The bytes of a file.
+fn read_file(path : *const i8) -> Vec<i32> {
+  let mut file = unsafe { File::open(path, OpenMode::Read) };
+  let buf : Tensor<u8, [4096]> = Tensor<u8, [4096]>::new();
+  let p = buf.as_mut_ptr();
+  let mut out = Vec<i32>::new();
+  let mut done = false;
+  while !done {
+    let n = unsafe { file.read(p, 4096) };
+    if n == 0 {
+      done = true;
+    }
+    for i in 0..(n as i64) {
+      let b = unsafe { p[i] };
+      out.push(i32::from(b));
+    }
+  }
+  return out;
+}
+
+// The bytes of a C string.
+fn bytes_of(s : *const i8) -> Vec<i32> {
+  let mut out = Vec<i32>::new();
+  let mut i : i64 = 0;
+  let mut done = false;
+  while !done {
+    let b = i32::from(unsafe { s[i] });
+    if b == 0 {
+      done = true;
+    } else {
+      out.push(b);
+      i = i + 1;
+    }
+  }
+  return out;
+}
+
+// Bytes cut into words: a cut before every space or newline that follows another byte.
+fn words(bytes : &Vec<i32>) -> Vec<i32> {
+  let mut out = Vec<i32>::with_capacity(bytes.len() * 2);
+  for i in 0..bytes.len() {
+    let b = bytes.get(i);
+    if i > 0 && is_space(b) {
+      out.push(cut());
+    }
+    out.push(b);
+  }
+  return out;
+}
+
+// What training learns. Token 256 + r is the pair (left[r], right[r]). `rank[a * size + b]` is r
+// for that pair, or -1 if the pair is not a merge, so that encoding can look a pair up at once.
+struct Bpe {
+  size : i32,
+  left : Vec<i32>,
+  right : Vec<i32>,
+  rank : Vec<i32>,
+}
+
+fn filled(n : i32, v : i32) -> Vec<i32> {
+  let mut out = Vec<i32>::with_capacity(n);
+  for i in 0..n {
+    out.push(v);
+  }
+  return out;
+}
+
+// Replace every (a, b) in seq by t, left to right, in place. Cuts are never part of a pair.
+fn merge_pair(seq : &mut Vec<i32>, a : i32, b : i32, t : i32) -> void {
+  let n = seq.len();
+  let mut w = 0;
+  let mut i = 0;
+  while i < n {
+    let x = seq.get(i);
+    let mut merged = false;
+    if i + 1 < n {
+      if x == a && seq.get(i + 1) == b {
+        merged = true;
+      }
+    }
+    if merged {
+      seq.set(w, t);
+      i = i + 2;
+    } else {
+      seq.set(w, x);
+      i = i + 1;
+    }
+    w = w + 1;
+  }
+  while seq.len() > w {
+    seq.pop();
+  }
+}
+
+// Learn up to `merges` merges from seq (bytes with cuts), merging seq as it goes. Each round
+// counts every adjacent pair and merges the most frequent; a tie goes to the pair with the
+// smaller tokens, so training is repeatable. It stops early when no pair occurs twice.
+fn train(seq : &mut Vec<i32>, merges : i32) -> Bpe {
+  let size = 256 + merges;
+  let mut left = Vec<i32>::new();
+  let mut right = Vec<i32>::new();
+  let mut rank = filled(size * size, -1);
+  let mut counts = filled(size * size, 0);
+  let mut r = 0;
+  let mut more = true;
+  while more && r < merges {
+    for i in 0..size * size {
+      counts.set(i, 0);
+    }
+    let mut best = -1;
+    let mut best_count = 1;
+    for i in 0..seq.len() - 1 {
+      let a = seq.get(i);
+      let b = seq.get(i + 1);
+      if a != cut() && b != cut() {
+        let key = a * size + b;
+        let c = counts.get(key) + 1;
+        counts.set(key, c);
+        if c > best_count || (c == best_count && key < best) {
+          best = key;
+          best_count = c;
+        }
+      }
+    }
+    if best < 0 {
+      more = false;
+    } else {
+      let a = best / size;
+      let b = best % size;
+      left.push(a);
+      right.push(b);
+      rank.set(best, r);
+      merge_pair(seq, a, b, 256 + r);
+      r = r + 1;
+    }
+  }
+  return Bpe { size: size, left: left, right: right, rank: rank };
+}
+
+// Encode bytes: cut them into words, then, as long as some adjacent pair is a merge, merge every
+// occurrence of the earliest-learned one. Because training merged in that same order, this
+// reproduces what training did.
+fn encode(bpe : &Bpe, bytes : &Vec<i32>) -> Vec<i32> {
+  let mut seq = words(bytes);
+  let mut more = true;
+  while more {
+    let mut best = -1;
+    let mut best_key = 0;
+    for i in 0..seq.len() - 1 {
+      let a = seq.get(i);
+      let b = seq.get(i + 1);
+      if a != cut() && b != cut() {
+        let key = a * bpe.size + b;
+        let r = bpe.rank.get(key);
+        if r >= 0 && (best < 0 || r < best) {
+          best = r;
+          best_key = key;
+        }
+      }
+    }
+    if best < 0 {
+      more = false;
+    } else {
+      merge_pair(&mut seq, best_key / bpe.size, best_key % bpe.size, 256 + best);
+    }
+  }
+  // Drop the cuts: they were only there to keep merges inside words.
+  let mut out = Vec<i32>::with_capacity(seq.len());
+  for i in 0..seq.len() {
+    if seq.get(i) != cut() {
+      out.push(seq.get(i));
+    }
+  }
+  return out;
+}
+
+// Decode tokens to bytes, expanding each merged token into its two halves with a stack.
+fn decode(bpe : &Bpe, tokens : &Vec<i32>) -> Vec<i32> {
+  let mut out = Vec<i32>::new();
+  let mut stack = Vec<i32>::new();
+  for i in 0..tokens.len() {
+    stack.push(tokens.get(i));
+    while stack.len() > 0 {
+      let t = stack.get(stack.len() - 1);
+      stack.pop();
+      if t < 256 {
+        out.push(t);
+      } else {
+        // Right half first, so the left half comes off the stack first.
+        stack.push(bpe.right.get(t - 256));
+        stack.push(bpe.left.get(t - 256));
+      }
+    }
+  }
+  return out;
+}
+
+fn same(a : &Vec<i32>, b : &Vec<i32>) -> bool {
+  if a.len() != b.len() {
+    return false;
+  }
+  for i in 0..a.len() {
+    if a.get(i) != b.get(i) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Print a token's bytes, showing a space as _ and a newline as \n.
+fn show(bpe : &Bpe, t : i32) -> void {
+  let mut one = Vec<i32>::new();
+  one.push(t);
+  let bytes = decode(bpe, &one);
+  for i in 0..bytes.len() {
+    let b = bytes.get(i);
+    if b == 32 {
+      print!("_");
+    } else if b == 10 {
+      print!("\\n");
+    } else {
+      let one : Tensor<i8, [2]> = Tensor<i8, [2]>::new();
+      let p = one.as_mut_ptr();
+      unsafe {
+        p[0] = b as i8;
+        p[1] = 0;
+      }
+      print!(p as *const i8);
+    }
+  }
+}
+
+fn main() -> i32 {
+  let mut failed = 0;
+
+  // 1. Wikipedia's example. With a = 97, b = 98: aa becomes 256, ab becomes 257, and 256 257
+  //    becomes 258, so "aaabdaaabac" ends as 258 d 258 a c.
+  let tiny = bytes_of("aaabdaaabac");
+  let mut tiny_seq = words(&tiny);
+  let tiny_bpe = train(&mut tiny_seq, 10);
+  let mut want = Vec<i32>::new();
+  want.push(258);
+  want.push(100);
+  want.push(258);
+  want.push(97);
+  want.push(99);
+  print!("aaabdaaabac: ");
+  print!(tiny_bpe.left.len());
+  print!(" merges, ");
+  print!(tiny_seq.len());
+  print!(" tokens\n");
+  if tiny_bpe.left.len() != 3 || !same(&tiny_seq, &want) || tiny_bpe.left.get(0) != 97 ||
+     tiny_bpe.right.get(0) != 97 || tiny_bpe.left.get(1) != 97 || tiny_bpe.right.get(1) != 98 {
+    print!("FAIL: Wikipedia's example\n");
+    failed = failed + 1;
+  }
+  if !same(&encode(&tiny_bpe, &tiny), &want) {
+    print!("FAIL: encoding Wikipedia's example\n");
+    failed = failed + 1;
+  }
+
+  // 2. Train on one file.
+  let text = read_file("../FRICTION.md");
+  let mut seq = words(&text);
+  let bpe = train(&mut seq, 500);
+  let mut trained = Vec<i32>::with_capacity(seq.len());
+  for i in 0..seq.len() {
+    if seq.get(i) != cut() {
+      trained.push(seq.get(i));
+    }
+  }
+  print!("trained on ../FRICTION.md: ");
+  print!(text.len());
+  print!(" bytes, ");
+  print!(bpe.left.len());
+  print!(" merges\n");
+  print!("first merges:");
+  for r in 0..12 {
+    print!(" ");
+    show(&bpe, 256 + r);
+  }
+  print!("\nlast merges:");
+  for r in bpe.left.len() - 6..bpe.left.len() {
+    print!(" ");
+    show(&bpe, 256 + r);
+  }
+  print!("\n");
+  // No token may hold a space or newline after its first byte: that would span a word cut.
+  let mut spans = 0;
+  for r in 0..bpe.left.len() {
+    let mut one = Vec<i32>::new();
+    one.push(256 + r);
+    let bytes = decode(&bpe, &one);
+    for i in 1..bytes.len() {
+      if is_space(bytes.get(i)) {
+        spans = spans + 1;
+      }
+    }
+  }
+  if spans > 0 {
+    print!("FAIL: a token spans a word cut\n");
+    failed = failed + 1;
+  }
+  let tokens = encode(&bpe, &text);
+  if !same(&tokens, &trained) {
+    print!("FAIL: encoding the training file differs from training's own result\n");
+    failed = failed + 1;
+  }
+
+  // 3. Round trips.
+  if !same(&decode(&bpe, &tokens), &text) {
+    print!("FAIL: decoding the training file\n");
+    failed = failed + 1;
+  }
+  let other = read_file("../README.md");
+  let other_tokens = encode(&bpe, &other);
+  if !same(&decode(&bpe, &other_tokens), &other) {
+    print!("FAIL: decoding ../README.md\n");
+    failed = failed + 1;
+  }
+  print!("../FRICTION.md: ");
+  print!(tokens.len());
+  print!(" tokens, ");
+  print!(f64::from(text.len()) / f64::from(tokens.len()));
+  print!(" bytes per token\n");
+  print!("../README.md (not seen in training): ");
+  print!(other_tokens.len());
+  print!(" tokens, ");
+  print!(f64::from(other.len()) / f64::from(other_tokens.len()));
+  print!(" bytes per token\n");
+
+  if failed == 0 {
+    print!("ok\n");
+  }
+  return failed;
+}
