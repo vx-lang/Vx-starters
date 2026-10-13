@@ -69,6 +69,7 @@ first such checks ([vx-lang/Vx#1489](https://github.com/vx-lang/Vx/issues/1489))
 | [`ffi-zlib`](ffi-zlib) | Calling a C library: zlib's crc32, adler32, compress2 and uncompress through an `extern` block, checked against known values and a CRC-32 written in Vx | Linking native libraries: `vxc` cannot add `-lz`, so the build compiles to an object and links it by hand |
 | [`will-it-fit`](will-it-fit) | `--machine`: one program admitted or refused per GPU (A100 40 GB, H100); capacity (E6010) and dtype (E6026) errors predicted by a run-time calculation and matched exactly | Machine models as build inputs, per target: the same source, one compile per machine file |
 | [`prefill-decode`](prefill-decode) | `spawn on` GPU and NPU regions, `transfer` / `to_device` of a KV cache, `--verify-seams` proving every hop and refusing a relaxed one | Optional tools (`z3`) in the test step: skipped with a message when missing |
+| [`gpu-norms`](gpu-norms) | LayerNorm, RMSNorm and softmax as `spawn on(Topology::GPU)` kernels: PTX for sm_80 that `ptxas` accepts, a standalone executable, results checked against host code and Python, no GPU needed | Device code as a build output: the PTX is dug out of LLVM IR, the CUDA toolkit is an optional tool, and a CUDA toolchain needs the driver's stub to link |
 
 ## Getting the toolchain
 
@@ -81,7 +82,8 @@ Every project builds with `./build.sh` against `~/.vx/current`, or the toolchain
 The projects up to `tiny-mlp` were written against v0.0.3. From `flash-attn` on, they use Vx
 built from `main` (39a12e0a or later), which has fixes the release lacks; there is no nightly
 installer yet, so that means building Vx and packaging it with `scripts/release/package.sh`.
-Every project passes with that build too, except `rational` and `interval`, which no longer
+Every project passes with that build too (rechecked on b31ef3ca, built with and without CUDA),
+except `rational` and `interval`, which no longer
 compile on `main` ([vx-lang/Vx#1661](https://github.com/vx-lang/Vx/issues/1661)); they still
 pass on v0.0.3.
 
