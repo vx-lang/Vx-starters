@@ -24,6 +24,24 @@ Format: the project, the toolchain version, what happened, and what we did inste
   the LLVM directory from the installed v0.0.3. A package needs a way to say "needs Vx newer than
   v0.0.3", and the installer a way to install a nightly.
 
+- **gpu-norms, main b31ef3ca: a CUDA toolchain needs the GPU driver to build anything.** Built
+  where the CUDA toolkit is installed, Vx's dispatch library links `-lcuda`, so every
+  `run-jit`, and `emit-obj` of a program with a GPU region, needs `libcuda.so.1`, which only an
+  NVIDIA driver installs. On a machine with the toolkit and no driver, 24 of the 28 projects fail,
+  even ones with no GPU code ([vx-lang/Vx#1737](https://github.com/vx-lang/Vx/issues/1737)).
+  `build.sh` links the toolkit's stub in as `libcuda.so.1` and puts it on `LD_LIBRARY_PATH`.
+  A toolchain also has two flavours now, with and without CUDA, that a package cannot ask for.
+- **gpu-norms, main b31ef3ca: linking a GPU program needs two more things.** Besides the
+  libraries `ffi-zlib` names, the dispatch library (`libvx_cuda_dispatch` or
+  `libvx_x86_dispatch`, whichever the toolchain has) and `-rdynamic`. Without `-rdynamic` the
+  executable links and then stops, `FATAL: outlined kernel vx_npu_kernel_0 not found`, because
+  the dispatch library finds each kernel's host copy by name (#1499).
+- **gpu-norms, main b31ef3ca: no way to get the device code out.** The PTX is a string in the
+  emitted LLVM IR, after `image=`, escaped. `kernels.py` unescapes it so `ptxas` can check it.
+  The chip is fixed at `sm_80` unless the environment variable `VX_GPU_CHIP` says otherwise;
+  a build tool would want a flag, an output file per device, and the target chip in the
+  manifest.
+
 - **wordcount, v0.0.3: no way to build an executable.** `vxc` can run a program (`run-jit`) or
   emit an object file (`emit-obj`), but not link one. `build.sh` links the object against
   `$VX_HOME/lib/libvx_std_core.so` with the bundled clang, and sets an rpath so the binary finds

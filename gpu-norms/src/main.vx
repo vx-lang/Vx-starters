@@ -1,0 +1,175 @@
+// gpu-norms: LayerNorm, RMSNorm and softmax over the rows of a matrix, each in a GPU region.
+//
+// Each `spawn on(Topology::GPU) { .. }` block is compiled to an NVIDIA kernel (PTX for sm_80)
+// and carried inside the program. Where a GPU and its driver are present the kernel runs there;
+// on a machine without one, the same region runs on the host. Either way the program checks the
+// three kernels against plain host code below, and prints a few numbers that build.sh checks
+// against Python.
+//
+// Data moves explicitly: `transfer(t, Memory::GPU_HBM)` changes the tensor's type to one placed
+// in GPU memory, and the host cannot read it again until it is transferred back.
+
+import core::convert;
+import core::num;
+
+const R : i32 = 32;
+const C : i32 = 128;
+
+// The input, a whole-number pattern scaled by 1/8 so that every value is exact in f32 and the
+// Python check reads the same matrix.
+macro_rules input { ($i : expr, $j : expr) => { ((($i * 37 + $j * 11) % 101) as f32) / 8.0 - 6.0 }; }
+
+// The host versions, written separately from the kernels: same formulas, ordinary loops.
+fn layernorm_host(x : &Tensor<f32, [32, 128]>, y : &mut Tensor<f32, [32, 128]>) -> void {
+  for i in 0..R {
+    let mut mean : f32 = 0.0;
+    for j in 0..C { mean += x[i][j]; }
+    mean = mean / (C as f32);
+    let mut var : f32 = 0.0;
+    for j in 0..C { let d = x[i][j] - mean; var += d * d; }
+    var = var / (C as f32);
+    let inv = 1.0 / (var + 0.00001).sqrt();
+    for j in 0..C { y[i][j] = (x[i][j] - mean) * inv; }
+  }
+}
+
+fn rmsnorm_host(x : &Tensor<f32, [32, 128]>, y : &mut Tensor<f32, [32, 128]>) -> void {
+  for i in 0..R {
+    let mut ms : f32 = 0.0;
+    for j in 0..C { ms += x[i][j] * x[i][j]; }
+    let inv = 1.0 / (ms / (C as f32) + 0.00001).sqrt();
+    for j in 0..C { y[i][j] = x[i][j] * inv; }
+  }
+}
+
+fn softmax_host(x : &Tensor<f32, [32, 128]>, y : &mut Tensor<f32, [32, 128]>) -> void {
+  for i in 0..R {
+    let mut m : f32 = x[i][0];
+    for j in 1..C { if x[i][j] > m { m = x[i][j]; } }
+    let mut z : f32 = 0.0;
+    for j in 0..C { z += (x[i][j] - m).exp(); }
+    for j in 0..C { y[i][j] = (x[i][j] - m).exp() / z; }
+  }
+}
+
+// The largest |a - b| over the matrix.
+fn max_diff(a : &Tensor<f32, [32, 128]>, b : &Tensor<f32, [32, 128]>) -> f64 {
+  let mut worst : f64 = 0.0;
+  for i in 0..R {
+    for j in 0..C {
+      let mut d = f64::from(a[i][j] - b[i][j]);
+      if d < 0.0 { d = 0.0 - d; }
+      if d > worst { worst = d; }
+    }
+  }
+  return worst;
+}
+
+// Prints three entries of a kernel's result, and returns 1 if the kernel is further from the
+// host code than `tol`.
+fn report(gpu : &Tensor<f32, [32, 128]>, host : &Tensor<f32, [32, 128]>, tol : f64) -> i32 {
+  let d = max_diff(gpu, host);
+  print!(f64::from(gpu[0][0]));
+  print!(" ");
+  print!(f64::from(gpu[7][50]));
+  print!(" ");
+  print!(f64::from(gpu[31][127]));
+  print!("\n");
+  if d > tol {
+    print!("  FAIL: differs from the host code by ");
+    print!(d);
+    print!("\n");
+    return 1;
+  }
+  return 0;
+}
+
+fn main() -> i32 {
+  let mut x_h = unsafe { Tensor<f32, [32, 128]>::uninit() };
+  for i in 0..R {
+    for j in 0..C {
+      x_h[i][j] = input!(i, j);
+    }
+  }
+  let mut ln_host = unsafe { Tensor<f32, [32, 128]>::uninit() };
+  let mut rms_host = unsafe { Tensor<f32, [32, 128]>::uninit() };
+  let mut sm_host = unsafe { Tensor<f32, [32, 128]>::uninit() };
+  layernorm_host(&x_h, &mut ln_host);
+  rmsnorm_host(&x_h, &mut rms_host);
+  softmax_host(&x_h, &mut sm_host);
+
+  // To the GPU: the input, and three outputs.
+  let x = transfer(x_h, Memory::GPU_HBM);
+  let mut ln = transfer(unsafe { Tensor<f32, [32, 128]>::uninit() }, Memory::GPU_HBM);
+  let mut rms = transfer(unsafe { Tensor<f32, [32, 128]>::uninit() }, Memory::GPU_HBM);
+  let mut sm = transfer(unsafe { Tensor<f32, [32, 128]>::uninit() }, Memory::GPU_HBM);
+
+  // Kernel 1: LayerNorm without its affine part.
+  spawn on(Topology::GPU) {
+    for i in 0..32 {
+      let mut mean : f32 = 0.0;
+      for j in 0..128 { mean += x[i][j]; }
+      mean = mean / 128.0;
+      let mut var : f32 = 0.0;
+      for j in 0..128 { let d = x[i][j] - mean; var += d * d; }
+      var = var / 128.0;
+      let inv = 1.0 / (var + 0.00001).sqrt();
+      for j in 0..128 { ln[i][j] = (x[i][j] - mean) * inv; }
+    }
+  }
+
+  // Kernel 2: RMSNorm.
+  spawn on(Topology::GPU) {
+    for i in 0..32 {
+      let mut ms : f32 = 0.0;
+      for j in 0..128 { ms += x[i][j] * x[i][j]; }
+      let inv = 1.0 / (ms / 128.0 + 0.00001).sqrt();
+      for j in 0..128 { rms[i][j] = x[i][j] * inv; }
+    }
+  }
+
+  // Kernel 3: softmax, with the row's largest value subtracted first so exp cannot overflow.
+  spawn on(Topology::GPU) {
+    for i in 0..32 {
+      let mut m : f32 = x[i][0];
+      for j in 1..128 { if x[i][j] > m { m = x[i][j]; } }
+      let mut z : f32 = 0.0;
+      for j in 0..128 { z += (x[i][j] - m).exp(); }
+      for j in 0..128 { sm[i][j] = (x[i][j] - m).exp() / z; }
+    }
+  }
+
+  // Back to the host, where the results can be compared.
+  let ln_out = transfer(ln, Memory::CPU_DRAM);
+  let rms_out = transfer(rms, Memory::CPU_DRAM);
+  let sm_out = transfer(sm, Memory::CPU_DRAM);
+
+  let mut failed = 0;
+  print!("layernorm: ");
+  failed += report(&ln_out, &ln_host, 0.00001);
+  print!("rmsnorm: ");
+  failed += report(&rms_out, &rms_host, 0.00001);
+  print!("softmax: ");
+  failed += report(&sm_out, &sm_host, 0.0000001);
+
+  // Each softmax row sums to 1.
+  let mut worst_sum : f64 = 0.0;
+  for i in 0..R {
+    let mut s : f64 = 0.0;
+    for j in 0..C { s += f64::from(sm_out[i][j]); }
+    let mut d = s - 1.0;
+    if d < 0.0 { d = 0.0 - d; }
+    if d > worst_sum { worst_sum = d; }
+  }
+  if worst_sum > 0.00001 {
+    print!("FAIL: a softmax row sums to 1 +- ");
+    print!(worst_sum);
+    print!("\n");
+    failed += 1;
+  }
+
+  if failed == 0 {
+    print!("ok\n");
+  }
+  return failed;
+}
