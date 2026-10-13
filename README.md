@@ -92,3 +92,7 @@ checked ([language rules](https://github.com/vx-lang/Vx/blob/main/docs/language_
 The package manager must keep that true: a build step that runs before the compiler, such as one
 that generates source files, is fine; anything that adds declarations while bodies are being
 checked, as Rust's procedural macros can, is not.
+
+## License
+
+Apache License v2.0 with LLVM Exceptions, the same as Vx. See [`LICENSE`](LICENSE).
