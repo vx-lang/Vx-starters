@@ -18,6 +18,12 @@ Format: the project, the toolchain version, what happened, and what we did inste
   `libmlir_c_runner_utils` and `libmlir_runner_utils` (each with an rpath), then `-lz -lm`. That
   list was read from Vx's `src/jit.rs`, since nothing documents it (#1499).
 
+- **gpu-moe, main d25deea9: no sort on the device, and a plain scatter is refused.** Grouping
+  pairs by expert is a counting sort, and its last step writes at a position that only the data
+  knows, which the race proof refuses (E6032). The way through is `atomic_fetch_add_i32` for the
+  slot and `atomic_store_i32` / `atomic_store_f32` for the write. A library of sorts, scans and
+  scatters for `across` kernels would be the next thing a serving stack needs.
+
 - **flash-attn, main 39a12e0a: no way to get a toolchain newer than the release.** The bug fixes
   since v0.0.3 are only on `main`. Using them meant building Vx (a full `cargo build --release
   --workspace`) and packaging it with `scripts/release/package.sh`, borrowing

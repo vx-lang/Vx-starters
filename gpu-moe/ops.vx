@@ -1,0 +1,160 @@
+// gpu-moe: a mixture-of-experts layer on the GPU, with the work grouped by expert.
+//
+// Every token goes to k experts, and each expert applies a SwiGLU feed-forward network:
+// down(silu(gate x) * (up x)). A kernel for one token would read an expert's weights again for
+// each token that picks it. Here the (token, slot) pairs are sorted by expert first, so one
+// block works on one pair of one expert, and the pairs of an expert sit next to each other.
+//
+// The sort is done on the device, in four small kernels, with no sort routine: count the pairs of
+// each expert, a prefix sum of the counts, then each pair takes the next free position of its
+// expert's range with an atomic add. The race proof refuses a plain write at a position that
+// only the data knows, so the data-dependent writes are atomic stores (`pair_at`, `ysorted`);
+// the one plain write, `pos_of[p]`, is at the pair's own index.
+//
+// Weights: wg and wu are [experts][ffn][hidden], wd is [experts][hidden][ffn]. ffn is at most 512.
+// Results do not depend on the order in which pairs take their positions, because each pair's
+// result is written once and `moe_combine` adds a token's k results in slot order.
+
+import core::num;
+import core::sync::atomic;
+
+// Zeroes the per-expert counters. Run before each forward pass.
+pub fn moe_reset(counts : &mut Tensor<i32, [?], Memory::HBM>, cursor : &mut Tensor<i32, [?], Memory::HBM>, experts : i32) -> void {
+  spawn on(Topology::Device) {
+    for b in 0..(experts + 255) / 256 across blocks {
+      for l in 0..256 across lanes {
+        let e = b * 256 + l;
+        if e < experts {
+          counts[e] = 0;
+          cursor[e] = 0;
+        }
+      }
+    }
+  }
+  return;
+}
+
+// counts[e] = the number of (token, slot) pairs that pick expert e.
+pub fn moe_count(counts : &Tensor<i32, [?], Memory::HBM>, ids : &Tensor<i32, [?, ?], Memory::HBM>, tokens : i32, k : i32) -> void {
+  spawn on(Topology::Device) {
+    for b in 0..(tokens * k + 255) / 256 across blocks {
+      for l in 0..256 across lanes {
+        let p = b * 256 + l;
+        if p < tokens * k {
+          let _old = atomic_fetch_add_i32(counts, ids[p / k][p % k], 1, AtomicOrdering::Relaxed);
+        }
+      }
+    }
+  }
+  return;
+}
+
+// offsets[e] = the first position of expert e, offsets[experts] = the number of pairs.
+pub fn moe_offsets(offsets : &mut Tensor<i32, [?], Memory::HBM>, counts : &Tensor<i32, [?], Memory::HBM>, experts : i32) -> void {
+  spawn on(Topology::Device) {
+    for b in 0..1 across blocks {
+      let mut total : i32 = 0;
+      offsets[0] = 0;
+      for e in 0..experts {
+        total = total + counts[e];
+        offsets[e + 1] = total;
+      }
+    }
+  }
+  return;
+}
+
+// Gives each pair p = token * k + slot a position in its expert's range: pos_of[p], and the
+// reverse, pair_at[pos] = p.
+pub fn moe_scatter(pos_of : &mut Tensor<i32, [?], Memory::HBM>, pair_at : &Tensor<i32, [?], Memory::HBM>, cursor : &Tensor<i32, [?], Memory::HBM>, offsets : &Tensor<i32, [?], Memory::HBM>, ids : &Tensor<i32, [?, ?], Memory::HBM>, tokens : i32, k : i32) -> void {
+  spawn on(Topology::Device) {
+    for b in 0..(tokens * k + 255) / 256 across blocks {
+      for l in 0..256 across lanes {
+        let p = b * 256 + l;
+        if p < tokens * k {
+          let e = ids[p / k][p % k];
+          let slot = atomic_fetch_add_i32(cursor, e, 1, AtomicOrdering::Relaxed);
+          pos_of[p] = offsets[e] + slot;
+          atomic_store_i32(pair_at, offsets[e] + slot, p, AtomicOrdering::Relaxed);
+        }
+      }
+    }
+  }
+  return;
+}
+
+// The feed-forward network of every pair, expert by expert. Block (e, j) takes the j-th pair of
+// expert e, if it has one: the lanes fill h = silu(wg x) * (wu x) in shared memory, then each
+// lane computes some outputs of wd h and stores them in row `offsets[e] + j` of `ysorted`
+// (flat, [pairs * hidden]). `cap` is an upper bound for the pairs of one expert: `tokens`.
+pub fn moe_expert_ffn(ysorted : &Tensor<f32, [?], Memory::HBM>, x : &Tensor<f32, [?, ?], Memory::HBM>, wg : &Tensor<f32, [?, ?, ?], Memory::HBM>, wu : &Tensor<f32, [?, ?, ?], Memory::HBM>, wd : &Tensor<f32, [?, ?, ?], Memory::HBM>, pair_at : &Tensor<i32, [?], Memory::HBM>, offsets : &Tensor<i32, [?], Memory::HBM>, counts : &Tensor<i32, [?], Memory::HBM>, experts : i32, cap : i32, k : i32, hidden : i32, ffn : i32) -> void {
+  spawn on(Topology::Device) {
+    for e in 0..experts across blocks {
+      for j in 0..cap across blocks {
+        let mut h = unsafe { Tensor<f32, [512], Memory::SMEM>::uninit() };
+        for l in 0..256 across lanes {
+          for q in 0..2 {
+            let f = l + 256 * q;
+            if f < ffn && j < counts[e] {
+              let t = pair_at[offsets[e] + j] / k;
+              let mut sg : f32 = 0.0;
+              let mut su : f32 = 0.0;
+              for c in 0..hidden {
+                sg = sg + wg[e][f][c] * x[t][c];
+                su = su + wu[e][f][c] * x[t][c];
+              }
+              h[f] = sg / (1.0 + (0.0 - sg).exp()) * su;
+            }
+          }
+        }
+        for l in 0..256 across lanes {
+          for q in 0..(hidden + 255) / 256 {
+            let c = l + 256 * q;
+            if c < hidden && j < counts[e] {
+              let mut acc : f32 = 0.0;
+              for f in 0..ffn {
+                acc = acc + wd[e][c][f] * h[f];
+              }
+              atomic_store_f32(ysorted, (offsets[e] + j) * hidden + c, acc, AtomicOrdering::Relaxed);
+            }
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+// out[t] = the sum over the k slots of gates[t][s] * the result of the pair (t, s).
+pub fn moe_combine(out : &mut Tensor<f32, [?, ?], Memory::HBM>, ysorted : &Tensor<f32, [?], Memory::HBM>, pos_of : &Tensor<i32, [?], Memory::HBM>, gates : &Tensor<f32, [?, ?], Memory::HBM>, tokens : i32, k : i32, hidden : i32) -> void {
+  spawn on(Topology::Device) {
+    for t in 0..tokens across blocks {
+      for l in 0..256 across lanes {
+        for q in 0..(hidden + 255) / 256 {
+          let c = l + 256 * q;
+          if c < hidden {
+            let mut acc : f32 = 0.0;
+            for s in 0..k {
+              acc = acc + gates[t][s] * ysorted[pos_of[t * k + s] * hidden + c];
+            }
+            out[t][c] = acc;
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+// The whole layer. The scratch tensors are the caller's, so a serving loop allocates them once:
+// counts, cursor [experts]; offsets [experts + 1]; pos_of, pair_at [tokens * k];
+// ysorted [tokens * k * hidden].
+pub fn moe_forward(out : &mut Tensor<f32, [?, ?], Memory::HBM>, x : &Tensor<f32, [?, ?], Memory::HBM>, ids : &Tensor<i32, [?, ?], Memory::HBM>, gates : &Tensor<f32, [?, ?], Memory::HBM>, wg : &Tensor<f32, [?, ?, ?], Memory::HBM>, wu : &Tensor<f32, [?, ?, ?], Memory::HBM>, wd : &Tensor<f32, [?, ?, ?], Memory::HBM>, counts : &mut Tensor<i32, [?], Memory::HBM>, cursor : &mut Tensor<i32, [?], Memory::HBM>, offsets : &mut Tensor<i32, [?], Memory::HBM>, pos_of : &mut Tensor<i32, [?], Memory::HBM>, pair_at : &Tensor<i32, [?], Memory::HBM>, ysorted : &Tensor<f32, [?], Memory::HBM>, tokens : i32, experts : i32, k : i32, hidden : i32, ffn : i32) -> void {
+  moe_reset(counts, cursor, experts);
+  moe_count(counts, ids, tokens, k);
+  moe_offsets(offsets, counts, experts);
+  moe_scatter(pos_of, pair_at, cursor, offsets, ids, tokens, k);
+  moe_expert_ffn(ysorted, x, wg, wu, wd, pair_at, offsets, counts, experts, tokens, k, hidden, ffn);
+  moe_combine(out, ysorted, pos_of, gates, tokens, k, hidden);
+  return;
+}
