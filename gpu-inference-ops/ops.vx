@@ -1,0 +1,163 @@
+// gpu-inference-ops: GPU kernels for one decode step of a transformer: rotary embeddings,
+// SwiGLU, matrix-vector products, a top-2 expert router and attention of one query over a
+// key-value cache. They are the GPU forms of what the `rope`, `moe-router` and `paged-kv`
+// starters do on the CPU.
+//
+// Every kernel is an `across` loop: `blocks` become CUDA blocks and `lanes` become threads.
+// Head size is 64 where a type fixes it.
+
+import core::num;
+
+// Rotates each pair (x[2j], x[2j+1]) of every head by the angle in the tables, for position
+// pos0 + t. `cos_t` and `sin_t` have one row for each position and one column for each pair.
+// Each lane writes one output, `out[t][h][d]`: the checker wants every write of a lane loop to
+// use the lane's own index, so a lane does not write both halves of its pair.
+pub fn rope_forward(out : &mut Tensor<f32, [?, ?, 64], Memory::HBM>, x : &Tensor<f32, [?, ?, 64], Memory::HBM>, cos_t : &Tensor<f32, [?, 32], Memory::HBM>, sin_t : &Tensor<f32, [?, 32], Memory::HBM>, pos0 : i32, tokens : i32, heads : i32) -> void {
+  spawn on(Topology::Device) {
+    for t in 0..tokens across blocks {
+      for h in 0..heads across blocks {
+        for d in 0..64 across lanes {
+          let j = d / 2;
+          let a = x[t][h][2 * j];
+          let b = x[t][h][2 * j + 1];
+          if d % 2 == 0 {
+            out[t][h][d] = a * cos_t[pos0 + t][j] - b * sin_t[pos0 + t][j];
+          } else {
+            out[t][h][d] = a * sin_t[pos0 + t][j] + b * cos_t[pos0 + t][j];
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+// out = silu(gate) * up, with silu(g) = g / (1 + e^-g).
+pub fn swiglu(out : &mut Tensor<f32, [?], Memory::HBM>, gate : &Tensor<f32, [?], Memory::HBM>, up : &Tensor<f32, [?], Memory::HBM>, n : i32) -> void {
+  spawn on(Topology::Device) {
+    for b in 0..(n + 255) / 256 across blocks {
+      for l in 0..256 across lanes {
+        let i = b * 256 + l;
+        if i < n {
+          let g = gate[i];
+          out[i] = g / (1.0 + (0.0 - g).exp()) * up[i];
+        }
+      }
+    }
+  }
+  return;
+}
+
+// y = W x, one output for each lane.
+pub fn matvec(y : &mut Tensor<f32, [?], Memory::HBM>, w : &Tensor<f32, [?, ?], Memory::HBM>, x : &Tensor<f32, [?], Memory::HBM>, rows : i32, cols : i32) -> void {
+  spawn on(Topology::Device) {
+    for b in 0..(rows + 255) / 256 across blocks {
+      for l in 0..256 across lanes {
+        let r = b * 256 + l;
+        if r < rows {
+          let mut s : f32 = 0.0;
+          for c in 0..cols {
+            s = s + w[r][c] * x[c];
+          }
+          y[r] = s;
+        }
+      }
+    }
+  }
+  return;
+}
+
+// y = W x for 512 columns, one block for each output: the lanes take two columns each and
+// `lanes::sum` adds their parts. Reads of W by neighboring lanes are neighbors in memory.
+pub fn matvec_by_block(y : &mut Tensor<f32, [?], Memory::HBM>, w : &Tensor<f32, [?, 512], Memory::HBM>, x : &Tensor<f32, [512], Memory::HBM>, rows : i32) -> void {
+  spawn on(Topology::Device) {
+    for r in 0..rows across blocks {
+      let mut part = unsafe { Tensor<f32, [256], Memory::SMEM>::uninit() };
+      for l in 0..256 across lanes {
+        part[l] = w[r][l] * x[l] + w[r][256 + l] * x[256 + l];
+      }
+      let total = lanes::sum(&part, 256);
+      y[r] = total;
+    }
+  }
+  return;
+}
+
+// The two best experts of each token, and their gates: the softmax of the two scores. A token's
+// scan is serial, one token for each lane.
+pub fn router_top2(ids : &mut Tensor<i32, [?, 2], Memory::HBM>, gates : &mut Tensor<f32, [?, 2], Memory::HBM>, scores : &Tensor<f32, [?, ?], Memory::HBM>, tokens : i32, experts : i32) -> void {
+  spawn on(Topology::Device) {
+    for b in 0..(tokens + 127) / 128 across blocks {
+      for l in 0..128 across lanes {
+        let t = b * 128 + l;
+        if t < tokens {
+          let mut best : f32 = scores[t][0];
+          let mut best_id : i32 = 0;
+          let mut next : f32 = -1000000000.0;
+          let mut next_id : i32 = 1;
+          for e in 1..experts {
+            let s = scores[t][e];
+            if s > best {
+              next = best;
+              next_id = best_id;
+              best = s;
+              best_id = e;
+            } else if s > next {
+              next = s;
+              next_id = e;
+            }
+          }
+          let g = 1.0 / (1.0 + (next - best).exp());
+          ids[t][0] = best_id;
+          ids[t][1] = next_id;
+          gates[t][0] = g;
+          gates[t][1] = 1.0 - g;
+        }
+      }
+    }
+  }
+  return;
+}
+
+// Attention of one new token over the first `seq` (at most 128) entries of a key-value cache:
+// out[h] = softmax(q[h] . K[h][t] * scale over t) . V[h]. One block for each head.
+pub fn attention_decode(out : &mut Tensor<f32, [?, 64], Memory::HBM>, q : &Tensor<f32, [?, 64], Memory::HBM>, kc : &Tensor<f32, [?, ?, 64], Memory::HBM>, vc : &Tensor<f32, [?, ?, 64], Memory::HBM>, heads : i32, seq : i32, scale : f32) -> void {
+  spawn on(Topology::Device) {
+    for h in 0..heads across blocks {
+      let mut p = unsafe { Tensor<f32, [128], Memory::SMEM>::uninit() };
+      let mut stat = unsafe { Tensor<f32, [2], Memory::SMEM>::uninit() };
+      for l in 0..128 across lanes {
+        let mut s : f32 = -1000000000.0;
+        if l < seq {
+          let mut dot : f32 = 0.0;
+          for d in 0..64 {
+            dot = dot + q[h][d] * kc[h][l][d];
+          }
+          s = dot * scale;
+        }
+        p[l] = s;
+      }
+      let mut m : f32 = p[0];
+      for k in 1..128 {
+        m = m.max(p[k]);
+      }
+      stat[0] = m;
+      for l in 0..128 across lanes {
+        p[l] = (p[l] - stat[0]).exp();
+      }
+      let mut z : f32 = 0.0;
+      for k in 0..128 {
+        z = z + p[k];
+      }
+      stat[1] = 1.0 / z;
+      for d in 0..64 across lanes {
+        let mut acc : f32 = 0.0;
+        for t in 0..seq {
+          acc = acc + p[t] * vc[h][t][d];
+        }
+        out[h][d] = acc * stat[1];
+      }
+    }
+  }
+  return;
+}
