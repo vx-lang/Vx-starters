@@ -72,6 +72,15 @@ Format: the project, the toolchain version, what happened, and what we did inste
 - **wordcount, v0.0.3: no project root.** Imports resolve from the toolchain's `stdlib/`, then the
   directory `vxc` runs in. There is no manifest, so `build.sh` `cd`s to the project first.
 
+- **gpu-tensor-core, main d25deea9: a library cannot wrap the GPU matmul.** `c = a @b` has to
+  assign to a tensor by name; a function cannot assign through `&mut`, and a host function cannot
+  pass or return a `Memory::HBM` tensor by value
+  ([vx-lang/Vx#2225](https://github.com/vx-lang/Vx/issues/2225)), so the only way to share it is a
+  `macro_rules` (which does import). A destination made with `transfer(..)` fails with an error
+  that names no source line ([vx-lang/Vx#2224](https://github.com/vx-lang/Vx/issues/2224)). And
+  there is no PTX to dig out: the product is a cuBLAS call, so the build checks the launch record
+  (`kind=matmul`) instead, which is a second kind of device output for a build tool to know.
+
 - **cycle-clique, v0.0.3: optimization is off unless asked for.** `vxc` defaults to `-O0`.
   `build.sh` passes `-O3`, which makes the check several times faster. A build tool needs a
   debug and a release setting, and a way to set it per project.
