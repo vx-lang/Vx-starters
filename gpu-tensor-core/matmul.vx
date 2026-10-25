@@ -1,0 +1,10 @@
+// gpu-tensor-core: matrix products on the GPU through Vx's matmul route.
+//
+// `matmul_into!(c, a, b)` expands to a GPU region with `c = a @b`.
+macro_rules matmul_into {
+  ($c : ident, $a : ident, $b : ident) => {
+    spawn on(Topology::Device) {
+      $c = $a @$b;
+    }
+  };
+}
