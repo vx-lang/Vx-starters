@@ -1,0 +1,179 @@
+// Tests for gpu-stencil: every kernel in stencil.vx against the same formula as plain host code.
+// Returns the number of failed checks, and prints "ok" when there are none. It also prints three
+// entries of each result, which check.py computes again in Python.
+//
+//   ./build.sh
+
+import core::convert;
+import core::num;
+import stencil;
+
+// Inputs: whole numbers scaled by 1/8, so every value is exact in f32 and Python sees the same.
+macro_rules x { ($i : expr) => { (((($i) * 37) % 101) as f32) / 8.0 - 6.0 }; }
+
+fn abs64(v : f64) -> f64 {
+  if v < 0.0 {
+    return 0.0 - v;
+  }
+  return v;
+}
+
+fn verdict(name : *const i8, worst : f64, tol : f64, e0 : f32, e1 : f32, e2 : f32) -> i32 {
+  print!(name);
+  print!(": ");
+  print!(f64::from(e0));
+  print!(" ");
+  print!(f64::from(e1));
+  print!(" ");
+  print!(f64::from(e2));
+  print!("\n");
+  if worst > tol {
+    print!("  FAIL: differs from the host code by ");
+    print!(worst);
+    print!("\n");
+    return 1;
+  }
+  return 0;
+}
+
+fn diff2(a : &Tensor<f32, [?, ?]>, b : &Tensor<f32, [?, ?]>, n : i32, m : i32) -> f64 {
+  let mut worst : f64 = 0.0;
+  for i in 0..n {
+    for j in 0..m {
+      let d = abs64(f64::from(a[i][j] - b[i][j]));
+      if d > worst { worst = d; }
+    }
+  }
+  return worst;
+}
+
+// jacobi_2d on a 40 x 40 grid, 3 steps. The border keeps its value.
+fn test_jacobi() -> i32 {
+  let mut a_h = unsafe { Tensor<f32, [40, 40]>::uninit() };
+  let mut b_h = unsafe { Tensor<f32, [40, 40]>::uninit() };
+  let mut cur = unsafe { Tensor<f32, [40, 40]>::uninit() };
+  for i in 0..40 {
+    for j in 0..40 {
+      a_h[i][j] = x!(i * 40 + j) / 4.0;
+      b_h[i][j] = a_h[i][j];
+      cur[i][j] = a_h[i][j];
+    }
+  }
+  let mut next = Tensor<f32, [40, 40]>::new();
+  for t in 0..3 {
+    for i in 0..40 {
+      for j in 0..40 { next[i][j] = cur[i][j]; }
+    }
+    for i in 1..39 {
+      for j in 1..39 {
+        next[i][j] = 0.2 * (cur[i][j] + cur[i][j - 1] + cur[i][j + 1] + cur[i + 1][j] + cur[i - 1][j]);
+      }
+    }
+    for i in 0..40 {
+      for j in 0..40 { cur[i][j] = next[i][j]; }
+    }
+  }
+  // The kernel only writes the inside of `a`; `b` starts as a copy so the border matches.
+  let mut a = transfer(a_h, Memory::HBM);
+  let mut b = transfer(b_h, Memory::HBM);
+  jacobi_2d(&mut a, &mut b, 40, 3);
+  let a_o = transfer(a, Memory::CPU_DRAM);
+  return verdict("jacobi_2d", diff2(&a_o, &cur, 40, 40), 0.0001, a_o[1][1], a_o[20][17], a_o[38][38]);
+}
+
+// hotspot_step, two steps on a 20 x 30 chip, one launch each: the output of the first is the
+// input of the second.
+fn test_hotspot_step() -> i32 {
+  let mut t_h = unsafe { Tensor<f32, [20, 30]>::uninit() };
+  let mut p_h = unsafe { Tensor<f32, [20, 30]>::uninit() };
+  let mut cur = unsafe { Tensor<f32, [20, 30]>::uninit() };
+  for i in 0..20 {
+    for j in 0..30 {
+      t_h[i][j] = x!(i * 30 + j) / 4.0 + 60.0;
+      cur[i][j] = t_h[i][j];
+      p_h[i][j] = x!(i * 30 + j + 5) / 64.0;
+    }
+  }
+  let mut next = Tensor<f32, [20, 30]>::new();
+  for s in 0..2 {
+    for i in 0..20 {
+      for j in 0..30 {
+        let c = cur[i][j];
+        let mut north = c;
+        if i > 0 { north = cur[i - 1][j]; }
+        let mut south = c;
+        if i < 19 { south = cur[i + 1][j]; }
+        let mut west = c;
+        if j > 0 { west = cur[i][j - 1]; }
+        let mut east = c;
+        if j < 29 { east = cur[i][j + 1]; }
+        next[i][j] = c + 0.5 / 2.0 * (p_h[i][j] + (north + south - 2.0 * c) / 8.0 + (east + west - 2.0 * c) / 4.0 + (80.0 - c) / 16.0);
+      }
+    }
+    for i in 0..20 {
+      for j in 0..30 { cur[i][j] = next[i][j]; }
+    }
+  }
+  let src = transfer(t_h, Memory::HBM);
+  let power = transfer(p_h, Memory::HBM);
+  let mut mid = transfer(unsafe { Tensor<f32, [20, 30]>::uninit() }, Memory::HBM);
+  let mut end = transfer(unsafe { Tensor<f32, [20, 30]>::uninit() }, Memory::HBM);
+  hotspot_step(&mut mid, &src, &power, 20, 30, 2.0, 4.0, 8.0, 16.0, 80.0, 0.5);
+  hotspot_step(&mut end, &mid, &power, 20, 30, 2.0, 4.0, 8.0, 16.0, 80.0, 0.5);
+  let end_o = transfer(end, Memory::CPU_DRAM);
+  return verdict("hotspot_step", diff2(&end_o, &cur, 20, 30), 0.001, end_o[0][0], end_o[10][15], end_o[19][29]);
+}
+
+// hotspot_pyramid_inner_write: 2 x 2 tiles of 16 x 16 that overlap by 4, two steps inside each
+// tile, and only the inner 12 x 12 is written back. The border of the result stays zero.
+fn test_hotspot_pyramid() -> i32 {
+  let mut t_h = unsafe { Tensor<f32, [28, 28]>::uninit() };
+  let mut p_h = unsafe { Tensor<f32, [28, 28]>::uninit() };
+  let mut want = Tensor<f32, [28, 28]>::new();
+  for i in 0..28 {
+    for j in 0..28 {
+      t_h[i][j] = x!(i * 28 + j) / 4.0 + 60.0;
+      p_h[i][j] = x!(i * 28 + j + 5) / 16.0;
+    }
+  }
+  for bi in 0..2 {
+    for bj in 0..2 {
+      let mut now = Tensor<f32, [16, 16]>::new();
+      let mut next = Tensor<f32, [16, 16]>::new();
+      for ty in 0..16 {
+        for tx in 0..16 { now[ty][tx] = t_h[bi * 12 + ty][bj * 12 + tx]; }
+      }
+      for s in 0..2 {
+        for ty in 1..15 {
+          for tx in 1..15 {
+            let c = now[ty][tx];
+            next[ty][tx] = c + 0.25 * (p_h[bi * 12 + ty][bj * 12 + tx] + now[ty - 1][tx] + now[ty + 1][tx] + now[ty][tx - 1] + now[ty][tx + 1] - 4.0 * c);
+          }
+        }
+        for ty in 1..15 {
+          for tx in 1..15 { now[ty][tx] = next[ty][tx]; }
+        }
+      }
+      for wy in 0..12 {
+        for wx in 0..12 { want[bi * 12 + wy + 2][bj * 12 + wx + 2] = now[wy + 2][wx + 2]; }
+      }
+    }
+  }
+  let src = transfer(t_h, Memory::HBM);
+  let power = transfer(p_h, Memory::HBM);
+  let mut dst = transfer(Tensor<f32, [28, 28]>::new(), Memory::HBM);
+  hotspot_pyramid_inner_write(&mut dst, &src, &power, 2, 0.25);
+  let dst_o = transfer(dst, Memory::CPU_DRAM);
+  return verdict("hotspot_pyramid", diff2(&dst_o, &want, 28, 28), 0.001, dst_o[2][2], dst_o[13][14], dst_o[25][25]);
+}
+
+fn main() -> i32 {
+  let mut failed = 0;
+  failed += test_jacobi();
+  failed += test_hotspot_step();
+  failed += test_hotspot_pyramid();
+  if failed == 0 {
+    print!("ok\n");
+  }
+  return failed;
+}

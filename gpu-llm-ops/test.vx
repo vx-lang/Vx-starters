@@ -1,0 +1,374 @@
+// Tests for gpu-llm-ops: every kernel in ops.vx against the same formula as plain host code.
+// Returns the number of failed checks, and prints "ok" when there are none. It also prints three
+// entries of each result, which check.py computes again in Python.
+//
+//   ./build.sh
+
+import core::convert;
+import core::num;
+import ops;
+
+// Inputs: whole numbers scaled by 1/8, so every value is exact in f32 and Python sees the same.
+macro_rules x { ($i : expr) => { (((($i) * 37) % 101) as f32) / 8.0 - 6.0 }; }
+
+fn abs64(v : f64) -> f64 {
+  if v < 0.0 {
+    return 0.0 - v;
+  }
+  return v;
+}
+
+// Compares a kernel result with the host's, entry by entry, over `n` entries read through `at`
+// in the macros below. Prints the name and three entries, and returns 1 on a mismatch.
+fn verdict(name : *const i8, worst : f64, tol : f64, e0 : f32, e1 : f32, e2 : f32) -> i32 {
+  print!(name);
+  print!(": ");
+  print!(f64::from(e0));
+  print!(" ");
+  print!(f64::from(e1));
+  print!(" ");
+  print!(f64::from(e2));
+  print!("\n");
+  if worst > tol {
+    print!("  FAIL: differs from the host code by ");
+    print!(worst);
+    print!("\n");
+    return 1;
+  }
+  return 0;
+}
+
+fn diff1(a : &Tensor<f32, [?]>, b : &Tensor<f32, [?]>, n : i32) -> f64 {
+  let mut worst : f64 = 0.0;
+  for i in 0..n {
+    let d = abs64(f64::from(a[i] - b[i]));
+    if d > worst { worst = d; }
+  }
+  return worst;
+}
+
+fn diff2(a : &Tensor<f32, [?, ?]>, b : &Tensor<f32, [?, ?]>, n : i32, m : i32) -> f64 {
+  let mut worst : f64 = 0.0;
+  for i in 0..n {
+    for j in 0..m {
+      let d = abs64(f64::from(a[i][j] - b[i][j]));
+      if d > worst { worst = d; }
+    }
+  }
+  return worst;
+}
+
+const N : i32 = 1000;
+
+// residual_forward, gelu_forward, gelu_backward and adamw: one thread for each element.
+fn test_elementwise() -> i32 {
+  let mut failed = 0;
+  let mut a_h = unsafe { Tensor<f32, [1000]>::uninit() };
+  let mut b_h = unsafe { Tensor<f32, [1000]>::uninit() };
+  let mut res_h = unsafe { Tensor<f32, [1000]>::uninit() };
+  let mut gelu_h = unsafe { Tensor<f32, [1000]>::uninit() };
+  let mut dgelu_h = unsafe { Tensor<f32, [1000]>::uninit() };
+  for i in 0..N {
+    a_h[i] = x!(i);
+    b_h[i] = x!(i + 1) / 4.0;
+    res_h[i] = a_h[i] + b_h[i];
+    let v = a_h[i];
+    let th = (0.7978846 * (v + 0.044715 * v * v * v)).tanh();
+    gelu_h[i] = 0.5 * v * (1.0 + th);
+    dgelu_h[i] = b_h[i] + (0.5 * (1.0 + th) + v * 0.5 * (1.0 - th * th) * 0.7978846 * (1.0 + 3.0 * 0.044715 * v * v)) * a_h[i];
+  }
+
+  let a = transfer(a_h, Memory::HBM);
+  let b = transfer(b_h, Memory::HBM);
+  let mut res = transfer(unsafe { Tensor<f32, [1000]>::uninit() }, Memory::HBM);
+  let mut gelu = transfer(unsafe { Tensor<f32, [1000]>::uninit() }, Memory::HBM);
+  // gelu_backward adds to dinp, which starts as b.
+  let mut dgelu = transfer(b_h, Memory::HBM);
+  residual_forward(&mut res, &a, &b, N);
+  gelu_forward(&mut gelu, &a, N);
+  gelu_backward(&mut dgelu, &a, &a, N);
+  let res_o = transfer(res, Memory::CPU_DRAM);
+  let gelu_o = transfer(gelu, Memory::CPU_DRAM);
+  let dgelu_o = transfer(dgelu, Memory::CPU_DRAM);
+  failed += verdict("residual", diff1(&res_o, &res_h, N), 0.000001, res_o[0], res_o[500], res_o[999]);
+  failed += verdict("gelu_forward", diff1(&gelu_o, &gelu_h, N), 0.00001, gelu_o[0], gelu_o[500], gelu_o[999]);
+  failed += verdict("gelu_backward", diff1(&dgelu_o, &dgelu_h, N), 0.0001, dgelu_o[0], dgelu_o[500], dgelu_o[999]);
+
+  // adamw, the third step: bias corrections 1 - 0.9^3 and 1 - 0.999^3.
+  let mut p_h = unsafe { Tensor<f32, [1000]>::uninit() };
+  let mut g_h = unsafe { Tensor<f32, [1000]>::uninit() };
+  let mut m_h = unsafe { Tensor<f32, [1000]>::uninit() };
+  let mut v_h = unsafe { Tensor<f32, [1000]>::uninit() };
+  let mut p_want = unsafe { Tensor<f32, [1000]>::uninit() };
+  for i in 0..N {
+    p_h[i] = x!(i);
+    g_h[i] = x!(i + 1) / 16.0;
+    m_h[i] = x!(i + 2) / 32.0;
+    v_h[i] = ((i % 7) as f32) / 16.0;
+    let mi = 0.9 * m_h[i] + 0.1 * g_h[i];
+    let vi = 0.999 * v_h[i] + 0.001 * g_h[i] * g_h[i];
+    p_want[i] = p_h[i] - 0.01 * ((mi / 0.271) / ((vi / 0.002997001).sqrt() + 0.00000001) + 0.1 * p_h[i]);
+  }
+  let mut p = transfer(p_h, Memory::HBM);
+  let g = transfer(g_h, Memory::HBM);
+  let mut m = transfer(m_h, Memory::HBM);
+  let mut v = transfer(v_h, Memory::HBM);
+  adamw(&mut p, &g, &mut m, &mut v, N, 0.01, 0.9, 0.999, 0.271, 0.002997001, 0.00000001, 0.1);
+  let p_o = transfer(p, Memory::CPU_DRAM);
+  failed += verdict("adamw", diff1(&p_o, &p_want, N), 0.0001, p_o[0], p_o[500], p_o[999]);
+  return failed;
+}
+
+// matmul_forward and the two bias gradients.
+fn test_matmul() -> i32 {
+  let mut failed = 0;
+  let mut inp_h = unsafe { Tensor<f32, [6, 40]>::uninit() };
+  let mut w_h = unsafe { Tensor<f32, [20, 40]>::uninit() };
+  let mut bias_h = unsafe { Tensor<f32, [20]>::uninit() };
+  let mut out_h = unsafe { Tensor<f32, [6, 20]>::uninit() };
+  let mut db_h = unsafe { Tensor<f32, [20]>::uninit() };
+  for r in 0..6 {
+    for c in 0..40 { inp_h[r][c] = x!(r * 40 + c) / 4.0; }
+  }
+  for o in 0..20 {
+    for c in 0..40 { w_h[o][c] = x!(o * 40 + c + 5) / 4.0; }
+    bias_h[o] = x!(o + 3);
+  }
+  for r in 0..6 {
+    for o in 0..20 {
+      let mut s : f32 = bias_h[o];
+      for c in 0..40 { s += inp_h[r][c] * w_h[o][c]; }
+      out_h[r][o] = s;
+    }
+  }
+  for o in 0..20 {
+    let mut s : f32 = 0.0;
+    for r in 0..6 { s += out_h[r][o]; }
+    db_h[o] = s;
+  }
+  let inp = transfer(inp_h, Memory::HBM);
+  let w = transfer(w_h, Memory::HBM);
+  let bias = transfer(bias_h, Memory::HBM);
+  let mut out = transfer(unsafe { Tensor<f32, [6, 20]>::uninit() }, Memory::HBM);
+  matmul_forward(&mut out, &inp, &w, &bias, 6, 40, 20);
+  // The gradient of the output is the output itself, so the host column sums are `db_h`.
+  let mut db_col = transfer(Tensor<f32, [20]>::new(), Memory::HBM);
+  let db_atomic = transfer(Tensor<f32, [20]>::new(), Memory::HBM);
+  matmul_backward_bias_by_column(&mut db_col, &out, 6, 20);
+  matmul_backward_bias_atomic(&db_atomic, &out, 6, 20);
+  let out_o = transfer(out, Memory::CPU_DRAM);
+  let col_o = transfer(db_col, Memory::CPU_DRAM);
+  let atomic_o = transfer(db_atomic, Memory::CPU_DRAM);
+  failed += verdict("matmul_forward", diff2(&out_o, &out_h, 6, 20), 0.001, out_o[0][0], out_o[3][7], out_o[5][19]);
+  failed += verdict("bias_by_column", diff1(&col_o, &db_h, 20), 0.001, col_o[0], col_o[7], col_o[19]);
+  failed += verdict("bias_atomic", diff1(&atomic_o, &db_h, 20), 0.001, atomic_o[0], atomic_o[7], atomic_o[19]);
+  return failed;
+}
+
+const B : i32 = 2;
+const T : i32 = 5;
+const V : i32 = 50;
+
+// encoder_forward, and encoder_backward_atomic: tokens that share an id add to one row.
+fn test_encoder() -> i32 {
+  let mut failed = 0;
+  let mut ix_h = unsafe { Tensor<i32, [2, 5]>::uninit() };
+  let mut wte_h = unsafe { Tensor<f32, [50, 768]>::uninit() };
+  let mut wpe_h = unsafe { Tensor<f32, [8, 768]>::uninit() };
+  let mut dout_h = unsafe { Tensor<f32, [2, 5, 768]>::uninit() };
+  let mut out_h = unsafe { Tensor<f32, [2, 5, 768]>::uninit() };
+  let mut dwte_h = Tensor<f32, [38400]>::new();
+  for b in 0..B {
+    for t in 0..T {
+      ix_h[b][t] = (b * 7 + t * 3) % 5 + 10;
+    }
+  }
+  for v in 0..V {
+    for c in 0..768 { wte_h[v][c] = x!(v * 768 + c) / 4.0; }
+  }
+  for t in 0..8 {
+    for c in 0..768 { wpe_h[t][c] = x!(t * 768 + c + 9) / 4.0; }
+  }
+  for b in 0..B {
+    for t in 0..T {
+      for c in 0..768 {
+        out_h[b][t][c] = wte_h[ix_h[b][t]][c] + wpe_h[t][c];
+        dout_h[b][t][c] = x!((b * 5 + t) * 768 + c) / 4.0;
+        dwte_h[ix_h[b][t] * 768 + c] += dout_h[b][t][c];
+      }
+    }
+  }
+  let ix = transfer(ix_h, Memory::HBM);
+  let wte = transfer(wte_h, Memory::HBM);
+  let wpe = transfer(wpe_h, Memory::HBM);
+  let dout = transfer(dout_h, Memory::HBM);
+  let mut out = transfer(unsafe { Tensor<f32, [2, 5, 768]>::uninit() }, Memory::HBM);
+  let dwte = transfer(Tensor<f32, [38400]>::new(), Memory::HBM);
+  encoder_forward(&mut out, &ix, &wte, &wpe, B, T);
+  encoder_backward_atomic(&dwte, &dout, &ix, B, T);
+  let out_o = transfer(out, Memory::CPU_DRAM);
+  let dwte_o = transfer(dwte, Memory::CPU_DRAM);
+  let mut worst : f64 = 0.0;
+  for b in 0..B {
+    for t in 0..T {
+      for c in 0..768 {
+        let d = abs64(f64::from(out_o[b][t][c] - out_h[b][t][c]));
+        if d > worst { worst = d; }
+      }
+    }
+  }
+  failed += verdict("encoder_forward", worst, 0.000001, out_o[0][0][0], out_o[1][3][100], out_o[1][4][767]);
+  // Row 10 is hit by (b, t) = (0, 0) and (1, 2): the same id twice.
+  failed += verdict("encoder_backward", diff1(&dwte_o, &dwte_h, 38400), 0.001, dwte_o[10 * 768], dwte_o[11 * 768 + 5], dwte_o[14 * 768 + 767]);
+  return failed;
+}
+
+// attention_permute and attention_unpermute: q, k and v come out as [b][h][n][d], and unpermute
+// puts q back.
+fn test_attention_layout() -> i32 {
+  let mut failed = 0;
+  let mut qkv_h = unsafe { Tensor<f32, [2, 4, 3, 12, 64]>::uninit() };
+  for b in 0..2 {
+    for n in 0..4 {
+      for s in 0..3 {
+        for h in 0..12 {
+          for d in 0..64 { qkv_h[b][n][s][h][d] = x!((((b * 4 + n) * 3 + s) * 12 + h) * 64 + d); }
+        }
+      }
+    }
+  }
+  let qkv = transfer(qkv_h, Memory::HBM);
+  let mut q = transfer(unsafe { Tensor<f32, [2, 12, 4, 64]>::uninit() }, Memory::HBM);
+  let mut k = transfer(unsafe { Tensor<f32, [2, 12, 4, 64]>::uninit() }, Memory::HBM);
+  let mut v = transfer(unsafe { Tensor<f32, [2, 12, 4, 64]>::uninit() }, Memory::HBM);
+  attention_permute(&mut q, &mut k, &mut v, &qkv, 2, 4);
+  let mut back = transfer(unsafe { Tensor<f32, [2, 4, 12, 64]>::uninit() }, Memory::HBM);
+  attention_unpermute(&mut back, &q, 2, 4);
+  let q_o = transfer(q, Memory::CPU_DRAM);
+  let k_o = transfer(k, Memory::CPU_DRAM);
+  let v_o = transfer(v, Memory::CPU_DRAM);
+  let back_o = transfer(back, Memory::CPU_DRAM);
+  let mut worst : f64 = 0.0;
+  for b in 0..2 {
+    for h in 0..12 {
+      for n in 0..4 {
+        for d in 0..64 {
+          let w0 = abs64(f64::from(q_o[b][h][n][d] - qkv_h[b][n][0][h][d]));
+          let w1 = abs64(f64::from(k_o[b][h][n][d] - qkv_h[b][n][1][h][d]));
+          let w2 = abs64(f64::from(v_o[b][h][n][d] - qkv_h[b][n][2][h][d]));
+          let w3 = abs64(f64::from(back_o[b][n][h][d] - qkv_h[b][n][0][h][d]));
+          if w0 > worst { worst = w0; }
+          if w1 > worst { worst = w1; }
+          if w2 > worst { worst = w2; }
+          if w3 > worst { worst = w3; }
+        }
+      }
+    }
+  }
+  failed += verdict("attention_permute", worst, 0.0, q_o[1][5][2][7], k_o[0][11][3][63], v_o[1][2][1][0]);
+  return failed;
+}
+
+// attention_softmax_causal: row t of each head covers columns 0..=t and is zero after.
+fn test_causal_softmax() -> i32 {
+  let mut preatt_h = unsafe { Tensor<f32, [2, 8, 8]>::uninit() };
+  let mut want = unsafe { Tensor<f32, [2, 8, 8]>::uninit() };
+  for h in 0..2 {
+    for t in 0..8 {
+      for c in 0..8 { preatt_h[h][t][c] = x!((h * 8 + t) * 8 + c); }
+    }
+  }
+  for h in 0..2 {
+    for t in 0..8 {
+      let mut m : f32 = preatt_h[h][t][0] * 0.125;
+      for c in 1..t + 1 { m = m.max(preatt_h[h][t][c] * 0.125); }
+      let mut z : f32 = 0.0;
+      for c in 0..t + 1 { z += (preatt_h[h][t][c] * 0.125 - m).exp(); }
+      for c in 0..8 {
+        want[h][t][c] = 0.0;
+        if c <= t { want[h][t][c] = (preatt_h[h][t][c] * 0.125 - m).exp() / z; }
+      }
+    }
+  }
+  let preatt = transfer(preatt_h, Memory::HBM);
+  let mut att = transfer(unsafe { Tensor<f32, [2, 8, 8]>::uninit() }, Memory::HBM);
+  attention_softmax_causal(&mut att, &preatt, 2, 8, 0.125);
+  let att_o = transfer(att, Memory::CPU_DRAM);
+  let mut worst : f64 = 0.0;
+  for h in 0..2 {
+    for t in 0..8 {
+      for c in 0..8 {
+        let d = abs64(f64::from(att_o[h][t][c] - want[h][t][c]));
+        if d > worst { worst = d; }
+      }
+    }
+  }
+  return verdict("causal_softmax", worst, 0.0000001, att_o[0][3][1], att_o[1][7][7], att_o[1][6][7]);
+}
+
+// crossentropy_forward, and the fused softmax and cross-entropy backward.
+fn test_crossentropy() -> i32 {
+  let mut failed = 0;
+  let mut probs_h = unsafe { Tensor<f32, [2, 5, 50]>::uninit() };
+  let mut tgt_h = unsafe { Tensor<i32, [2, 5]>::uninit() };
+  let mut dloss_h = unsafe { Tensor<f32, [2, 5]>::uninit() };
+  let mut loss_h = unsafe { Tensor<f32, [2, 5]>::uninit() };
+  let mut dlog_h = unsafe { Tensor<f32, [2, 5, 50]>::uninit() };
+  for b in 0..B {
+    for t in 0..T {
+      tgt_h[b][t] = (b * 11 + t * 7) % 50;
+      dloss_h[b][t] = x!(b * 5 + t) / 8.0;
+      let mut z : f32 = 0.0;
+      for v in 0..V { z += (x!((b * 5 + t) * 50 + v) / 4.0).exp(); }
+      for v in 0..V { probs_h[b][t][v] = (x!((b * 5 + t) * 50 + v) / 4.0).exp() / z; }
+      loss_h[b][t] = 0.0 - probs_h[b][t][tgt_h[b][t]].ln();
+      for v in 0..V {
+        let mut ind : f32 = 0.0;
+        if v == tgt_h[b][t] { ind = 1.0; }
+        dlog_h[b][t][v] = x!(v) / 8.0 + (probs_h[b][t][v] - ind) * dloss_h[b][t];
+      }
+    }
+  }
+  let probs = transfer(probs_h, Memory::HBM);
+  let tgt = transfer(tgt_h, Memory::HBM);
+  let dloss = transfer(dloss_h, Memory::HBM);
+  let mut loss = transfer(unsafe { Tensor<f32, [2, 5]>::uninit() }, Memory::HBM);
+  // dlogits starts as x(v) / 8, to show the kernel adds.
+  let mut dlog_start = unsafe { Tensor<f32, [2, 5, 50]>::uninit() };
+  for b in 0..B {
+    for t in 0..T {
+      for v in 0..V { dlog_start[b][t][v] = x!(v) / 8.0; }
+    }
+  }
+  let mut dlog = transfer(dlog_start, Memory::HBM);
+  crossentropy_forward(&mut loss, &probs, &tgt, B, T);
+  crossentropy_softmax_backward(&mut dlog, &dloss, &probs, &tgt, B, T, V);
+  let loss_o = transfer(loss, Memory::CPU_DRAM);
+  let dlog_o = transfer(dlog, Memory::CPU_DRAM);
+  let mut worst : f64 = 0.0;
+  for b in 0..B {
+    for t in 0..T {
+      for v in 0..V {
+        let d = abs64(f64::from(dlog_o[b][t][v] - dlog_h[b][t][v]));
+        if d > worst { worst = d; }
+      }
+    }
+  }
+  failed += verdict("crossentropy_forward", diff2(&loss_o, &loss_h, B, T), 0.00001, loss_o[0][0], loss_o[1][2], loss_o[1][4]);
+  failed += verdict("crossentropy_backward", worst, 0.00001, dlog_o[0][0][0], dlog_o[1][2][13], dlog_o[1][4][49]);
+  return failed;
+}
+
+fn main() -> i32 {
+  let mut failed = 0;
+  failed += test_elementwise();
+  failed += test_matmul();
+  failed += test_encoder();
+  failed += test_attention_layout();
+  failed += test_causal_softmax();
+  failed += test_crossentropy();
+  if failed == 0 {
+    print!("ok\n");
+  }
+  return failed;
+}

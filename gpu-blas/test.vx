@@ -1,0 +1,234 @@
+// Tests for gpu-blas: every kernel in blas.vx against the same formula as plain host code.
+// Returns the number of failed checks, and prints "ok" when there are none. It also prints three
+// entries of each result, which check.py computes again in Python.
+//
+//   ./build.sh
+
+import core::convert;
+import core::num;
+import blas;
+
+// Inputs: whole numbers scaled by 1/8, so every value is exact in f32 and Python sees the same.
+macro_rules x { ($i : expr) => { (((($i) * 37) % 101) as f32) / 8.0 - 6.0 }; }
+
+fn abs64(v : f64) -> f64 {
+  if v < 0.0 {
+    return 0.0 - v;
+  }
+  return v;
+}
+
+fn verdict(name : *const i8, worst : f64, tol : f64, e0 : f32, e1 : f32, e2 : f32) -> i32 {
+  print!(name);
+  print!(": ");
+  print!(f64::from(e0));
+  print!(" ");
+  print!(f64::from(e1));
+  print!(" ");
+  print!(f64::from(e2));
+  print!("\n");
+  if worst > tol {
+    print!("  FAIL: differs from the host code by ");
+    print!(worst);
+    print!("\n");
+    return 1;
+  }
+  return 0;
+}
+
+fn diff1(a : &Tensor<f32, [?]>, b : &Tensor<f32, [?]>, n : i32) -> f64 {
+  let mut worst : f64 = 0.0;
+  for i in 0..n {
+    let d = abs64(f64::from(a[i] - b[i]));
+    if d > worst { worst = d; }
+  }
+  return worst;
+}
+
+fn diff2(a : &Tensor<f32, [?, ?]>, b : &Tensor<f32, [?, ?]>, n : i32, m : i32) -> f64 {
+  let mut worst : f64 = 0.0;
+  for i in 0..n {
+    for j in 0..m {
+      let d = abs64(f64::from(a[i][j] - b[i][j]));
+      if d > worst { worst = d; }
+    }
+  }
+  return worst;
+}
+
+// gemm_shared_tiles: C = A B with 16x16 tiles, for 3x3 tiles (48 x 48).
+fn test_gemm() -> i32 {
+  let mut a_h = unsafe { Tensor<f32, [48, 48]>::uninit() };
+  let mut b_h = unsafe { Tensor<f32, [48, 48]>::uninit() };
+  let mut c_h = unsafe { Tensor<f32, [48, 48]>::uninit() };
+  for i in 0..48 {
+    for j in 0..48 {
+      a_h[i][j] = x!(i * 48 + j) / 4.0;
+      b_h[i][j] = x!(i * 48 + j + 17) / 4.0;
+    }
+  }
+  for i in 0..48 {
+    for j in 0..48 {
+      let mut s : f32 = 0.0;
+      for k in 0..48 { s += a_h[i][k] * b_h[k][j]; }
+      c_h[i][j] = s;
+    }
+  }
+  let a = transfer(a_h, Memory::HBM);
+  let b = transfer(b_h, Memory::HBM);
+  let mut c = transfer(unsafe { Tensor<f32, [48, 48]>::uninit() }, Memory::HBM);
+  gemm_shared_tiles(&mut c, &a, &b, 3);
+  let c_o = transfer(c, Memory::CPU_DRAM);
+  return verdict("gemm", diff2(&c_o, &c_h, 48, 48), 0.001, c_o[0][0], c_o[17][40], c_o[47][47]);
+}
+
+// 2mm on sizes that are not a multiple of the 8x32 tile: tmp = alpha A B, then D = beta D + tmp C.
+fn test_two_mm() -> i32 {
+  let mut failed = 0;
+  let mut a_h = unsafe { Tensor<f32, [10, 12]>::uninit() };
+  let mut b_h = unsafe { Tensor<f32, [12, 35]>::uninit() };
+  let mut c_h = unsafe { Tensor<f32, [35, 9]>::uninit() };
+  let mut d_h = unsafe { Tensor<f32, [10, 9]>::uninit() };
+  let mut tmp_h = unsafe { Tensor<f32, [10, 35]>::uninit() };
+  let mut d_want = unsafe { Tensor<f32, [10, 9]>::uninit() };
+  for i in 0..10 {
+    for k in 0..12 { a_h[i][k] = x!(i * 12 + k) / 4.0; }
+    for j in 0..9 { d_h[i][j] = x!(i * 9 + j + 3); }
+  }
+  for k in 0..12 {
+    for j in 0..35 { b_h[k][j] = x!(k * 35 + j + 1) / 4.0; }
+  }
+  for k in 0..35 {
+    for j in 0..9 { c_h[k][j] = x!(k * 9 + j + 2) / 4.0; }
+  }
+  for i in 0..10 {
+    for j in 0..35 {
+      let mut s : f32 = 0.0;
+      for k in 0..12 { s += 1.5 * a_h[i][k] * b_h[k][j]; }
+      tmp_h[i][j] = s;
+    }
+    for j in 0..9 {
+      let mut s : f32 = d_h[i][j] * 0.5;
+      for k in 0..35 { s += tmp_h[i][k] * c_h[k][j]; }
+      d_want[i][j] = s;
+    }
+  }
+  let a = transfer(a_h, Memory::HBM);
+  let b = transfer(b_h, Memory::HBM);
+  let c = transfer(c_h, Memory::HBM);
+  let mut d = transfer(d_h, Memory::HBM);
+  let mut tmp = transfer(unsafe { Tensor<f32, [10, 35]>::uninit() }, Memory::HBM);
+  two_mm_first(&mut tmp, &a, &b, 10, 35, 12, 1.5);
+  two_mm_second(&mut d, &tmp, &c, 10, 9, 35, 0.5);
+  let tmp_o = transfer(tmp, Memory::CPU_DRAM);
+  let d_o = transfer(d, Memory::CPU_DRAM);
+  failed += verdict("two_mm_first", diff2(&tmp_o, &tmp_h, 10, 35), 0.001, tmp_o[0][0], tmp_o[4][20], tmp_o[9][34]);
+  failed += verdict("two_mm_second", diff2(&d_o, &d_want, 10, 9), 0.01, d_o[0][0], d_o[5][4], d_o[9][8]);
+  return failed;
+}
+
+// atax on a 300 x 270 matrix: tmp = A x, then y = A^T tmp. 300 rows need two blocks of 256.
+fn test_atax() -> i32 {
+  let mut failed = 0;
+  let mut a_h = unsafe { Tensor<f32, [300, 270]>::uninit() };
+  let mut x_h = unsafe { Tensor<f32, [270]>::uninit() };
+  let mut tmp_h = unsafe { Tensor<f32, [300]>::uninit() };
+  let mut y_h = unsafe { Tensor<f32, [270]>::uninit() };
+  for i in 0..300 {
+    for j in 0..270 { a_h[i][j] = x!(i * 270 + j) / 8.0; }
+  }
+  for j in 0..270 { x_h[j] = x!(j + 4) / 4.0; }
+  for i in 0..300 {
+    let mut s : f32 = 0.0;
+    for j in 0..270 { s += a_h[i][j] * x_h[j]; }
+    tmp_h[i] = s;
+  }
+  for j in 0..270 {
+    let mut s : f32 = 0.0;
+    for i in 0..300 { s += a_h[i][j] * tmp_h[i]; }
+    y_h[j] = s;
+  }
+  let a = transfer(a_h, Memory::HBM);
+  let xv = transfer(x_h, Memory::HBM);
+  let mut tmp = transfer(unsafe { Tensor<f32, [300]>::uninit() }, Memory::HBM);
+  let mut y = transfer(unsafe { Tensor<f32, [270]>::uninit() }, Memory::HBM);
+  atax_first(&mut tmp, &a, &xv, 300, 270);
+  atax_second(&mut y, &a, &tmp, 300, 270);
+  let tmp_o = transfer(tmp, Memory::CPU_DRAM);
+  let y_o = transfer(y, Memory::CPU_DRAM);
+  failed += verdict("atax_first", diff1(&tmp_o, &tmp_h, 300), 0.01, tmp_o[0], tmp_o[150], tmp_o[299]);
+  failed += verdict("atax_second", diff1(&y_o, &y_h, 270), 1.0, y_o[0], y_o[100], y_o[269]);
+  return failed;
+}
+
+// gemver on n = 40: A += u1 v1^T + u2 v2^T, x = x + beta A^T y + z, w = w + alpha A x.
+fn test_gemver() -> i32 {
+  let mut failed = 0;
+  let mut a_h = unsafe { Tensor<f32, [40, 40]>::uninit() };
+  let mut u1_h = unsafe { Tensor<f32, [40]>::uninit() };
+  let mut v1_h = unsafe { Tensor<f32, [40]>::uninit() };
+  let mut u2_h = unsafe { Tensor<f32, [40]>::uninit() };
+  let mut v2_h = unsafe { Tensor<f32, [40]>::uninit() };
+  let mut y_h = unsafe { Tensor<f32, [40]>::uninit() };
+  let mut z_h = unsafe { Tensor<f32, [40]>::uninit() };
+  let mut x_h = unsafe { Tensor<f32, [40]>::uninit() };
+  let mut w_h = unsafe { Tensor<f32, [40]>::uninit() };
+  let mut a_want = unsafe { Tensor<f32, [40, 40]>::uninit() };
+  let mut x_want = unsafe { Tensor<f32, [40]>::uninit() };
+  let mut w_want = unsafe { Tensor<f32, [40]>::uninit() };
+  for i in 0..40 {
+    u1_h[i] = x!(i) / 4.0;
+    v1_h[i] = x!(i + 40) / 4.0;
+    u2_h[i] = x!(i + 80) / 4.0;
+    v2_h[i] = x!(i + 120) / 4.0;
+    y_h[i] = x!(i + 160) / 4.0;
+    z_h[i] = x!(i + 200) / 4.0;
+    x_h[i] = x!(i + 240) / 4.0;
+    w_h[i] = x!(i + 280) / 4.0;
+    for j in 0..40 { a_h[i][j] = x!(i * 40 + j) / 8.0; }
+  }
+  for i in 0..40 {
+    for j in 0..40 { a_want[i][j] = a_h[i][j] + u1_h[i] * v1_h[j] + u2_h[i] * v2_h[j]; }
+  }
+  for i in 0..40 {
+    let mut s : f32 = x_h[i];
+    for j in 0..40 { s += 0.5 * a_want[j][i] * y_h[j]; }
+    x_want[i] = s + z_h[i];
+  }
+  for i in 0..40 {
+    let mut s : f32 = w_h[i];
+    for j in 0..40 { s += 1.5 * a_want[i][j] * x_want[j]; }
+    w_want[i] = s;
+  }
+  let mut a = transfer(a_h, Memory::HBM);
+  let u1 = transfer(u1_h, Memory::HBM);
+  let v1 = transfer(v1_h, Memory::HBM);
+  let u2 = transfer(u2_h, Memory::HBM);
+  let v2 = transfer(v2_h, Memory::HBM);
+  let y = transfer(y_h, Memory::HBM);
+  let z = transfer(z_h, Memory::HBM);
+  let mut xv = transfer(x_h, Memory::HBM);
+  let mut w = transfer(w_h, Memory::HBM);
+  gemver_outer(&mut a, &u1, &v1, &u2, &v2, 40);
+  gemver_transposed(&mut xv, &a, &y, &z, 40, 0.5);
+  gemver_product(&mut w, &a, &xv, 40, 1.5);
+  let a_o = transfer(a, Memory::CPU_DRAM);
+  let x_o = transfer(xv, Memory::CPU_DRAM);
+  let w_o = transfer(w, Memory::CPU_DRAM);
+  failed += verdict("gemver_outer", diff2(&a_o, &a_want, 40, 40), 0.0001, a_o[0][0], a_o[13][27], a_o[39][39]);
+  failed += verdict("gemver_transposed", diff1(&x_o, &x_want, 40), 0.01, x_o[0], x_o[20], x_o[39]);
+  failed += verdict("gemver_product", diff1(&w_o, &w_want, 40), 0.1, w_o[0], w_o[20], w_o[39]);
+  return failed;
+}
+
+fn main() -> i32 {
+  let mut failed = 0;
+  failed += test_gemm();
+  failed += test_two_mm();
+  failed += test_atax();
+  failed += test_gemver();
+  if failed == 0 {
+    print!("ok\n");
+  }
+  return failed;
+}
