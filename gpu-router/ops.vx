@@ -1,0 +1,109 @@
+// gpu-router: the router of a mixture-of-experts layer, for a batch of tokens, on the GPU.
+//
+// Scoring is the one DeepSeek-V3 and GLM use: each expert's score is sigmoid(logit) + bias[e].
+// The bias steers which experts are picked, but not the weights: a picked expert's weight is
+// sigmoid(logit), the k weights are divided by their sum (plus 1e-20), then multiplied by
+// `scale`. Ties go to the lower expert id.
+//
+// With `groups` > 1 the experts are split into equal groups of consecutive ids, a group's score
+// is the sum of its two best expert scores, and only the `topk_group` best groups can send
+// experts (the k best experts among those). With one group and `topk_group` = 1 it is a plain
+// top-k over all experts.
+//
+// One token for each lane: the scan over the experts is serial, repeated for each pick. That is
+// fine for a few hundred experts and is exact; a faster form would use a warp for each token.
+// The picks are read back from `ids` itself to exclude them, and the chosen groups are kept in
+// `gsel`, a scratch of [tokens][topk_group].
+
+import core::num;
+
+macro_rules sigmoid {
+  ($v : expr) => {
+    unsafe {
+      let dv_v : f32 = $v;
+      let mut dv_r : f32 = 0.0;
+      if dv_v >= 0.0 {
+        dv_r = 1.0 / (1.0 + (0.0 - dv_v).exp());
+      } else {
+        let dv_z = dv_v.exp();
+        dv_r = dv_z / (1.0 + dv_z);
+      }
+      dv_r
+    }
+  };
+}
+
+pub fn router_topk(ids : &mut Tensor<i32, [?, ?], Memory::HBM>, weights : &mut Tensor<f32, [?, ?], Memory::HBM>, gsel : &mut Tensor<i32, [?, ?], Memory::HBM>, logits : &Tensor<f32, [?, ?], Memory::HBM>, bias : &Tensor<f32, [?], Memory::HBM>, tokens : i32, experts : i32, k : i32, groups : i32, topk_group : i32, scale : f32) -> void {
+  spawn on(Topology::Device) {
+    for b in 0..(tokens + 127) / 128 across blocks {
+      for l in 0..128 across lanes {
+        let t = b * 128 + l;
+        if t < tokens {
+          let size = experts / groups;
+          // The best groups, one at a time, by the sum of their two best scores.
+          for r in 0..topk_group {
+            let mut best_g : i32 = -1;
+            let mut best_s : f32 = 0.0;
+            for g in 0..groups {
+              let mut used : i32 = 0;
+              for q in 0..r {
+                if gsel[t][q] == g { used = 1; }
+              }
+              if used == 0 {
+                let mut m1 : f32 = -1000000000.0;
+                let mut m2 : f32 = -1000000000.0;
+                for e in g * size..(g + 1) * size {
+                  let s = sigmoid!(logits[t][e]) + bias[e];
+                  if s > m1 {
+                    m2 = m1;
+                    m1 = s;
+                  } else if s > m2 {
+                    m2 = s;
+                  }
+                }
+                let mut gs = m1 + m2;
+                if size == 1 { gs = m1; }
+                if best_g < 0 || gs > best_s {
+                  best_g = g;
+                  best_s = gs;
+                }
+              }
+            }
+            gsel[t][r] = best_g;
+          }
+          // The best experts among the chosen groups.
+          for slot in 0..k {
+            let mut best_e : i32 = -1;
+            let mut best_s : f32 = 0.0;
+            for e in 0..experts {
+              let mut ok : i32 = 0;
+              for q in 0..topk_group {
+                if gsel[t][q] == e / size { ok = 1; }
+              }
+              for q in 0..slot {
+                if ids[t][q] == e { ok = 0; }
+              }
+              if ok != 0 {
+                let s = sigmoid!(logits[t][e]) + bias[e];
+                if best_e < 0 || s > best_s {
+                  best_e = e;
+                  best_s = s;
+                }
+              }
+            }
+            ids[t][slot] = best_e;
+            weights[t][slot] = sigmoid!(logits[t][best_e]);
+          }
+          let mut total : f32 = 0.0;
+          for slot in 0..k {
+            total = total + weights[t][slot];
+          }
+          for slot in 0..k {
+            weights[t][slot] = weights[t][slot] / (total + 0.00000000000000000001) * scale;
+          }
+        }
+      }
+    }
+  }
+  return;
+}
