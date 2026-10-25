@@ -24,6 +24,14 @@ Format: the project, the toolchain version, what happened, and what we did inste
   the LLVM directory from the installed v0.0.3. A package needs a way to say "needs Vx newer than
   v0.0.3", and the installer a way to install a nightly.
 
+- **gpu-quant-ops, main d25deea9: a kernel cannot call a function, so decoders are macros.**
+  The race proof refuses a call it cannot read inside an `across` loop, and
+  `f32::from_bits` is not trusted either
+  ([vx-lang/Vx#2222](https://github.com/vx-lang/Vx/issues/2222)); `libm_f32_from_bits` also needs
+  the CPU. The bf16, fp8 and int4 decoders are `macro_rules` in `ops.vx`, with a macro `pow2` in
+  place of a bit-cast. A library of kernels cannot share its decoders as functions, only as
+  macros, and a macro defined in one file is not a thing a package can export in its API.
+
 - **gpu-norms, main b31ef3ca: a CUDA toolchain needs the GPU driver to build anything.** Built
   where the CUDA toolkit is installed, Vx's dispatch library links `-lcuda`, so every
   `run-jit`, and `emit-obj` of a program with a GPU region, needs `libcuda.so.1`, which only an
