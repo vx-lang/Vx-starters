@@ -1,0 +1,130 @@
+// gpu-flash-prefill: causal multi-head attention for a whole prompt on the GPU, without writing
+// the T x T matrix of scores. The GPU form of the `flash-attn` starter.
+//
+// Block (head, query tile) handles 16 queries. It walks the keys and values of the same head in
+// tiles of 16, only up to its own tile (the causal mask), keeping for each query a running
+// maximum m, a running sum l and the running weighted sum of V. A new tile that raises a
+// query's maximum rescales those. 16 x 16 lanes: lane (ty, tx) scores query ty against key tx,
+// and later owns column tx, tx + 16, .. of the head's 64 outputs for query ty.
+//
+// q, k, v and out are [heads][T][64]. T can be any length: a key at or past T is also past every
+// valid query, so the causal mask hides it, and queries at or past T are not written. The
+// result for position i uses positions 0..=i.
+//
+// Shared memory is tiny here: a query tile, a key tile, a value tile, the output being
+// accumulated (4 KiB each), the scores (1 KiB) and the state of 16 queries.
+//
+// The reductions over a row of 16 scores are serial loops in the code of the block, which runs
+// on one lane; `lanes::max` and `lanes::sum` on a [16][16] tensor would spread them.
+
+import core::num;
+
+pub fn flash_prefill(out : &mut Tensor<f32, [?, ?, 64], Memory::HBM>, q : &Tensor<f32, [?, ?, 64], Memory::HBM>, k : &Tensor<f32, [?, ?, 64], Memory::HBM>, v : &Tensor<f32, [?, ?, 64], Memory::HBM>, heads : i32, seq : i32, scale : f32) -> void {
+  spawn on(Topology::Device) {
+    for h in 0..heads across blocks {
+      for qt in 0..(seq + 15) / 16 across blocks {
+        let mut qs = unsafe { Tensor<f32, [16, 64], Memory::SMEM>::uninit() };
+        let mut ks = unsafe { Tensor<f32, [16, 64], Memory::SMEM>::uninit() };
+        let mut vs = unsafe { Tensor<f32, [16, 64], Memory::SMEM>::uninit() };
+        let mut acc = unsafe { Tensor<f32, [16, 64], Memory::SMEM>::uninit() };
+        let mut sc = unsafe { Tensor<f32, [16, 16], Memory::SMEM>::uninit() };
+        let mut run_m = unsafe { Tensor<f32, [16], Memory::SMEM>::uninit() };
+        let mut run_l = unsafe { Tensor<f32, [16], Memory::SMEM>::uninit() };
+        let mut alpha = unsafe { Tensor<f32, [16], Memory::SMEM>::uninit() };
+        for ty in 0..16 across lanes {
+          for tx in 0..16 across lanes {
+            for r in 0..4 {
+              let d = tx + 16 * r;
+              let mut qv : f32 = 0.0;
+              if qt * 16 + ty < seq {
+                qv = q[h][qt * 16 + ty][d];
+              }
+              qs[ty][d] = qv;
+              acc[ty][d] = 0.0;
+            }
+          }
+        }
+        for r in 0..16 {
+          run_m[r] = -1000000000.0;
+          run_l[r] = 0.0;
+          alpha[r] = 1.0;
+        }
+        for kt in 0..qt + 1 {
+          for ty in 0..16 across lanes {
+            for tx in 0..16 across lanes {
+              for r in 0..4 {
+                let d = tx + 16 * r;
+                let mut kv : f32 = 0.0;
+                let mut vv : f32 = 0.0;
+                if kt * 16 + ty < seq {
+                  kv = k[h][kt * 16 + ty][d];
+                  vv = v[h][kt * 16 + ty][d];
+                }
+                ks[ty][d] = kv;
+                vs[ty][d] = vv;
+              }
+            }
+          }
+          for ty in 0..16 across lanes {
+            for tx in 0..16 across lanes {
+              let mut dot : f32 = 0.0;
+              for d in 0..64 {
+                dot = dot + qs[ty][d] * ks[tx][d];
+              }
+              let mut s : f32 = dot * scale;
+              if kt * 16 + tx > qt * 16 + ty {
+                s = -1000000000.0;
+              }
+              sc[ty][tx] = s;
+            }
+          }
+          for r in 0..16 {
+            let mut cm : f32 = sc[r][0];
+            for j in 1..16 {
+              cm = cm.max(sc[r][j]);
+            }
+            let m_old = run_m[r];
+            let m_new = m_old.max(cm);
+            run_m[r] = m_new;
+            alpha[r] = (m_old - m_new).exp();
+          }
+          for ty in 0..16 across lanes {
+            for tx in 0..16 across lanes {
+              sc[ty][tx] = (sc[ty][tx] - run_m[ty]).exp();
+            }
+          }
+          for r in 0..16 {
+            let mut ps : f32 = 0.0;
+            for j in 0..16 {
+              ps = ps + sc[r][j];
+            }
+            run_l[r] = run_l[r] * alpha[r] + ps;
+          }
+          for ty in 0..16 across lanes {
+            for tx in 0..16 across lanes {
+              for r in 0..4 {
+                let d = tx + 16 * r;
+                let mut a : f32 = acc[ty][d] * alpha[ty];
+                for j in 0..16 {
+                  a = a + sc[ty][j] * vs[j][d];
+                }
+                acc[ty][d] = a;
+              }
+            }
+          }
+        }
+        for ty in 0..16 across lanes {
+          for tx in 0..16 across lanes {
+            for r in 0..4 {
+              let d = tx + 16 * r;
+              if qt * 16 + ty < seq {
+                out[h][qt * 16 + ty][d] = acc[ty][d] / run_l[ty];
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return;
+}
