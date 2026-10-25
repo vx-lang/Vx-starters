@@ -42,6 +42,27 @@ Format: the project, the toolchain version, what happened, and what we did inste
   a build tool would want a flag, an output file per device, and the target chip in the
   manifest.
 
+- **gpu-llm-ops, gpu-blas, gpu-stencil, main d25deea9: `across` needs a newer toolchain than
+  any installed.** The machine files that `across` loops need (`levels: [blocks(..), ..]`) are
+  refused by v0.0.3 and by b31ef3ca (`Unknown topology field 'levels'`). Another full build and
+  `package.sh` run, with the CUDA flavour. The same package-manager need as `flash-attn`: "needs
+  Vx newer than X". The machine file ships in the toolchain (`$VX_HOME/fleet/a100-40.vx`), so
+  `build.sh` finds it there; a project would want it named in its manifest.
+- **gpu-llm-ops, main d25deea9: a library cannot be both in a directory with a hyphen and
+  imported.** `gpu-norms` style names (`gpu-llm-ops`) cannot be a path in `import`, so the library
+  and its test sit in one directory and the test says `import ops;`. Another project could not
+  use the library without copying it, or renaming the directory.
+- **gpu-llm-ops, main d25deea9: the PTX calls CUDA's `__assertfail`.** The kernels that index with
+  a value from memory (`wte[ix[b][t]]`) get a bounds check, and a failed check calls
+  `__assertfail`, which the driver provides. `kernels.py` first said "calls nothing outside
+  itself" and had to allow it. A build tool that checks device code needs to know the runtime's
+  symbols.
+- **gpu-stencil, main d25deea9: launches are not functions.** `jacobi_2d` has two `spawn` regions
+  inside a host loop, so the 3 functions make 4 kernels. `kernels.py` is given the
+  number of regions by hand.
+- **gpu-blas, main d25deea9: tensors are linear, so a test cannot copy an input.** `let cur = a_h;`
+  moves `a_h` (E4001), so the host reference refills a second tensor with the same loop.
+
 - **wordcount, v0.0.3: no way to build an executable.** `vxc` can run a program (`run-jit`) or
   emit an object file (`emit-obj`), but not link one. `build.sh` links the object against
   `$VX_HOME/lib/libvx_std_core.so` with the bundled clang, and sets an rpath so the binary finds

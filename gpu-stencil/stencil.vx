@@ -1,0 +1,91 @@
+// gpu-stencil: grid time-stepping on the GPU, after PolyBench/GPU and Rodinia: Jacobi relaxation
+// and the HotSpot heat step. The time loop is on the host, one launch for each step.
+
+import core::num;
+
+pub fn jacobi_2d(a : &mut Tensor<f32, [?, ?], Memory::HBM>, b : &mut Tensor<f32, [?, ?], Memory::HBM>, n : i32, steps : i32) -> void {
+  for t in 0..steps {
+    spawn on(Topology::Device) {
+      for i in 1..n - 1 across blocks {
+        for j in 1..n - 1 across lanes(256) {
+          b[i][j] = 0.2 * (a[i][j] + a[i][j - 1] + a[i][j + 1] + a[i + 1][j] + a[i - 1][j]);
+        }
+      }
+    }
+    spawn on(Topology::Device) {
+      for i in 1..n - 1 across blocks {
+        for j in 1..n - 1 across lanes(256) {
+          a[i][j] = b[i][j];
+        }
+      }
+    }
+  }
+  return;
+}
+
+pub fn hotspot_step(dst : &mut Tensor<f32, [?, ?], Memory::HBM>, src : &Tensor<f32, [?, ?], Memory::HBM>, power : &Tensor<f32, [?, ?], Memory::HBM>, rows : i32, cols : i32, cap : f32, rx : f32, ry : f32, rz : f32, amb : f32, step : f32) -> void {
+  spawn on(Topology::Device) {
+    for i in 0..rows across blocks {
+      for j in 0..cols across lanes(256) {
+        let c = src[i][j];
+        let mut north = c;
+        if i > 0 {
+          north = src[i - 1][j];
+        }
+        let mut south = c;
+        if i < rows - 1 {
+          south = src[i + 1][j];
+        }
+        let mut west = c;
+        if j > 0 {
+          west = src[i][j - 1];
+        }
+        let mut east = c;
+        if j < cols - 1 {
+          east = src[i][j + 1];
+        }
+        let delta = step / cap * (power[i][j] + (north + south - 2.0 * c) / ry + (east + west - 2.0 * c) / rx + (amb - c) / rz);
+        dst[i][j] = c + delta;
+      }
+    }
+  }
+  return;
+}
+
+pub fn hotspot_pyramid_inner_write(dst : &mut Tensor<f32, [?, ?], Memory::HBM>, src : &Tensor<f32, [?, ?], Memory::HBM>, power : &Tensor<f32, [?, ?], Memory::HBM>, tiles : i32, step : f32) -> void {
+  spawn on(Topology::Device) {
+    for bi in 0..tiles across blocks {
+      for bj in 0..tiles across blocks {
+        let mut now = unsafe { Tensor<f32, [16, 16], Memory::SMEM>::uninit() };
+        let mut next = unsafe {
+          Tensor<f32, [16, 16], Memory::SMEM>::uninit()
+        };
+        for ty in 0..16 across lanes {
+          for tx in 0..16 across lanes {
+            now[ty][tx] = src[bi * 12 + ty][bj * 12 + tx];
+          }
+        }
+        for s in 0..2 {
+          for ty in 1..15 across lanes {
+            for tx in 1..15 across lanes {
+              let c = now[ty][tx];
+              next[ty][tx] = c + step * (power[bi * 12 + ty][bj * 12 + tx] + now[ty - 1][tx] + now[ty + 1][tx] + now[ty][tx - 1] + now[ty][tx + 1] - 4.0 * c);
+            }
+          }
+          for ty in 1..15 across lanes {
+            for tx in 1..15 across lanes {
+              now[ty][tx] = next[ty][tx];
+            }
+          }
+        }
+        for wy in 0..12 across lanes {
+          for wx in 0..12 across lanes {
+            dst[bi * 12 + wy + 2][bj * 12 + wx + 2] = now[wy + 2][wx + 2];
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+

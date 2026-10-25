@@ -70,6 +70,9 @@ first such checks ([vx-lang/Vx#1489](https://github.com/vx-lang/Vx/issues/1489))
 | [`will-it-fit`](will-it-fit) | `--machine`: one program admitted or refused per GPU (A100 40 GB, H100); capacity (E6010) and dtype (E6026) errors predicted by a run-time calculation and matched exactly | Machine models as build inputs, per target: the same source, one compile per machine file |
 | [`prefill-decode`](prefill-decode) | `spawn on` GPU and NPU regions, `transfer` / `to_device` of a KV cache, `--verify-seams` proving every hop and refusing a relaxed one | Optional tools (`z3`) in the test step: skipped with a message when missing |
 | [`gpu-norms`](gpu-norms) | LayerNorm, RMSNorm and softmax as `spawn on(Topology::GPU)` kernels: PTX for sm_80 that `ptxas` accepts, a standalone executable, results checked against host code and Python, no GPU needed | Device code as a build output: the PTX is dug out of LLVM IR, the CUDA toolkit is an optional tool, and a CUDA toolchain needs the driver's stub to link |
+| [`gpu-llm-ops`](gpu-llm-ops) | The kernels of a GPT-2 training step (embedding, GELU, matmul, attention layout, causal softmax, cross-entropy, AdamW) as a library of `across` kernels, from llm.c; same checks as `gpu-norms` | A library whose code is device code: the tests import it, and the PTX still has to be dug out of the test program |
+| [`gpu-blas`](gpu-blas) | A tiled matrix product, 2mm, atax and gemver as `across` kernels, from PolyBench/GPU; edge sizes that are not a multiple of the block | A toolchain newer than the last release, because the machine file needs `levels:` |
+| [`gpu-stencil`](gpu-stencil) | Jacobi and HotSpot grid steps as `across` kernels: a launch for each step, and two steps inside a shared-memory tile | A host loop that launches kernels: the build must count launches, not functions |
 
 ## Getting the toolchain
 
@@ -80,7 +83,7 @@ curl -fsSL https://vxlang.org/install.sh | sh
 Every project builds with `./build.sh` against `~/.vx/current`, or the toolchain `VX_HOME` names.
 
 The projects up to `tiny-mlp` were written against v0.0.3. From `flash-attn` on, they use Vx
-built from `main` (39a12e0a or later), which has fixes the release lacks; there is no nightly
+built from `main` (39a12e0a or later; d25deea9 for the `gpu-llm-ops`, `gpu-blas` and `gpu-stencil` kernels), which has fixes the release lacks; there is no nightly
 installer yet, so that means building Vx and packaging it with `scripts/release/package.sh`.
 Every project passes with that build too (rechecked on b31ef3ca, built with and without CUDA),
 except `rational` and `interval`, which no longer

@@ -1,0 +1,178 @@
+// gpu-blas: dense linear algebra on the GPU, after PolyBench/GPU: matrix products, matrix-vector
+// products with and without a transpose, and a rank-2 update. Every kernel is an `across` loop.
+
+import core::num;
+
+pub fn gemm_shared_tiles(c : &mut Tensor<f32, [?, ?], Memory::HBM>, a : &Tensor<f32, [?, ?], Memory::HBM>, b : &Tensor<f32, [?, ?], Memory::HBM>, tiles : i32) -> void {
+  spawn on(Topology::Device) {
+    for bi in 0..tiles across blocks {
+      for bj in 0..tiles across blocks {
+        let mut ta = unsafe { Tensor<f32, [16, 16], Memory::SMEM>::uninit() };
+        let mut tb = unsafe { Tensor<f32, [16, 16], Memory::SMEM>::uninit() };
+        let mut acc = unsafe { Tensor<f32, [16, 16], Memory::SMEM>::uninit() };
+        for ty in 0..16 across lanes {
+          for tx in 0..16 across lanes {
+            acc[ty][tx] = 0.0;
+          }
+        }
+        for kt in 0..tiles {
+          for ty in 0..16 across lanes {
+            for tx in 0..16 across lanes {
+              ta[ty][tx] = a[bi * 16 + ty][kt * 16 + tx];
+              tb[ty][tx] = b[kt * 16 + ty][bj * 16 + tx];
+            }
+          }
+          for ty in 0..16 across lanes {
+            for tx in 0..16 across lanes {
+              let mut s : f32 = acc[ty][tx];
+              for k in 0..16 {
+                s = s + ta[ty][k] * tb[k][tx];
+              }
+              acc[ty][tx] = s;
+            }
+          }
+        }
+        for ty in 0..16 across lanes {
+          for tx in 0..16 across lanes {
+            c[bi * 16 + ty][bj * 16 + tx] = acc[ty][tx];
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+fn main() -> i32 {
+  return 0;
+}
+
+pub fn two_mm_first(tmp : &mut Tensor<f32, [?, ?], Memory::HBM>, a : &Tensor<f32, [?, ?], Memory::HBM>, b : &Tensor<f32, [?, ?], Memory::HBM>, ni : i32, nj : i32, nk : i32, alpha : f32) -> void {
+  spawn on(Topology::Device) {
+    for bi in 0..(ni + 7) / 8 across blocks {
+      for bj in 0..(nj + 31) / 32 across blocks {
+        for ty in 0..8 across lanes {
+          for tx in 0..32 across lanes {
+            let i = bi * 8 + ty;
+            let j = bj * 32 + tx;
+            if i < ni && j < nj {
+              let mut s : f32 = 0.0;
+              for k in 0..nk {
+                s = s + alpha * a[i][k] * b[k][j];
+              }
+              tmp[i][j] = s;
+            }
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+pub fn two_mm_second(d : &mut Tensor<f32, [?, ?], Memory::HBM>, tmp : &Tensor<f32, [?, ?], Memory::HBM>, c : &Tensor<f32, [?, ?], Memory::HBM>, ni : i32, nl : i32, nj : i32, beta : f32) -> void {
+  spawn on(Topology::Device) {
+    for bi in 0..(ni + 7) / 8 across blocks {
+      for bj in 0..(nl + 31) / 32 across blocks {
+        for ty in 0..8 across lanes {
+          for tx in 0..32 across lanes {
+            let i = bi * 8 + ty;
+            let j = bj * 32 + tx;
+            if i < ni && j < nl {
+              let mut s : f32 = d[i][j] * beta;
+              for k in 0..nj {
+                s = s + tmp[i][k] * c[k][j];
+              }
+              d[i][j] = s;
+            }
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+pub fn atax_first(tmp : &mut Tensor<f32, [?], Memory::HBM>, a : &Tensor<f32, [?, ?], Memory::HBM>, x : &Tensor<f32, [?], Memory::HBM>, nx : i32, ny : i32) -> void {
+  spawn on(Topology::Device) {
+    for b in 0..(nx + 255) / 256 across blocks {
+      for l in 0..256 across lanes {
+        let i = b * 256 + l;
+        if i < nx {
+          let mut s : f32 = 0.0;
+          for j in 0..ny {
+            s = s + a[i][j] * x[j];
+          }
+          tmp[i] = s;
+        }
+      }
+    }
+  }
+  return;
+}
+
+pub fn atax_second(y : &mut Tensor<f32, [?], Memory::HBM>, a : &Tensor<f32, [?, ?], Memory::HBM>, tmp : &Tensor<f32, [?], Memory::HBM>, nx : i32, ny : i32) -> void {
+  spawn on(Topology::Device) {
+    for b in 0..(ny + 255) / 256 across blocks {
+      for l in 0..256 across lanes {
+        let j = b * 256 + l;
+        if j < ny {
+          let mut s : f32 = 0.0;
+          for i in 0..nx {
+            s = s + a[i][j] * tmp[i];
+          }
+          y[j] = s;
+        }
+      }
+    }
+  }
+  return;
+}
+
+pub fn gemver_outer(a : &mut Tensor<f32, [?, ?], Memory::HBM>, u1 : &Tensor<f32, [?], Memory::HBM>, v1 : &Tensor<f32, [?], Memory::HBM>, u2 : &Tensor<f32, [?], Memory::HBM>, v2 : &Tensor<f32, [?], Memory::HBM>, n : i32) -> void {
+  spawn on(Topology::Device) {
+    for i in 0..n across blocks {
+      for j in 0..n across lanes(256) {
+        a[i][j] = a[i][j] + u1[i] * v1[j] + u2[i] * v2[j];
+      }
+    }
+  }
+  return;
+}
+
+pub fn gemver_transposed(x : &mut Tensor<f32, [?], Memory::HBM>, a : &Tensor<f32, [?, ?], Memory::HBM>, y : &Tensor<f32, [?], Memory::HBM>, z : &Tensor<f32, [?], Memory::HBM>, n : i32, beta : f32) -> void {
+  spawn on(Topology::Device) {
+    for b in 0..(n + 255) / 256 across blocks {
+      for l in 0..256 across lanes {
+        let i = b * 256 + l;
+        if i < n {
+          let mut s : f32 = x[i];
+          for j in 0..n {
+            s = s + beta * a[j][i] * y[j];
+          }
+          x[i] = s + z[i];
+        }
+      }
+    }
+  }
+  return;
+}
+
+pub fn gemver_product(w : &mut Tensor<f32, [?], Memory::HBM>, a : &Tensor<f32, [?, ?], Memory::HBM>, x : &Tensor<f32, [?], Memory::HBM>, n : i32, alpha : f32) -> void {
+  spawn on(Topology::Device) {
+    for b in 0..(n + 255) / 256 across blocks {
+      for l in 0..256 across lanes {
+        let i = b * 256 + l;
+        if i < n {
+          let mut s : f32 = w[i];
+          for j in 0..n {
+            s = s + alpha * a[i][j] * x[j];
+          }
+          w[i] = s;
+        }
+      }
+    }
+  }
+  return;
+}
+
