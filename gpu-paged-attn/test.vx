@@ -1,0 +1,191 @@
+// Tests for gpu-paged-attn: appends one token to each of three sequences in a paged cache and
+// decodes them, against plain attention over contiguous keys and values on the host. Returns the
+// number of failed checks, and prints "ok" when there are none. It also prints some entries,
+// which check.py computes again in Python.
+//
+//   ./build.sh
+
+import core::convert;
+import core::num;
+import ops;
+
+// Inputs: whole numbers scaled by 1/8, so every value is exact in f32 and Python sees the same.
+macro_rules x { ($i : expr) => { (((($i) * 37) % 101) as f32) / 8.0 - 6.0 }; }
+
+fn abs64(v : f64) -> f64 {
+  if v < 0.0 {
+    return 0.0 - v;
+  }
+  return v;
+}
+
+fn verdict(name : *const i8, worst : f64, tol : f64, e0 : f32, e1 : f32, e2 : f32) -> i32 {
+  print!(name);
+  print!(": ");
+  print!(f64::from(e0));
+  print!(" ");
+  print!(f64::from(e1));
+  print!(" ");
+  print!(f64::from(e2));
+  print!("\n");
+  if worst > tol {
+    print!("  FAIL: differs from the host code by ");
+    print!(worst);
+    print!("\n");
+    return 1;
+  }
+  return 0;
+}
+
+const SEQS : i32 = 3;
+const HEADS : i32 = 2;
+const MAXP : i32 = 16;
+
+// The pool has 64 pages. Sequence s page j is page ((16 s + j) * 17 + 3) mod 64: 17 is odd, so
+// the 48 pages are all different, and they are scattered.
+fn page_of(s : i32, j : i32) -> i32 {
+  return ((s * MAXP + j) * 17 + 3) % 64;
+}
+
+fn len_of(s : i32) -> i32 {
+  if s == 0 { return 37; }
+  if s == 1 { return 130; }
+  return 5;
+}
+
+fn cell(page : i32, h : i32, slot : i32, d : i32) -> i32 {
+  return ((page * HEADS + h) * 16 + slot) * 64 + d;
+}
+
+macro_rules key { ($s : expr, $h : expr, $pos : expr, $d : expr) => { x!(((($s) * 2 + ($h)) * 256 + ($pos)) * 64 + ($d)) / 16.0 * (1.0 + (($pos) as f32) / 64.0) }; }
+macro_rules val { ($s : expr, $h : expr, $pos : expr, $d : expr) => { x!(((($s) * 2 + ($h)) * 256 + ($pos)) * 64 + ($d) + 5) / 4.0 }; }
+macro_rules qry { ($s : expr, $h : expr, $d : expr) => { x!((($s) * 2 + ($h)) * 64 + ($d) + 9) / 16.0 }; }
+
+fn main() -> i32 {
+  let mut failed = 0;
+  let mut kc_h = Tensor<f32, [131072]>::new();
+  let mut vc_h = Tensor<f32, [131072]>::new();
+  let mut table_h = Tensor<i32, [3, 16]>::new();
+  let mut lens_h = Tensor<i32, [3]>::new();
+  let mut q_h = Tensor<f32, [3, 2, 64]>::new();
+  let mut kn_h = Tensor<f32, [3, 2, 64]>::new();
+  let mut vn_h = Tensor<f32, [3, 2, 64]>::new();
+  for s in 0..SEQS {
+    lens_h[s] = len_of(s);
+    for j in 0..MAXP { table_h[s][j] = page_of(s, j); }
+    for h in 0..HEADS {
+      for d in 0..64 {
+        q_h[s][h][d] = qry!(s, h, d);
+        // The new token is at position len_of(s).
+        kn_h[s][h][d] = key!(s, h, len_of(s), d);
+        vn_h[s][h][d] = val!(s, h, len_of(s), d);
+      }
+      // The cache holds the positions before it.
+      for pos in 0..len_of(s) {
+        for d in 0..64 {
+          kc_h[cell(page_of(s, pos / 16), h, pos % 16, d)] = key!(s, h, pos, d);
+          vc_h[cell(page_of(s, pos / 16), h, pos % 16, d)] = val!(s, h, pos, d);
+        }
+      }
+    }
+  }
+
+  // The host attention over positions 0..=len of each sequence, with the keys and values
+  // computed from the formula, not read from the cache.
+  let mut want = Tensor<f32, [3, 2, 64]>::new();
+  let mut sc = Tensor<f32, [256]>::new();
+  for s in 0..SEQS {
+    let n = len_of(s) + 1;
+    for h in 0..HEADS {
+      let mut m : f32 = -1000000000.0;
+      for pos in 0..n {
+        let mut dot : f32 = 0.0;
+        for d in 0..64 { dot += qry!(s, h, d) * key!(s, h, pos, d); }
+        sc[pos] = dot * 0.125;
+        m = m.max(sc[pos]);
+      }
+      let mut z : f32 = 0.0;
+      for pos in 0..n { z += (sc[pos] - m).exp(); }
+      for d in 0..64 {
+        let mut acc : f32 = 0.0;
+        for pos in 0..n { acc += (sc[pos] - m).exp() * val!(s, h, pos, d); }
+        want[s][h][d] = acc / z;
+      }
+    }
+  }
+
+  let kc = transfer(kc_h, Memory::HBM);
+  let vc = transfer(vc_h, Memory::HBM);
+  let table = transfer(table_h, Memory::HBM);
+  let mut lens = transfer(lens_h, Memory::HBM);
+  let q = transfer(q_h, Memory::HBM);
+  let kn = transfer(kn_h, Memory::HBM);
+  let vn = transfer(vn_h, Memory::HBM);
+  let mut out = transfer(Tensor<f32, [3, 2, 64]>::new(), Memory::HBM);
+  kv_append(&kc, &vc, &kn, &vn, &table, &lens, SEQS, HEADS);
+  kv_advance(&mut lens, SEQS);
+  paged_attention_decode(&mut out, &q, &kc, &vc, &table, &lens, SEQS, HEADS, 256, 0.125);
+  let out_o = transfer(out, Memory::CPU_DRAM);
+  let lens_o = transfer(lens, Memory::CPU_DRAM);
+  let kc_o = transfer(kc, Memory::CPU_DRAM);
+
+  // The append wrote the new token's keys where the table says, and the lengths grew by one.
+  // Nothing else changed: the number of nonzero cells is the number of positions that should
+  // hold a nonzero number (the pattern has zeros of its own, so count those from the formula).
+  let mut bad = 0;
+  for s in 0..SEQS {
+    let pos = len_of(s);
+    for h in 0..HEADS {
+      for d in 0..64 {
+        let at = cell(page_of(s, pos / 16), h, pos % 16, d);
+        let want_k = key!(s, h, pos, d);
+        if kc_o[at] != want_k { bad += 1; }
+      }
+    }
+    if lens_o[s] != len_of(s) + 1 { bad += 1; }
+  }
+  let mut nonzero = 0;
+  for i in 0..131072 {
+    if kc_o[i] != 0.0 { nonzero += 1; }
+  }
+  let mut expect = 0;
+  for s in 0..SEQS {
+    for h in 0..HEADS {
+      for pos in 0..len_of(s) + 1 {
+        for d in 0..64 {
+          let kv = key!(s, h, pos, d);
+          if kv != 0.0 { expect += 1; }
+        }
+      }
+    }
+  }
+  if nonzero != expect { bad += 1; }
+  print!("append: ");
+  print!(lens_o[0]);
+  print!(" ");
+  print!(lens_o[1]);
+  print!(" ");
+  print!(lens_o[2]);
+  print!("\n");
+  if bad > 0 {
+    print!("  FAIL: ");
+    print!(bad);
+    print!(" wrong cells after the append\n");
+    failed += 1;
+  }
+
+  let mut worst : f64 = 0.0;
+  for s in 0..SEQS {
+    for h in 0..HEADS {
+      for d in 0..64 {
+        let e = abs64(f64::from(out_o[s][h][d] - want[s][h][d]));
+        if e > worst { worst = e; }
+      }
+    }
+  }
+  failed += verdict("decode", worst, 0.0001, out_o[0][0][0], out_o[1][1][31], out_o[2][0][63]);
+  if failed == 0 {
+    print!("ok\n");
+  }
+  return failed;
+}
