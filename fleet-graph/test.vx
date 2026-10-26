@@ -606,7 +606,7 @@ fn test_plan() -> i32 {
 }
 
 fn batch_ok_for(s : Service, dep : Deploy, b : i32) -> bool {
-  return fits(s.model, dep, b, s.prompt + s.out) && decode_step(s.model, dep, b, s.prompt + s.out / 2) <= s.slo_tpot;
+  return fits(s.model, dep, b, s.prompt + s.out) && tpot(s, dep, b) <= s.slo_tpot;
 }
 
 // The invariants of a plan.
@@ -667,7 +667,7 @@ fn check_plan_down(f : &Fleet, sv : &Vec<Service>, p : &Plan, down : &Vec<i32>) 
     }
     if pl.role == 1 {
       // A prefill replica: the prompt fits, the first token (prefill plus sending the cache) is in time, and it serves 1 / prefill.
-      let tp = prefill_time(s.model, c.dep, s.prompt);
+      let tp = prefill_time_hit(s.model, c.dep, s.prompt, s.hit);
       let xs = if gpus(c.dep) < c.xs { gpus(c.dep) } else { c.xs };
       let nic = if c.dep.sku.nic < c.xnic { c.dep.sku.nic } else { c.xnic };
       if !fits(s.model, c.dep, 1, s.prompt) || c.ttft > s.slo_ttft { missed += 1; }
@@ -1133,6 +1133,93 @@ fn test_headroom() -> i32 {
   return failed;
 }
 
+// ---------------------------------------------------------------------------------------------
+// 9. Speculative decoding and the prefix cache
+
+fn spec_service(mode : i32) -> Service {
+  return with_mode(with_hit(with_spec(make_service(deepseek_v3(), 10.0f64, 8192, 1024, 0.03f64, 5.0f64, 1.0f64, 1, 2048), 2.0f64, 1.8f64), 0.5f64), mode);
+}
+
+fn test_spec() -> i32 {
+  let mut failed = 0;
+  let d = deepseek_v3();
+  let s0 = make_service(d, 10.0f64, 8192, 1024, 0.03f64, 5.0f64, 1.0f64, 1, 2048);
+  // A step on one token of each sequence is the plain step, and the plain prefill is the one with
+  // nothing cached.
+  let n72 = deploy(b200(), 1, 72, 1, 1, 1.0f64, 1.0f64, 0.0f64, 0.0f64);
+  failed += expect(decode_step_spec(d, n72, 512, 8192, 1.0f64) == decode_step(d, n72, 512, 8192), "a step on one token of each sequence is the plain step");
+  failed += expect(prefill_time_hit(d, n72, 8192, 0.0f64) == prefill_time(d, n72, 8192), "a prefill with nothing cached is the plain prefill");
+
+  // On a machine limited by arithmetic, a step on two tokens takes twice as long (less the overhead of
+  // the layers, which a step pays once).
+  let tfn = deploy(toy_flops(), 1, 8, 1, 1, 2.0f64, 2.0f64, 0.0f64, 0.0f64);
+  let over = 61.0f64 * 0.00003f64;
+  let one = decode_step_spec(d, tfn, 8, 100000, 1.0f64) - over;
+  let two = decode_step_spec(d, tfn, 8, 100000, 2.0f64) - over;
+  failed += expect(close(two, 2.0f64 * one, 0.000000001f64), "a compute-bound step on two tokens takes twice as long");
+  // On a machine limited by memory, two tokens only touch more experts: for one sequence, 8 experts of
+  // a layer become 256 * (1 - (31/32)^2) = 15.75, and the rest of the traffic is the same.
+  let t8 = deploy(toy(), 1, 8, 1, 1, 1.0f64, 1.0f64, 0.0f64, 0.0f64);
+  let extra = 58.0f64 * (15.75f64 - 8.0f64) / 8.0f64 * 44040192.0f64 / 750000000000.0f64;
+  failed += expect(close(decode_step_spec(d, t8, 1, 1000, 2.0f64) - decode_step(d, t8, 1, 1000), extra, 0.000001f64), "a memory-bound step on two tokens reads the extra experts and nothing else");
+  let mut up = 0;
+  let mut prev = 0.0f64;
+  for k in 0..8 {
+    let st = decode_step_spec(d, n72, 256, 8192, 1.0f64 + fl(k));
+    if st < prev { up += 1; }
+    prev = st;
+  }
+  failed += expect(up == 0, "a step never gets shorter with more tokens to check");
+
+  // A prefill with half the prompt cached: 500 new tokens that attend to 500 old ones, by hand, on the
+  // machine limited by arithmetic.
+  let la = 61.0f64 * 187105280.0f64 + 9.0f64 * 7168.0f64 * 18432.0f64 + 58.0f64 * (9.0f64 * 44040192.0f64 + 7168.0f64 * 256.0f64);
+  let flops = 2.0f64 * la * 500.0f64 + (500.0f64 * 500.0f64 + 500.0f64 * 500.0f64 / 2.0f64) * 61.0f64 * 81920.0f64;
+  let tf = deploy(toy_flops(), 1, 8, 1, 1, 2.0f64, 2.0f64, 0.0f64, 0.0f64);
+  failed += expect(close(prefill_time_hit(d, tf, 1000, 0.5f64), flops / (8.0f64 * 1000000000000000.0f64 * 0.4f64) + over, 0.000000001f64), "a prefill with half cached is the work of 500 new tokens over 500 old ones");
+  let mut down = 0;
+  let mut before = prefill_time_hit(d, n72, 32768, 0.0f64);
+  for k in 1..9 {
+    let ti = prefill_time_hit(d, n72, 32768, fl(k) / 10.0f64);
+    if ti > before { down += 1; }
+    before = ti;
+  }
+  failed += expect(down == 0 && prefill_time_hit(d, n72, 32768, 0.9f64) < prefill_time_hit(d, n72, 32768, 0.0f64) / 2.0f64, "the more of a prompt is cached, the shorter the prefill");
+
+  // The service: the time between tokens is the step over the tokens a step gives.
+  let sp = with_spec(s0, 2.0f64, 1.8f64);
+  let h200_node = deploy(h200(), 1, 8, 1, 1, 1.0f64, 1.0f64, 0.0f64, 0.0f64);
+  failed += expect(close(tpot(sp, h200_node, 300), decode_step_spec(d, h200_node, 300, 8192 + 512, 2.0f64) / 1.8f64, 0.000000001f64), "the time between tokens is the step over 1.8 tokens");
+  let plain_c = evaluate(s0, h200_node);
+  let spec_c = evaluate(sp, h200_node);
+  failed += expect(plain_c.ok == 1 && spec_c.ok == 1 && spec_c.batch > 4 * plain_c.batch && spec_c.rate > 2.0f64 * plain_c.rate, "at 30 ms a token speculation lets the batch grow and doubles the rate");
+  failed += expect(spec_c.step <= s0.slo_tpot && close(spec_c.step, tpot(sp, h200_node, spec_c.batch), 0.000000001f64), "the candidate's time between tokens is the speculative one");
+  let cached = evaluate(with_hit(s0, 0.5f64), h200_node);
+  failed += expect(cached.ttft < plain_c.ttft * 0.6f64 && close(cached.ttft, prefill_time_hit(d, h200_node, 8192, 0.5f64), 0.000000001f64), "a half-cached prompt gets its first token in well under the time of a whole one");
+
+  // Layouts with tensor parallel attention and with the cache cut, on two tokens a step, priced again in Python.
+  let tgl = deploy(h200(), 1, 8, 0, 1, 2.0f64, 2.0f64, 0.0f64, 0.0f64);
+  let cut8 = deploy(b200(), 1, 72, 1, 8, 1.0f64, 1.0f64, 0.0f64, 0.0f64);
+  show("cost_spec", decode_step_spec(glm_4_5(), tgl, 32, 8192, 2.0f64), decode_step_spec(d, cut8, 18, 200000, 2.0f64), prefill_time_hit(glm_4_5(), tgl, 8192, 0.25f64));
+
+  // Plans, priced again in Python.
+  let f = mixed_fleet();
+  let o = one_order();
+  let mut v0 = Vec<Service>::with_capacity(1);
+  v0.push(spec_service(0));
+  let mut v1 = Vec<Service>::with_capacity(1);
+  v1.push(spec_service(1));
+  let q0 = schedule_in_order(&f, &v0, &o);
+  let q1 = schedule_in_order(&f, &v1, &o);
+  failed += check_plan(&f, &v0, &q0);
+  failed += check_plan(&f, &v1, &q1);
+  failed += expect(q0.unmet.get(0) == 0.0f64 && q1.unmet.get(0) == 0.0f64, "10 requests a second with speculation and a prefix cache are met, either way");
+  print_plan("spec0", &q0);
+  print_plan("spec1", &q1);
+  show("spec", spec_c.rate / plain_c.rate, cached.ttft / plain_c.ttft, fl(spec_c.batch));
+  return failed;
+}
+
 fn main() -> i32 {
   let mut failed = 0;
   failed += test_models();
@@ -1143,6 +1230,7 @@ fn main() -> i32 {
   failed += test_pools();
   failed += test_losses();
   failed += test_headroom();
+  failed += test_spec();
   if failed == 0 {
     print!("ok\n");
   }

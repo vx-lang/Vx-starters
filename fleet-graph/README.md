@@ -114,44 +114,67 @@ weights and cache, batch 920) and GLM on the rack and all eight A100 nodes (in g
 leaving 14% of the GLM rate unmet. A plan that is best over all orders is still a greedy's: it is
 not the best split of the fleet.
 
+## Speculative decoding and the prefix cache
+
+Two things that change what a service costs, as parameters of a `Service`:
+
+* `with_spec(s, t, acc)`: speculative decoding (DeepSeek's and GLM's multi-token prediction). A step
+  works on `t` tokens of each sequence (the token it has and `t - 1` drafts to check) and gives it
+  `acc` tokens on average, so the time between tokens is `step / acc`. The weights, the cache and the
+  layers are read once for all `t` tokens; the arithmetic, the attention and the traffic between GPUs
+  grow with `t`; and `t` tokens touch more experts than one (for one sequence, 8 of 256 become 15.75).
+* `with_hit(s, hit)`: a share `hit` of each prompt is in the prefix cache. Only the rest is computed,
+  but it attends to all of it, and the weights are read once either way.
+
+At 30 ms a token on an H200 node (DeepSeek-V3, 8k prompt), speculation with 2 tokens a step and 1.8
+given lets the batch grow from 112 to 678 and the rate go from 2.4 to 5.1 requests a second; half of the
+prompt cached takes the first token from 0.15 to 0.08 s. The tests check both against hand sums on
+machines with one limit, and `check.py` against Python.
+
 ## A datacenter in one program
 
 `examples/datacenter.vx` is the whole of the library in 30 lines of Vx: the fleet (two NVL72 racks,
 twelve H200 nodes, twenty-four A100-80 nodes, seven leaf switches with the spine links cut to half),
-five services, `schedule`, and the report. `vxc -a run-jit examples/datacenter.vx` prints:
+five services (the chat services with speculation and half of each prompt cached, the agents with
+speculation and 60% cached), `schedule`, and the report. `vxc -a run-jit examples/datacenter.vx`
+prints:
 
 ```
 services (requests a second; cost in units an hour)
-  chat-ds: DeepSeek-V3, 8192 + 512 tokens, 30.00 asked, 30.00 served (0% unmet), 56 GPUs, 116
-  chat-glm: GLM-4.5, 4096 + 512 tokens, 20.00 asked, 20.00 served (0% unmet), 40 GPUs, 100
-  docs-ds: DeepSeek-V3, 131072 + 1024 tokens, 2.00 asked, 2.00 served (0% unmet), 80 GPUs, 308
-  repo-glm: GLM-4.5, 1000000 + 256 tokens, 0.0200 asked, 0.0078 served (61% unmet), 176 GPUs, 176
-  agents-ds: DeepSeek-V3, 32768 + 256 tokens, 15.00 asked, 15.00 served (0% unmet), 72 GPUs, 288
+  chat-ds: DeepSeek-V3, 8192 + 512 tokens, 30.00 asked, 30.00 served (0% unmet), 40 GPUs, 76
+  chat-glm: GLM-4.5, 4096 + 512 tokens, 20.00 asked, 20.00 served (0% unmet), 56 GPUs, 68
+  docs-ds: DeepSeek-V3, 131072 + 1024 tokens, 2.00 asked, 2.00 served (0% unmet), 88 GPUs, 304
+  repo-glm: GLM-4.5, 1000000 + 256 tokens, 0.0200 asked, 0.0200 served (0% unmet), 72 GPUs, 288
+  agents-ds: DeepSeek-V3, 32768 + 256 tokens, 15.00 asked, 15.00 served (0% unmet), 64 GPUs, 160
 placements
-  chat-ds both    H200 x1 of 8 (domains 2), attention data parallel, context split 1, weights 1B, cache 1B, batch 976, 42.5 ms a token, first token 0.15 s, HBM 90%, 5.81 of 5.81 a second
+  chat-ds both    H200 x1 of 8 (domains 2), attention data parallel, context split 1, weights 1B, cache 1B, batch 976, 41.9 ms a token, first token 0.08 s, HBM 90%, 9.58 of 9.58 a second
   ...
-  docs-ds both    B200 x1 of 72 (domains 0), attention data parallel, context split 8, weights 1B, cache 1B, batch 128, 7.8 ms a token, first token 0.44 s, HBM 18%, 1.89 of 1.99 a second
-  repo-glm decode  A100-80 x2 of 8 (domains 16 17), attention tensor parallel, context split 2, ... batch 1, 22.2 ms a token, HBM 79%, 0.0200 of 0.18 a second
-  repo-glm prefill A100-80 x6 of 8 (domains 18 19 20 21 22 23), ... first token 424.64 s, HBM 83%, ...
+  chat-glm decode  A100-80 x4 of 8 (domains 16 17 18 19), attention data parallel, context split 1, weights 2B, cache 2B, batch 416, 37.8 ms a token, HBM 90%, 20.00 of 21.50 a second
+  chat-glm prefill H200 x1 of 8 (domains 13), attention data parallel, context split 1, weights 2B, cache 2B, first token 0.07 s, HBM 79%, 15.20 of 15.20 a second
+  chat-glm prefill A100-80 x2 of 8 (domains 20 21), attention data parallel, context split 1, weights 2B, cache 2B, first token 0.18 s, HBM 90%, 4.80 of 5.61 a second
+  docs-ds both    B200 x1 of 72 (domains 1), attention data parallel, context split 8, weights 1B, cache 1B, batch 128, 7.8 ms a token, first token 0.44 s, HBM 18%, 1.99 of 1.99 a second
+  repo-glm both    B200 x1 of 72 (domains 0), attention data parallel, context split 4, weights 2B, cache 2B, batch 18, 25.6 ms a token, first token 36.79 s, HBM 71%, 0.0200 of 0.0269 a second
   ...
 fleet
   B200 x72: 2 domains (144 GPUs), 2 in use, 0 free
-  H200 x8: 12 domains (96 GPUs), 11 in use, 1 free
-  A100-80 x8: 24 domains (192 GPUs), 24 in use, 0 free
-  spend 988 an hour
+  H200 x8: 12 domains (96 GPUs), 12 in use, 0 free
+  A100-80 x8: 24 domains (192 GPUs), 10 in use, 14 free
+  spend 896 an hour
+headroom: 1.05 times this load before something goes unmet
 losses (the services placed again, in the same order)
-  a domain in use (37 tried): 37 leave something unmet
+  a domain in use (24 tried): 14 leave something unmet
   the worst, domain 0 (B200 x72):
-    2.17 of a service more unmet, 268 an hour less
+    1.49 of a service more unmet, 176 an hour less
   the worst leaf switch, 0 (1 domains):
-    2.17 of a service more unmet, 268 an hour less
+    1.49 of a service more unmet, 176 an hour less
 ```
 
-Read it as a design review. The 1M-token GLM service takes 176 GPUs and still serves 39% of what was
-asked (every request waits 5 to 7 minutes for its first token); the long-document and agent services
-sit on one NVL72 rack each; and the fleet has no slack, so losing any domain in use leaves something
-unmet, and losing a rack leaves two services' worth. A planner that says that before the hardware is
-bought, or before a rack fails, is the point of writing it as a program.
+Read it as a design review. The GLM chat service is split across SKUs: it decodes on four A100 nodes
+and prefills on an H200 node and two pairs of A100 nodes. The million-token GLM service takes a whole
+NVL72 rack, with the context cut in 4, and the long documents take the other. The 14 free A100 nodes
+are the slack, and they are of little use to the rest: the fleet carries only 1.05 times this load, and
+losing a rack leaves a service and a half unmet. A planner that says that before the hardware is bought,
+or before a rack fails, is the point of writing it as a program.
 
 The build checks that the report adds up (`check_example.py`): every domain is in at most one
 placement, the GPUs of a service are those of its placements, the domains in use are the ones listed,
@@ -162,25 +185,22 @@ the unmet share follows from the asked and served.
 
 `headroom` answers "how much more load does the fleet carry?": the largest factor, to about 1%, by
 which every rate can be multiplied with nothing left unmet (below 1 when the load as given is not
-met), found by doubling and bisection. On the example fleet it is 0.43: with the million-token service
-asked for at 0.02 requests a second, nothing is left unmet only at about 0.4 of the whole load. On
-two H200 nodes carrying half a replica's rate it is 4.00, as it must be (two nodes, one replica each,
-and half a replica's rate asked), and with three replicas' rate asked it is 0.66, which the test
-checks. The greedy is not monotone, so this is the boundary of one search, not a promise for every
-placement.
+met), found by doubling and bisection. On the example fleet it is 1.05. On two H200 nodes carrying half
+a replica's rate it is 4.00, as it must be (two nodes, one replica each, and half a replica's rate
+asked), and with three replicas' rate asked it is 0.66, which the test checks. The greedy is not
+monotone, so this is the boundary of one search, not a promise for every placement.
 
 ### What to buy
 
 `examples/procure.vx` runs the planner over a grid of fleets (0 to 2 NVL72 racks, 0 to 12 H200 nodes,
-0 to 24 A100 nodes) for four services (DeepSeek-V3 chat, GLM-4.5 chat, long documents, agents) and
-prints a line for each: the price (the hourly cost of all its GPUs, used or not) and the unmet share.
-Of the 26 fleets, only three carry the load, and all three have two racks and twelve H200 nodes (with
-0, 12 or 24 A100 nodes). The cheapest is the one without A100 nodes, 816 an hour: with these targets the
-A100 nodes do not make a smaller fleet of the others sufficient (the best of the other fleets still
-leaves 0.71 of a service unmet, even with a rack, twelve H200 nodes and 24 A100 nodes), so they only add
-to the price. `check_procure.py` works the prices out again and checks that no cheaper fleet of the
-table carries the load. The grid is coarse and the services are placed in
-one order; it is a way to see where the money goes, not an optimizer.
+0 to 24 A100 nodes) for four services (the chat services, the long documents, the agents) and prints a
+line for each: the price (the hourly cost of all its GPUs, used or not) and the unmet share. Of the 26
+fleets, six carry the load. The cheapest is one rack, twelve H200 nodes and twenty-four A100 nodes, 720
+an hour; the fleet with the most hardware per GPU price (two racks and twelve H200 nodes, 816) is not
+the cheapest, and without speculation and a prefix cache the A100 nodes were of no use (the same grid
+needed two racks and twelve H200 nodes: 816 an hour). `check_procure.py` works the prices out again and
+checks that no cheaper fleet of the table carries the load. The grid is coarse and the services are
+placed in one order; it is a way to see where the money goes, not an optimizer.
 
 ## What the tests check
 
@@ -214,7 +234,11 @@ one order; it is a way to see where the money goes, not an optimizer.
    against Python's.
 8. **Headroom.** On two nodes: 4.0 times the load for half a replica's rate, 0.66 for three
    replicas' rate, and at the boundary the load is met and 5% more is not.
-9. **Python.** `check.py` prices the same layouts again from the architectures and the formulas,
+9. **Speculation and the cache.** A step on one token is the plain step; a compute-bound step on two
+   tokens takes twice as long, a memory-bound one reads the extra experts only; a prefill with half
+   cached is the work of the new tokens over the old; the batch grows and the rate doubles at 30 ms a
+   token; plans with both, in both modes, priced again in Python.
+10. **Python.** `check.py` prices the same layouts again from the architectures and the formulas,
    written out a second time, and every placement of the schedule too; they agree to 1e-9.
 
 ## The compiler checks the planner

@@ -139,33 +139,36 @@ def all_reduce(d, nbytes):
     return t + 2.0 * d.lat if d.domains > 1 else t
 
 
-def decode_step(m, d, b, s):
-    routed_read = m.moe_layers * touched(m, b) / d.g * m.expert() * d.wb
+def decode_step(m, d, b, s, t=1.0):
+    tok = b * t
+    routed_read = m.moe_layers * touched(m, tok) / d.g * m.expert() * d.wb
     resident = m.resident() * d.wb / (1 if d.dp == 1 else d.g)
     mem = (routed_read + resident + kv_bytes(m, d, b, s)) / (d.bw * MEM_EFF)
     if d.dp == 1:
-        attn = seqs_per_group(d, b) * s / d.cp * m.layers * m.pair(True)
+        attn = seqs_per_group(d, b) * t * s / d.cp * m.layers * m.pair(True)
     else:
-        attn = b * s * m.layers * m.pair(True) / d.g
-    comp = (2.0 * m.active() * b / d.g + attn) / (d.peak() * MFU)
-    comm = m.moe_layers * all_to_all(m, d, b)
+        attn = tok * s * m.layers * m.pair(True) / d.g
+    comp = (2.0 * m.active() * tok / d.g + attn) / (d.peak() * MFU)
+    comm = m.moe_layers * all_to_all(m, d, tok)
     if d.dp == 0:
-        comm += m.layers * all_reduce(d, b * m.hidden * 2.0)
+        comm += m.layers * all_reduce(d, tok * m.hidden * 2.0)
     if d.cp > 1:
-        partial = seqs_per_group(d, b) * m.heads * (m.out_dim() + 2) * 4.0
+        partial = seqs_per_group(d, b) * t * m.heads * (m.out_dim() + 2) * 4.0
         comm += m.layers * ((d.cp - 1) / d.cp * partial / d.group_bw() + 2.0 * d.lat)
     return max(mem, comp) + comm + m.layers * LAYER_OVERHEAD
 
 
-def prefill_time(m, d, n):
-    flops = 2.0 * m.layer_active() * n + n * n / 2.0 * m.layers * m.pair(False)
+def prefill_time(m, d, n, hit=0.0):
+    fresh = n * (1.0 - hit)
+    old = n - fresh
+    flops = 2.0 * m.layer_active() * fresh + (fresh * old + fresh * fresh / 2.0) * m.layers * m.pair(False)
     comp = flops / (d.g * d.peak() * MFU)
     resident = m.resident() * d.wb / (1 if d.dp == 1 else d.g)
     mem = (m.routed() * d.wb / d.g + resident) / (d.bw * MEM_EFF)
-    comm = m.moe_layers * all_to_all(m, d, n)
+    comm = m.moe_layers * all_to_all(m, d, fresh)
     if d.dp == 0:
-        comm += m.layers * all_reduce(d, n * m.hidden * 2.0)
-    kv_layer = n * m.kv_elems() / m.layers * d.kb
+        comm += m.layers * all_reduce(d, fresh * m.hidden * 2.0)
+    kv_layer = fresh * m.kv_elems() / m.layers * d.kb
     comm += m.layers * ((d.g - 1.0) / d.g * kv_layer / d.group_bw() + 2.0 * d.lat)
     return max(mem, comp) + comm + m.layers * LAYER_OVERHEAD
 
@@ -173,8 +176,11 @@ def prefill_time(m, d, n):
 # The services of the test, by the tag of the placement lines: model, prompt, output, the target
 # for a token and for the first token. All have a largest batch of 1024.
 SERVICES = {
-    "placed": {0: (DS, 8192, 1024, 0.05, 5.0), 1: (GLM, 32768, 512, 0.05, 10.0)},
-    "pooled": {0: (DS, 32768, 512, 0.06, 0.5)},
+    "placed": {0: (DS, 8192, 1024, 0.05, 5.0, 1.0, 1.0, 0.0), 1: (GLM, 32768, 512, 0.05, 10.0, 1.0, 1.0, 0.0)},
+    "pooled": {0: (DS, 32768, 512, 0.06, 0.5, 1.0, 1.0, 0.0)},
+    # speculative decoding (2 tokens a step, 1.8 given) and half of each prompt cached
+    "spec0": {0: (DS, 8192, 1024, 0.03, 5.0, 2.0, 1.8, 0.5)},
+    "spec1": {0: (DS, 8192, 1024, 0.03, 5.0, 2.0, 1.8, 0.5)},
 }
 
 want = {
@@ -194,6 +200,9 @@ cut = Dep("B200", 1, 72, 1, 8, 1.0, 1.0, 0.0, 0.0)
 want["cost_cp8"] = [kv_bytes(DS, cut, 18, 1000000), decode_step(DS, cut, 18, 200000), prefill_time(DS, cut, 200000)]
 
 
+want["cost_spec"] = [decode_step(GLM, tg, 32, 8192, 2.0), decode_step(DS, cut, 18, 200000, 2.0), prefill_time(GLM, tg, 8192, 0.25)]
+
+
 def close(a, b):
     return abs(a - b) <= 1e-9 * max(abs(a), abs(b), 1e-300)
 
@@ -210,18 +219,18 @@ for line in sys.stdin:
         domains, gpd, dp, cp = (int(v) for v in f[3:7])
         wb, kb, cross, lat = (float(v) for v in f[7:11])
         batch, step, ttft, xfer, xnic, xs, xlat = int(f[11]), float(f[12]), float(f[13]), float(f[14]), float(f[15]), int(f[16]), float(f[17])
-        m, prompt, out, slo_tpot, slo_ttft = SERVICES[name][svc]
+        m, prompt, out, slo_tpot, slo_ttft, spec_t, spec_acc, hit = SERVICES[name][svc]
         dep = Dep(sku, domains, gpd, dp, cp, wb, kb, cross, lat)
         placed += 1
         ctx = prompt + out
 
         def ok(b):
             return (weight_bytes(m, dep) + kv_bytes(m, dep, b, ctx) <= USABLE * dep.hbm
-                    and decode_step(m, dep, b, prompt + out // 2) <= slo_tpot)
+                    and decode_step(m, dep, b, prompt + out // 2, spec_t) / spec_acc <= slo_tpot)
 
         if role in (0, 2):
             # The step is priced again, and the batch is the largest that fits and meets the target.
-            want_step = decode_step(m, dep, batch, prompt + out // 2)
+            want_step = decode_step(m, dep, batch, prompt + out // 2, spec_t) / spec_acc
             if not close(step, want_step):
                 print(f"FAIL: decode step {step} of {line.strip()} is {want_step} in Python")
                 failed += 1
@@ -229,7 +238,7 @@ for line in sys.stdin:
                 print(f"FAIL: batch {batch} is not the largest that fits and meets the target ({line.strip()})")
                 failed += 1
         if role == 0:
-            want_ttft = prefill_time(m, dep, prompt)
+            want_ttft = prefill_time(m, dep, prompt, hit)
             if not close(ttft, want_ttft):
                 print(f"FAIL: first token {ttft} of {line.strip()} is {want_ttft} in Python")
                 failed += 1
@@ -239,7 +248,7 @@ for line in sys.stdin:
             nic = min(dep.nic, xnic)
             streams = min(dep.g, xs)
             want_xfer = prompt * m.kv_elems() * dep.kb / (nic * streams) + xlat
-            want_ttft = prefill_time(m, dep, prompt) + want_xfer
+            want_ttft = prefill_time(m, dep, prompt, hit) + want_xfer
             if not (close(xfer, want_xfer) and close(ttft, want_ttft)):
                 print(f"FAIL: prefill replica {line.strip()} is priced {want_xfer} and {want_ttft} in Python")
                 failed += 1
