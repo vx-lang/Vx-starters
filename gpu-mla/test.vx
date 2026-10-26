@@ -1,0 +1,276 @@
+// Tests for gpu-mla: decode over a latent cache and causal prefill, each against attention in the
+// expanded form on the host (keys and values made from the latents with wuk and wuv, then plain
+// softmax attention), which is a different way to the same numbers. Decode has two sequences of
+// 150 and 61 positions (the longer one crosses the chunk of 128), with the last position of each
+// put there by `mla_append`. Prefill is 140 rows of the first sequence, each attending to its own
+// prefix. The latents grow with the position, so a later chunk raises the maximum. Returns the
+// number of failed checks, and prints "ok" when there are none. It also prints some outputs, which
+// check.py computes again in Python.
+//
+//   ./build.sh
+
+import core::convert;
+import core::num;
+import ops;
+
+const HEADS : i32 = 2;
+const DN : i32 = 16;
+const DV : i32 = 16;
+const STRIDE : i32 = 160;
+const SCALE : f32 = 0.5;
+
+fn c_val(s : i32, t : i32, j : i32) -> f32 {
+  return ((((t * 13 + j * 7 + s * 5) % 17) - 8) as f32) / 16.0 * (1.0 + (t as f32) / 50.0);
+}
+
+fn pe_val(s : i32, t : i32, d : i32) -> f32 {
+  return (((t * 3 + d * 5 + s) % 11 - 5) as f32) / 16.0;
+}
+
+fn qn_val(r : i32, h : i32, d : i32) -> f32 {
+  return (((r * 7 + h * 3 + d * 5) % 9 - 4) as f32) / 8.0;
+}
+
+fn qp_val(r : i32, h : i32, d : i32) -> f32 {
+  return (((r * 5 + h * 11 + d * 3) % 7 - 3) as f32) / 8.0;
+}
+
+fn wuk_val(h : i32, d : i32, j : i32) -> f32 {
+  return (((h * 3 + d * 5 + j * 11) % 13 - 6) as f32) / 16.0;
+}
+
+fn wuv_val(h : i32, j : i32, d : i32) -> f32 {
+  return (((h * 7 + j * 3 + d * 5) % 11 - 5) as f32) / 4.0;
+}
+
+fn abs(x : f32) -> f32 {
+  if x < 0.0 { return 0.0 - x; }
+  return x;
+}
+
+// The attention of row r, head h, over the first `len` positions of sequence s in the expanded
+// form. kn and vv hold the expanded keys and values: [(s * HEADS + h) * STRIDE + t][d].
+fn ref_row(out : &mut Tensor<f32, [16]>, kn : &Tensor<f32, [10240]>, vv : &Tensor<f32, [10240]>, r : i32, h : i32, s : i32, len : i32) -> void {
+  let mut sc = Tensor<f32, [160]>::new();
+  let mut top : f32 = -1000000000.0;
+  for t in 0..len {
+    let at = ((s * HEADS + h) * STRIDE + t) * DN;
+    let mut dot : f32 = 0.0;
+    for d in 0..DN { dot += qn_val(r, h, d) * kn[at + d]; }
+    for d in 0..64 { dot += qp_val(r, h, d) * pe_val(s, t, d); }
+    sc[t] = dot * SCALE;
+    if sc[t] > top { top = sc[t]; }
+  }
+  let mut z : f32 = 0.0;
+  for t in 0..len {
+    sc[t] = (sc[t] - top).exp();
+    z += sc[t];
+  }
+  for d in 0..DV {
+    let mut a : f32 = 0.0;
+    for t in 0..len { a += sc[t] * vv[((s * HEADS + h) * STRIDE + t) * DV + d]; }
+    out[d] = a / z;
+  }
+  return;
+}
+
+fn show(name : *const i8, a : i32, b : i32, c : i32) -> void {
+  print!(name);
+  print!(": ");
+  print!(a);
+  print!(" ");
+  print!(b);
+  print!(" ");
+  print!(c);
+  print!("\n");
+  return;
+}
+
+fn main() -> i32 {
+  let mut failed = 0;
+
+  // The weights, the expanded keys and values, and the cache for every position.
+  let mut wuk_h = Tensor<f32, [2, 16, 512]>::new();
+  let mut wuv_h = Tensor<f32, [2, 512, 16]>::new();
+  for h in 0..HEADS {
+    for d in 0..DN {
+      for j in 0..512 {
+        wuk_h[h][d][j] = wuk_val(h, d, j);
+        wuv_h[h][j][d] = wuv_val(h, j, d);
+      }
+    }
+  }
+  let mut kn = Tensor<f32, [10240]>::new();
+  let mut vv = Tensor<f32, [10240]>::new();
+  let mut cc_h = Tensor<f32, [163840]>::new();
+  let mut cpe_h = Tensor<f32, [20480]>::new();
+  let lens_final_0 = 150;
+  let lens_final_1 = 61;
+  for s in 0..2 {
+    let mut len = lens_final_0;
+    if s == 1 { len = lens_final_1; }
+    for t in 0..len {
+      for d in 0..64 { cpe_h[(s * STRIDE + t) * 64 + d] = pe_val(s, t, d); }
+      for j in 0..512 { cc_h[(s * STRIDE + t) * 512 + j] = c_val(s, t, j); }
+      for h in 0..HEADS {
+        for d in 0..DN {
+          let mut a : f32 = 0.0;
+          let mut b : f32 = 0.0;
+          for j in 0..512 {
+            a += c_val(s, t, j) * wuk_val(h, d, j);
+            b += c_val(s, t, j) * wuv_val(h, j, d);
+          }
+          kn[((s * HEADS + h) * STRIDE + t) * DN + d] = a;
+          vv[((s * HEADS + h) * STRIDE + t) * DV + d] = b;
+        }
+      }
+    }
+  }
+  // The device cache lacks the last position of each sequence; mla_append puts it there.
+  let mut cc_dev_h = Tensor<f32, [163840]>::new();
+  let mut cpe_dev_h = Tensor<f32, [20480]>::new();
+  for s in 0..2 {
+    let mut len = lens_final_0;
+    if s == 1 { len = lens_final_1; }
+    for t in 0..len - 1 {
+      for d in 0..64 { cpe_dev_h[(s * STRIDE + t) * 64 + d] = pe_val(s, t, d); }
+      for j in 0..512 { cc_dev_h[(s * STRIDE + t) * 512 + j] = c_val(s, t, j); }
+    }
+  }
+  let mut cc = transfer(cc_dev_h, Memory::HBM);
+  let mut cpe = transfer(cpe_dev_h, Memory::HBM);
+  let wuk = transfer(wuk_h, Memory::HBM);
+  let wuv = transfer(wuv_h, Memory::HBM);
+
+  // 1. Append the last position and advance the lengths.
+  let mut c_new_h = Tensor<f32, [2, 512]>::new();
+  let mut pe_new_h = Tensor<f32, [2, 64]>::new();
+  let mut lens_h = Tensor<i32, [2]>::new();
+  lens_h[0] = lens_final_0 - 1;
+  lens_h[1] = lens_final_1 - 1;
+  for j in 0..512 {
+    c_new_h[0][j] = c_val(0, lens_final_0 - 1, j);
+    c_new_h[1][j] = c_val(1, lens_final_1 - 1, j);
+  }
+  for d in 0..64 {
+    pe_new_h[0][d] = pe_val(0, lens_final_0 - 1, d);
+    pe_new_h[1][d] = pe_val(1, lens_final_1 - 1, d);
+  }
+  let c_new = transfer(c_new_h, Memory::HBM);
+  let pe_new = transfer(pe_new_h, Memory::HBM);
+  let mut lens = transfer(lens_h, Memory::HBM);
+  mla_append(&cc, &cpe, &c_new, &pe_new, &lens, 2, STRIDE);
+  mla_advance(&mut lens, 2);
+  let lens_back = transfer(lens, Memory::CPU_DRAM);
+  if lens_back[0] != lens_final_0 || lens_back[1] != lens_final_1 {
+    print!("  FAIL: lengths after advance are wrong\n");
+    failed += 1;
+  }
+  let cache_back = transfer(cc, Memory::CPU_DRAM);
+  let mut wrong_cache = 0;
+  for s in 0..2 {
+    let mut len = lens_final_0;
+    if s == 1 { len = lens_final_1; }
+    for j in 0..512 {
+      if cache_back[(s * STRIDE + len - 1) * 512 + j] != c_val(s, len - 1, j) { wrong_cache += 1; }
+    }
+  }
+  if wrong_cache > 0 {
+    print!("  FAIL: ");
+    print!(wrong_cache);
+    print!(" appended latents are wrong\n");
+    failed += 1;
+  }
+  let cc2 = transfer(cache_back, Memory::HBM);
+  let cpe_back = transfer(cpe, Memory::CPU_DRAM);
+  let cpe2 = transfer(cpe_back, Memory::HBM);
+  let lens2 = transfer(lens_back, Memory::HBM);
+
+  // 2. Decode: two rows, one for each sequence, qlen = the length.
+  let mut qn_h = Tensor<f32, [2, 2, 16]>::new();
+  let mut qp_h = Tensor<f32, [2, 2, 64]>::new();
+  let mut qseq_h = Tensor<i32, [2]>::new();
+  for r in 0..2 {
+    qseq_h[r] = r;
+    for h in 0..HEADS {
+      for d in 0..DN { qn_h[r][h][d] = qn_val(r, h, d); }
+      for d in 0..64 { qp_h[r][h][d] = qp_val(r, h, d); }
+    }
+  }
+  let qn = transfer(qn_h, Memory::HBM);
+  let qp = transfer(qp_h, Memory::HBM);
+  let qseq = transfer(qseq_h, Memory::HBM);
+  let mut qlat = transfer(Tensor<f32, [2, 2, 512]>::new(), Memory::HBM);
+  let mut olat = transfer(Tensor<f32, [2, 2, 512]>::new(), Memory::HBM);
+  let mut o = transfer(Tensor<f32, [2, 2, 16]>::new(), Memory::HBM);
+  mla_absorb_q(&mut qlat, &qn, &wuk, 2, HEADS, DN);
+  mla_attention(&mut olat, &qlat, &qp, &cc2, &cpe2, &qseq, &lens2, 2, HEADS, STRIDE, lens_final_0, SCALE);
+  mla_expand_out(&mut o, &olat, &wuv, 2, HEADS, DV);
+  let o_h = transfer(o, Memory::CPU_DRAM);
+  let mut worst : f32 = 0.0;
+  let mut want = Tensor<f32, [16]>::new();
+  for r in 0..2 {
+    let mut len = lens_final_0;
+    if r == 1 { len = lens_final_1; }
+    for h in 0..HEADS {
+      ref_row(&mut want, &kn, &vv, r, h, r, len);
+      for d in 0..DV {
+        let e = abs(o_h[r][h][d] - want[d]);
+        if e > worst { worst = e; }
+      }
+    }
+  }
+  show("decode", (o_h[0][0][0] * 1000.0) as i32, (o_h[0][1][5] * 1000.0) as i32, (o_h[1][1][15] * 1000.0) as i32);
+  if worst > 0.0001 {
+    print!("  FAIL: decode differs from the expanded form by ");
+    print!((worst * 1000000.0) as i32);
+    print!(" e-6\n");
+    failed += 1;
+  }
+
+  // 3. Prefill: 140 rows of sequence 0, row t attends to t + 1 positions.
+  let mut pqn_h = Tensor<f32, [140, 2, 16]>::new();
+  let mut pqp_h = Tensor<f32, [140, 2, 64]>::new();
+  let mut pseq_h = Tensor<i32, [140]>::new();
+  let mut plen_h = Tensor<i32, [140]>::new();
+  for r in 0..140 {
+    plen_h[r] = r + 1;
+    for h in 0..HEADS {
+      for d in 0..DN { pqn_h[r][h][d] = qn_val(r, h, d); }
+      for d in 0..64 { pqp_h[r][h][d] = qp_val(r, h, d); }
+    }
+  }
+  let pqn = transfer(pqn_h, Memory::HBM);
+  let pqp = transfer(pqp_h, Memory::HBM);
+  let pseq = transfer(pseq_h, Memory::HBM);
+  let plen = transfer(plen_h, Memory::HBM);
+  let mut pqlat = transfer(Tensor<f32, [140, 2, 512]>::new(), Memory::HBM);
+  let mut polat = transfer(Tensor<f32, [140, 2, 512]>::new(), Memory::HBM);
+  let mut po = transfer(Tensor<f32, [140, 2, 16]>::new(), Memory::HBM);
+  mla_absorb_q(&mut pqlat, &pqn, &wuk, 140, HEADS, DN);
+  mla_attention(&mut polat, &pqlat, &pqp, &cc2, &cpe2, &pseq, &plen, 140, HEADS, STRIDE, 140, SCALE);
+  mla_expand_out(&mut po, &polat, &wuv, 140, HEADS, DV);
+  let po_h = transfer(po, Memory::CPU_DRAM);
+  worst = 0.0;
+  for r in 0..140 {
+    for h in 0..HEADS {
+      ref_row(&mut want, &kn, &vv, r, h, 0, r + 1);
+      for d in 0..DV {
+        let e = abs(po_h[r][h][d] - want[d]);
+        if e > worst { worst = e; }
+      }
+    }
+  }
+  show("prefill", (po_h[0][0][0] * 1000.0) as i32, (po_h[70][1][3] * 1000.0) as i32, (po_h[139][0][9] * 1000.0) as i32);
+  if worst > 0.0001 {
+    print!("  FAIL: prefill differs from the expanded form by ");
+    print!((worst * 1000000.0) as i32);
+    print!(" e-6\n");
+    failed += 1;
+  }
+
+  if failed == 0 {
+    print!("ok\n");
+  }
+  return failed;
+}
