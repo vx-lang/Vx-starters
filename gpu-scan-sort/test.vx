@@ -1,0 +1,133 @@
+// Tests for gpu-scan-sort: the scan at sizes around the tile edges and the 65536 limit, the
+// histogram, and the radix sort (stable, with values) against a host stable sort. Returns the number of failed
+// checks, and prints "ok" when there are none. It also prints some entries, which check.py
+// computes again in Python.
+//
+//   ./build.sh
+
+import core::convert;
+import core::num;
+import ops;
+
+fn num_at(i : i32) -> i32 {
+  return (i * 37 + i / 7) % 11 - 3;
+}
+
+fn key_at(i : i32) -> i32 {
+  return (i * 73 + i / 5 * 11) % 256;
+}
+
+fn show(name : *const i8, a : i32, b : i32, c : i32) -> void {
+  print!(name);
+  print!(": ");
+  print!(a);
+  print!(" ");
+  print!(b);
+  print!(" ");
+  print!(c);
+  print!("\n");
+  return;
+}
+
+// Scans n numbers on the device and compares each with the host's running sum. Returns the failures.
+fn check_scan(name : *const i8, n : i32) -> i32 {
+  let mut inp_h = Tensor<i32, [65536]>::new();
+  for i in 0..n { inp_h[i] = num_at(i); }
+  let inp = transfer(inp_h, Memory::HBM);
+  let mut out = transfer(Tensor<i32, [65536]>::new(), Memory::HBM);
+  let mut sums = transfer(Tensor<i32, [256]>::new(), Memory::HBM);
+  let mut offs = transfer(Tensor<i32, [256]>::new(), Memory::HBM);
+  let mut top = transfer(Tensor<i32, [1]>::new(), Memory::HBM);
+  scan_exclusive(&mut out, &mut sums, &mut offs, &mut top, &inp, n);
+  let got = transfer(out, Memory::CPU_DRAM);
+  let mut run = 0;
+  let mut wrong = 0;
+  for i in 0..n {
+    if got[i] != run { wrong += 1; }
+    run += num_at(i);
+  }
+  show(name, got[n - 1], got[n / 2], got[0]);
+  if wrong > 0 {
+    print!("  FAIL: ");
+    print!(wrong);
+    print!(" sums differ\n");
+    return 1;
+  }
+  return 0;
+}
+
+fn main() -> i32 {
+  let mut failed = 0;
+  failed += check_scan("scan_1", 1);
+  failed += check_scan("scan_255", 255);
+  failed += check_scan("scan_256", 256);
+  failed += check_scan("scan_257", 257);
+  failed += check_scan("scan_5000", 5000);
+  failed += check_scan("scan_65536", 65536);
+
+  // Histogram of 5000 keys in 0..256.
+  let mut keys_h = Tensor<i32, [5000]>::new();
+  for i in 0..5000 { keys_h[i] = key_at(i); }
+  let keys_d = transfer(keys_h, Memory::HBM);
+  let bins = transfer(Tensor<i32, [256]>::new(), Memory::HBM);
+  histogram(&bins, &keys_d, 5000);
+  let bins_h = transfer(bins, Memory::CPU_DRAM);
+  let mut want = Tensor<i32, [256]>::new();
+  for i in 0..5000 { want[key_at(i)] += 1; }
+  let mut wrong = 0;
+  for b in 0..256 {
+    if bins_h[b] != want[b] { wrong += 1; }
+  }
+  show("histogram", bins_h[0], bins_h[100], bins_h[255]);
+  if wrong > 0 {
+    print!("  FAIL: ");
+    print!(wrong);
+    print!(" bins differ\n");
+    failed += 1;
+  }
+
+  // Radix sort of 5000 keys (8 bits, many equal) with their positions as values. The host sorts
+  // stably by insertion into a counting order: for each key, the ones before it.
+  let mut k_h = Tensor<i32, [5000]>::new();
+  let mut v_h = Tensor<i32, [5000]>::new();
+  for i in 0..5000 {
+    k_h[i] = key_at(i);
+    v_h[i] = i;
+  }
+  let mut k = transfer(k_h, Memory::HBM);
+  let mut v = transfer(v_h, Memory::HBM);
+  let mut tk = transfer(Tensor<i32, [5000]>::new(), Memory::HBM);
+  let mut tv = transfer(Tensor<i32, [5000]>::new(), Memory::HBM);
+  let mut zeros = transfer(Tensor<i32, [5000]>::new(), Memory::HBM);
+  let mut before = transfer(Tensor<i32, [5000]>::new(), Memory::HBM);
+  let mut sums = transfer(Tensor<i32, [256]>::new(), Memory::HBM);
+  let mut offs = transfer(Tensor<i32, [256]>::new(), Memory::HBM);
+  let mut top = transfer(Tensor<i32, [1]>::new(), Memory::HBM);
+  radix_sort(&mut k, &mut v, &mut tk, &mut tv, &mut zeros, &mut before, &mut sums, &mut offs, &mut top, 5000, 8);
+  let sk = transfer(k, Memory::CPU_DRAM);
+  let sv = transfer(v, Memory::CPU_DRAM);
+  // The expected position of entry i: the number of entries with a smaller key, plus the equal
+  // ones before it.
+  let mut start = Tensor<i32, [257]>::new();
+  for b in 0..256 { start[b + 1] = start[b] + want[b]; }
+  let mut seen = Tensor<i32, [256]>::new();
+  let mut wrong_pos = 0;
+  for i in 0..5000 {
+    let key = key_at(i);
+    let pos = start[key] + seen[key];
+    seen[key] += 1;
+    if sk[pos] != key || sv[pos] != i { wrong_pos += 1; }
+  }
+  show("sort", sk[0], sk[2500], sv[4999]);
+  if wrong_pos > 0 {
+    print!("  FAIL: ");
+    print!(wrong_pos);
+    print!(" entries are not where a stable sort puts them\n");
+    failed += 1;
+  }
+
+  if failed == 0 {
+    print!("ok\n");
+  }
+  return failed;
+}
