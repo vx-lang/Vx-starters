@@ -28,6 +28,7 @@ Plain host code: no GPU and no CUDA. Every figure is an estimate (see *What it i
 | `fleet.vx` | A fleet: a vertex for each domain, one leaf switch for each group of domains, one spine, with the leaf-to-spine links cut by an oversubscription factor. `group_bandwidth` and `group_latency` of a set of domains read off the graph, with a leaf link shared by the members under it; `pick_group` chooses domains of one class that are as close as the graph allows |
 | `model.vx` | `Model`: layers, dense layers, hidden size, MLA or GQA attention, experts. Parameter counts, KV size of a token, and the attention FLOPs of a query-key pair all follow from those fields. `deepseek_v3()` and `glm_4_5()` |
 | `cost.vx` | `Deploy`: a group of whole domains, attention data or tensor parallel, a context-parallel degree, number formats. `fits`, `decode_step` and `prefill_time` |
+| `emit.vx`, `admit.py` | The bridge to the compiler (below): what the planner believes, printed as lines, and a Vx program for each, compiled against the machine files of the toolchain |
 | `plan.vx` | `Service` (model, request rate, prompt, output, targets for time per token and time to first token, and whether it is served co-located or on separate prefill and decode pools); `evaluate`, `evaluate_prefill`, `evaluate_decode`, `best_role`, `schedule` |
 
 ## The cost model
@@ -141,6 +142,43 @@ not the best split of the fleet.
    share one cache format.
 7. **Python.** `check.py` prices the same layouts again from the architectures and the formulas,
    written out a second time, and every placement of the schedule too; they agree to 1e-9.
+
+## The compiler checks the planner
+
+A planner written in plain code is only as good as its arithmetic. The Vx compiler already knows the
+hardware: the machine files in the toolchain's `fleet/` declare each SKU's memory, its number formats
+and the rate of every link, and `vxc --machine` admits or refuses a program against them (E6010: the
+resident set is over capacity) and prices its transfers. `./build.sh` makes the compiler the second
+opinion:
+
+* **Memory.** For 238 layouts and placements `emit.vx` prints the resident set of one GPU (weights,
+  cache) and whether `fits` says it fits. `admit.py` writes a Vx program that places tensors of those
+  sizes in `Memory::HBM` of the SKU, plus a reserve for the part of HBM a deployment does not use (the
+  planner's 10%; the machine files leave that policy to the admission program), compiles it with
+  `vxc --machine fleet/<sku>.vx`, and requires the same verdict: admitted exactly when `fits`
+  says so, with E6010 when not, and the compiler's count of resident bytes equal to the program's.
+  The layouts are a sweep (SKU, nodes, attention parallelism, context parallelism, formats, context
+  of 8k and 256k) at the largest batch that fits and the next one, plus every placement of the
+  mixed-fleet and pool scenarios.
+* **Hardware table.** `hw.vx` and the machine files must agree on HBM to the byte (A100-80 85899345920,
+  H200 151397597184, B200 192265846784).
+* **Number formats.** The compiler refuses fp8 tensors on an A100 (E6026: the file declares no
+  `f8e4m3`) and admits int8. So the 1-byte format of a layout is fp8 where the GPU has fp8 cores
+  and int8 weight-only where it has not, and the programs are written that way; compute on an A100
+  runs at the bf16 rate either way, as `cost.vx` has it.
+* **The wire.** For 19 cache transfers `admit.py` generates a machine file for each node (the SKU's
+  own file plus NVLink, PCIe and NIC links at the rates of `hw.vx`), sends a tensor of the bytes one
+  GPU sends from HBM to `Memory::Remote_HBM`, and reads the time the compiler derives for the NIC hop
+  (`derived_cost`, in picoseconds). It must be the planner's wire time, `bytes / (NIC x streams)`
+  with the slower NIC of the two sides, to 1e-9.
+
+This checks the planner's *thresholds* and *prices* against the compiler's; it does not check how
+the planner arrives at the weight bytes of a layout (the tests do, by hand sums). The compiler also
+prices the whole path with each hop in turn (GPU to NIC at PCIe rate, then the NIC): the planner
+counts only the wire, as the transfer is pipelined, so the compiler's sum is an upper bound.
+
+I broke the bridge five ways (a wrong HBM size, the cache split over one NIC instead of all, `fits`
+without the weights, with the wrong comparison, with the whole of HBM as the limit); each fails.
 
 ## What it is not
 

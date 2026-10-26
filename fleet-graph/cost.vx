@@ -58,7 +58,7 @@ fn layer_overhead() -> f64 {
   return 0.00003f64;
 }
 
-fn usable() -> f64 {
+pub fn usable() -> f64 {
   return 0.9f64;
 }
 
