@@ -8,20 +8,35 @@
 //      the weight and cache number formats the service allows). `evaluate` prices it with the
 //      cost model: the largest batch that fits in memory and meets the TPOT target, the TTFT, and
 //      from them the requests per second one replica serves and what a request costs.
-//   3. `best_for` tries every candidate the free part of the fleet can offer (the groups come
-//      from the graph, so their bandwidth is what the wiring gives) and takes the cheapest
-//      request that meets both targets; ties go to the first found.
-//   4. `schedule` places the services one at a time, the most demanding first (the one whose
-//      best candidate needs the most GPUs), a replica at a time, until the rate is met or
-//      nothing feasible is left; what is not met is reported.
+//   3. `best_role` tries every candidate the free part of the fleet can offer (the groups come
+//      from the graph, so their bandwidth is what the wiring gives) and takes the one that covers
+//      the rate still needed for the least an hour, in whole replicas (`price`); then the one
+//      with the cheaper request; ties go to the first found.
+//   4. `schedule` places the services one at a time, a replica at a time, until the rate is met
+//      or nothing feasible is left; what is not met is reported.
+//
+// A service is served in one of two ways, and its `mode` says which (or lets the scheduler pick):
+//
+//   * Co-located (role 0). A replica does its prefills and its decode steps in turns (no overlap),
+//     so it serves 1 / (ttft + out * step / batch) requests a second. Decode is costed at the
+//     average context (prompt + out / 2), memory at the largest (prompt + out).
+//   * Disaggregated. The prompt is read on a pool of prefill replicas (role 1), its KV cache is sent
+//     over the network, and the tokens are written on a pool of decode replicas (role 2). The pools
+//     are chosen separately, so each can sit on the GPUs that suit it (prefill is arithmetic and
+//     wants FLOP/s; decode is memory traffic and wants HBM and bandwidth) and be split its own way.
+//     A prefill replica serves 1 / prefill_time requests a second and a decode replica
+//     batch / (out * step), and no prefill steals a decode step. The first token comes after the
+//     prefill and the transfer of the prompt's cache, which crosses the network at the slower NIC
+//     of the two sides, over as many GPUs in parallel as the smaller side has. The decode pool
+//     comes first and fixes the cache format; a prefill pool uses the same one, for the rate the decode pool
+//     can take; if no prefill replica fits, the decode replicas are given back. The two pools are
+//     grown together, the one with less capacity getting the next replica, so that neither takes
+//     every domain the other needs.
 //
 // It is a greedy: the first services take the best of what is free and the later ones may be
-// left with worse. `schedule` makes no promise of the best total, only that every placement
-// meets its targets and that no domain is used twice.
-//
-// A replica does its prefills and its decode steps in turns (no overlap), so it serves
-// 1 / (ttft + out * step / batch) requests a second. Decode is costed at the average context
-// (prompt + out / 2), memory at the largest (prompt + out).
+// left with worse. `schedule` tries the orders of up to five services and keeps the best plan, but
+// makes no promise of the best total, only that every placement meets its targets and that no
+// domain is used twice.
 
 import core::convert;
 import core::num;
@@ -41,6 +56,7 @@ struct Service {
   min_wb : f64,        // the smallest bytes per weight the service accepts: 2 = bf16 only, 1 = fp8 too
   kv_fp8 : i32,        // 1 if an fp8 cache is acceptable
   bmax : i32,
+  mode : i32,          // 0 = co-located, 1 = disaggregated, 2 = whichever leaves less unmet and costs less
 }
 
 impl Copy for Service {}
@@ -48,12 +64,16 @@ impl Copy for Service {}
 struct Candidate {
   ok : i32,
   dep : Deploy,
-  batch : i32,
-  step : f64,
-  ttft : f64,
+  batch : i32,         // decode batch (0 for a prefill replica)
+  step : f64,          // decode step (0 for a prefill replica)
+  ttft : f64,          // time to the first token; for a prefill replica, prefill plus transfer
   rate : f64,          // requests/s one replica serves
   cost_hr : f64,
   per_req : f64,       // cost units per request
+  xfer : f64,          // prefill replica: seconds to send the prompt's cache to the decode pool
+  xnic : f64,          // ... the decode pool's NIC rate per GPU it was priced against
+  xs : i32,            // ... and its GPUs per replica (the most GPUs that can send in parallel)
+  xlat : f64,          // ... and the latency to it
 }
 
 impl Copy for Candidate {}
@@ -63,8 +83,10 @@ struct Pick {
   members : Vec<i32>,
 }
 
+// role: 0 = co-located, 1 = prefill, 2 = decode.
 struct Placement {
   svc : i32,
+  role : i32,
   cand : Candidate,
   mstart : i32,        // this placement's domains are plan.members[mstart .. mstart + mcount]
   mcount : i32,
@@ -85,11 +107,16 @@ fn fl(x : i32) -> f64 {
 }
 
 pub fn make_service(m : Model, qps : f64, prompt : i32, out : i32, slo_tpot : f64, slo_ttft : f64, min_wb : f64, kv_fp8 : i32, bmax : i32) -> Service {
-  return Service { model: m, qps: qps, prompt: prompt, out: out, slo_tpot: slo_tpot, slo_ttft: slo_ttft, min_wb: min_wb, kv_fp8: kv_fp8, bmax: bmax };
+  return Service { model: m, qps: qps, prompt: prompt, out: out, slo_tpot: slo_tpot, slo_ttft: slo_ttft, min_wb: min_wb, kv_fp8: kv_fp8, bmax: bmax, mode: 0 };
+}
+
+// The same service served another way: 0 co-located, 1 disaggregated, 2 whichever is better.
+pub fn with_mode(s : Service, mode : i32) -> Service {
+  return Service { model: s.model, qps: s.qps, prompt: s.prompt, out: s.out, slo_tpot: s.slo_tpot, slo_ttft: s.slo_ttft, min_wb: s.min_wb, kv_fp8: s.kv_fp8, bmax: s.bmax, mode: mode };
 }
 
 fn no_candidate(dep : Deploy) -> Candidate {
-  return Candidate { ok: 0, dep: dep, batch: 0, step: 0.0f64, ttft: 0.0f64, rate: 0.0f64, cost_hr: 0.0f64, per_req: 0.0f64 };
+  return Candidate { ok: 0, dep: dep, batch: 0, step: 0.0f64, ttft: 0.0f64, rate: 0.0f64, cost_hr: 0.0f64, per_req: 0.0f64, xfer: 0.0f64, xnic: 0.0f64, xs: 0, xlat: 0.0f64 };
 }
 
 // Can the deployment run the service at batch b: it fits, and a step meets the TPOT target.
@@ -99,17 +126,12 @@ fn batch_ok(s : Service, dep : Deploy, b : i32) -> bool {
   return fits(s.model, dep, b, ctx) && decode_step(s.model, dep, b, avg) <= s.slo_tpot;
 }
 
-// Prices one deployment for one service.
-pub fn evaluate(s : Service, dep : Deploy) -> Candidate {
+// The largest batch that is ok (it is ok for the smaller ones: memory and step time only grow with
+// the batch); 0 if even 1 is not.
+fn largest_batch(s : Service, dep : Deploy) -> i32 {
   if !batch_ok(s, dep, 1) {
-    return no_candidate(dep);
+    return 0;
   }
-  let ttft = prefill_time(s.model, dep, s.prompt);
-  if ttft > s.slo_ttft {
-    return no_candidate(dep);
-  }
-  // The largest batch that is still ok (ok is true for smaller ones: memory and step time only
-  // grow with the batch).
   let mut lo = 1;
   let mut hi = s.bmax + 1;
   while hi - lo > 1 {
@@ -120,21 +142,120 @@ pub fn evaluate(s : Service, dep : Deploy) -> Candidate {
       hi = mid;
     }
   }
+  return lo;
+}
+
+// Prices one deployment for one service, prefill and decode co-located.
+pub fn evaluate(s : Service, dep : Deploy) -> Candidate {
+  let lo = largest_batch(s, dep);
+  if lo == 0 {
+    return no_candidate(dep);
+  }
+  let ttft = prefill_time(s.model, dep, s.prompt);
+  if ttft > s.slo_ttft {
+    return no_candidate(dep);
+  }
   let avg = s.prompt + s.out / 2;
   let step = decode_step(s.model, dep, lo, avg);
   let rate = 1.0f64 / (ttft + fl(s.out) * step / fl(lo));
   let cost_hr = fl(gpus(dep)) * dep.sku.cost;
-  return Candidate { ok: 1, dep: dep, batch: lo, step: step, ttft: ttft, rate: rate, cost_hr: cost_hr, per_req: cost_hr / 3600.0f64 / rate };
+  return Candidate { ok: 1, dep: dep, batch: lo, step: step, ttft: ttft, rate: rate, cost_hr: cost_hr, per_req: cost_hr / 3600.0f64 / rate, xfer: 0.0f64, xnic: 0.0f64, xs: 0, xlat: 0.0f64 };
 }
 
-// The cheapest candidate on `members` (a group of domains of one class), over the ways to split
-// the model. `none` if there is none.
-pub fn best_on(s : Service, f : &Fleet, members : &Vec<i32>, best : Candidate) -> Candidate {
+// Prices a decode replica of a disaggregated service: no prefill steals a step, so it serves
+// batch / (out * step) requests a second.
+pub fn evaluate_decode(s : Service, dep : Deploy) -> Candidate {
+  let lo = largest_batch(s, dep);
+  if lo == 0 {
+    return no_candidate(dep);
+  }
+  let avg = s.prompt + s.out / 2;
+  let step = decode_step(s.model, dep, lo, avg);
+  let rate = fl(lo) / (fl(s.out) * step);
+  let cost_hr = fl(gpus(dep)) * dep.sku.cost;
+  return Candidate { ok: 1, dep: dep, batch: lo, step: step, ttft: 0.0f64, rate: rate, cost_hr: cost_hr, per_req: cost_hr / 3600.0f64 / rate, xfer: 0.0f64, xnic: 0.0f64, xs: 0, xlat: 0.0f64 };
+}
+
+// Seconds to send the cache of a prompt (entries of `kb` bytes) over `streams` GPUs in parallel
+// at `nic` bytes/s each, plus the latency.
+pub fn kv_transfer(s : Service, kb : f64, nic : f64, streams : i32, lat : f64) -> f64 {
+  return fl(s.prompt) * kv_elems(s.model) * kb / (nic * fl(streams)) + lat;
+}
+
+// Prices a prefill replica of a disaggregated service, sending the cache to a decode pool whose
+// replicas have `xs` GPUs and a NIC of `xnic` bytes/s a GPU, `xlat` seconds away. It serves
+// 1 / prefill_time requests a second; the first token waits for the prefill and the transfer.
+pub fn evaluate_prefill(s : Service, dep : Deploy, xnic : f64, xs : i32, xlat : f64) -> Candidate {
+  if !fits(s.model, dep, 1, s.prompt) {
+    return no_candidate(dep);
+  }
+  let tp = prefill_time(s.model, dep, s.prompt);
+  let streams = min_i(gpus(dep), xs);
+  let nic = dep.sku.nic.min(xnic);
+  let xfer = kv_transfer(s, dep.kb, nic, streams, xlat);
+  if tp + xfer > s.slo_ttft {
+    return no_candidate(dep);
+  }
+  let cost_hr = fl(gpus(dep)) * dep.sku.cost;
+  let rate = 1.0f64 / tp;
+  return Candidate { ok: 1, dep: dep, batch: 0, step: 0.0f64, ttft: tp + xfer, rate: rate, cost_hr: cost_hr, per_req: cost_hr / 3600.0f64 / rate, xfer: xfer, xnic: xnic, xs: xs, xlat: xlat };
+}
+
+// What it costs an hour to meet `need` requests a second with replicas of this candidate: a whole
+// number of them, since a domain is not shared. A rack that could serve a hundred times the rate
+// still costs a whole rack.
+pub fn price(c : Candidate, need : f64) -> f64 {
+  return c.cost_hr * (need / c.rate).ceil();
+}
+
+// Is candidate a a better buy than b for `need` requests a second: it costs less to cover the need,
+// or the same and each request costs less.
+pub fn better(a : Candidate, b : Candidate, need : f64) -> bool {
+  if b.ok == 0 {
+    return a.ok == 1;
+  }
+  if a.ok == 0 {
+    return false;
+  }
+  let pa = price(a, need);
+  let pb = price(b, need);
+  return pa < pb - 0.000000001f64 || (pa < pb + 0.000000001f64 && a.per_req < b.per_req);
+}
+
+fn min_i(a : i32, b : i32) -> i32 {
+  if a < b {
+    return a;
+  }
+  return b;
+}
+
+// What a pool of one role must agree with: the cache format (0 = free to choose), and for a
+// prefill pool the decode pool it sends to.
+struct Peer {
+  kb : f64,
+  xnic : f64,
+  xs : i32,
+  dref : i32,          // a domain of the decode pool, -1 if none
+}
+
+impl Copy for Peer {}
+
+pub fn no_peer() -> Peer {
+  return Peer { kb: 0.0f64, xnic: 0.0f64, xs: 0, dref: 0 - 1 };
+}
+
+// The cheapest candidate of the given role on `members` (a group of domains of one class), over the
+// ways to split the model, if it beats `best`.
+pub fn best_on_role(s : Service, f : &Fleet, members : &Vec<i32>, best : Candidate, role : i32, peer : Peer, need : f64) -> Candidate {
   let proto = domain(f, members.get(0));
   let m = members.len();
   let cross = group_bandwidth(f, members);
   let lat = group_latency(f, members);
   let g = m * proto.gpus;
+  let mut xlat = 0.0f64;
+  if peer.dref >= 0 {
+    xlat = latency_between(f, members.get(0), peer.dref);
+  }
   let mut out = best;
   let mut dp = 1;
   while dp >= 0 {
@@ -146,10 +267,19 @@ pub fn best_on(s : Service, f : &Fleet, members : &Vec<i32>, best : Candidate) -
           if wb >= s.min_wb {
             let mut kb = 2.0f64;
             while kb >= 0.9f64 {
-              if kb > 1.5f64 || s.kv_fp8 == 1 {
+              if (kb > 1.5f64 || s.kv_fp8 == 1) && (peer.kb < 0.5f64 || kb == peer.kb) {
                 let dep = Deploy { sku: proto.sku, domains: m, gpd: proto.gpus, dp: dp, cp: cp, wb: wb, kb: kb, cross: cross, lat: lat };
-                let c = evaluate(s, dep);
-                if c.ok == 1 && (out.ok == 0 || c.per_req < out.per_req) {
+                let mut c = no_candidate(dep);
+                if role == 0 {
+                  c = evaluate(s, dep);
+                }
+                if role == 2 && (peer.dref < 0 || (dep.sku.nic >= peer.xnic && gpus(dep) >= peer.xs)) {
+                  c = evaluate_decode(s, dep);
+                }
+                if role == 1 {
+                  c = evaluate_prefill(s, dep, peer.xnic, peer.xs, xlat);
+                }
+                if better(c, out, need) {
                   out = c;
                 }
               }
@@ -166,8 +296,13 @@ pub fn best_on(s : Service, f : &Fleet, members : &Vec<i32>, best : Candidate) -
   return out;
 }
 
-// The best candidate the free domains can offer for a service, with the domains it would use.
-pub fn best_for(s : Service, f : &Fleet, free : &Vec<i32>) -> Pick {
+// The cheapest co-located candidate on `members`.
+pub fn best_on(s : Service, f : &Fleet, members : &Vec<i32>, best : Candidate) -> Candidate {
+  return best_on_role(s, f, members, best, 0, no_peer(), s.qps);
+}
+
+// The best candidate of a role the free domains can offer for a service, with the domains it would use.
+pub fn best_role(s : Service, f : &Fleet, free : &Vec<i32>, role : i32, peer : Peer, need : f64) -> Pick {
   let n = count(f);
   let mut best = no_candidate(Deploy { sku: domain(f, 0).sku, domains: 0, gpd: 0, dp: 0, cp: 1, wb: 2.0f64, kb: 2.0f64, cross: 0.0f64, lat: 0.0f64 });
   let mut best_members = Vec<i32>::with_capacity(1);
@@ -190,8 +325,8 @@ pub fn best_for(s : Service, f : &Fleet, free : &Vec<i32>) -> Pick {
       while m <= avail && m <= 16 {
         let group = pick_group(f, i, m, free);
         if group.len() == m {
-          let c = best_on(s, f, &group, best);
-          if c.ok == 1 && (best.ok == 0 || c.per_req < best.per_req) {
+          let c = best_on_role(s, f, &group, best, role, peer, need);
+          if better(c, best, need) {
             best = c;
             best_members = group;
           }
@@ -203,48 +338,181 @@ pub fn best_for(s : Service, f : &Fleet, free : &Vec<i32>) -> Pick {
   return Pick { cand: best, members: best_members };
 }
 
-// The GPUs the best candidate for the service needs, on an empty fleet; 0 if there is none.
+// The best co-located candidate the free domains can offer for a service.
+pub fn best_for(s : Service, f : &Fleet, free : &Vec<i32>) -> Pick {
+  return best_role(s, f, free, 0, no_peer(), s.qps);
+}
+
+// The GPUs the best co-located candidate for the service needs, on an empty fleet; 0 if there is
+// none. It orders the services for the first try of `schedule`, whatever their mode.
 fn demand_size(s : Service, f : &Fleet) -> i32 {
   let mut free = Vec<i32>::with_capacity(count(f));
   for i in 0..count(f) {
     free.push(1);
   }
-  let p = best_for(s, f, &free);
+  let p = best_role(s, f, &free, 0, no_peer(), s.qps);
   if p.cand.ok == 0 {
     return 0;
   }
   return gpus(p.cand.dep);
 }
 
-// Places the services, a service at a time in the given order.
-pub fn schedule_in_order(f : &Fleet, svcs : &Vec<Service>, order : &Vec<i32>) -> Plan {
-  let ns = svcs.len();
-  let mut plan = Plan { places: Vec<Placement>::with_capacity(8), members: Vec<i32>::with_capacity(8), free: Vec<i32>::with_capacity(count(f)), unmet: Vec<f64>::with_capacity(ns) };
+pub fn new_plan(f : &Fleet, svcs : &Vec<Service>) -> Plan {
+  let mut plan = Plan { places: Vec<Placement>::with_capacity(8), members: Vec<i32>::with_capacity(8), free: Vec<i32>::with_capacity(count(f)), unmet: Vec<f64>::with_capacity(svcs.len()) };
   for i in 0..count(f) {
     plan.free.push(1);
   }
-  for k in 0..ns {
+  for k in 0..svcs.len() {
     plan.unmet.push(svcs.get(k).qps);
   }
+  return plan;
+}
+
+fn clone_plan(p : &Plan) -> Plan {
+  let mut q = Plan { places: Vec<Placement>::with_capacity(8), members: Vec<i32>::with_capacity(8), free: Vec<i32>::with_capacity(p.free.len()), unmet: Vec<f64>::with_capacity(p.unmet.len()) };
+  for i in 0..p.places.len() {
+    q.places.push(p.places.get(i));
+  }
+  for i in 0..p.members.len() {
+    q.members.push(p.members.get(i));
+  }
+  for i in 0..p.free.len() {
+    q.free.push(p.free.get(i));
+  }
+  for i in 0..p.unmet.len() {
+    q.unmet.push(p.unmet.get(i));
+  }
+  return q;
+}
+
+// Adds a placement of service k and takes its domains.
+fn take(plan : &mut Plan, k : i32, role : i32, p : Pick, served : f64) -> void {
+  let start = plan.members.len();
+  for x in 0..p.members.len() {
+    plan.members.push(p.members.get(x));
+    plan.free.set(p.members.get(x), 0);
+  }
+  plan.places.push(Placement { svc: k, role: role, cand: p.cand, mstart: start, mcount: p.members.len(), served: served });
+  return;
+}
+
+// Serves service k co-located, a replica at a time.
+fn place_colocated(plan : &mut Plan, f : &Fleet, s : Service, k : i32) -> void {
+  let mut left = s.qps;
+  while left > 0.000000001f64 {
+    let p = best_role(s, f, &plan.free, 0, no_peer(), left);
+    if p.cand.ok == 0 {
+      break;
+    }
+    let served = left.min(p.cand.rate);
+    take(plan, k, 0, p, served);
+    left = left - served;
+  }
+  plan.unmet.set(k, left.max(0.0f64));
+  return;
+}
+
+// Serves service k with a decode pool and a prefill pool, grown together: the pool with less
+// capacity gets the next replica (decode first), so neither takes every domain the other needs. The
+// first decode replica fixes the cache format and the transfer the prefill replicas are priced
+// against; later decode replicas must be no worse for the transfer (a NIC at least as fast, at
+// least as many GPUs). A prefill replica only counts up to what the decode pool can take. If no
+// prefill replica fits at all, the decode replicas are given back.
+fn place_disaggregated(plan : &mut Plan, f : &Fleet, s : Service, k : i32) -> void {
+  let before = clone_plan(plan);
+  let mut peer = no_peer();
+  let mut cap_d = 0.0f64;
+  let mut cap_p = 0.0f64;
+  let mut going = true;
+  while going {
+    going = false;
+    let useful_d = cap_d < s.qps - 0.000000001f64;
+    let useful_p = cap_p < s.qps.min(cap_d) - 0.000000001f64;
+    let mut decode_first = cap_d <= cap_p;
+    if !useful_p {
+      decode_first = true;
+    }
+    if !useful_d {
+      decode_first = false;
+    }
+    let mut round = 0;
+    while round < 2 && !going {
+      let want_decode = (round == 0) == decode_first;
+      if want_decode && useful_d {
+        let p = best_role(s, f, &plan.free, 2, peer, s.qps - cap_d);
+        if p.cand.ok == 1 {
+          let served = (s.qps - cap_d).min(p.cand.rate);
+          if peer.dref < 0 {
+            peer.dref = p.members.get(0);
+            peer.kb = p.cand.dep.kb;
+            peer.xnic = p.cand.dep.sku.nic;
+            peer.xs = gpus(p.cand.dep);
+          }
+          take(plan, k, 2, p, served);
+          cap_d = cap_d + served;
+          going = true;
+        }
+      }
+      if !want_decode && useful_p {
+        let p = best_role(s, f, &plan.free, 1, peer, s.qps - cap_p);
+        if p.cand.ok == 1 {
+          let served = (s.qps.min(cap_d) - cap_p).min(p.cand.rate);
+          take(plan, k, 1, p, served);
+          cap_p = cap_p + served;
+          going = true;
+        }
+      }
+      round += 1;
+    }
+  }
+  if cap_p <= 0.000000001f64 {
+    // Decode replicas with no prefill in front of them are no use: give them back.
+    plan.places = before.places;
+    plan.members = before.members;
+    plan.free = before.free;
+    plan.unmet.set(k, s.qps);
+    return;
+  }
+  // cap_p never passes cap_d, so the prefill pool sets what is met.
+  plan.unmet.set(k, (s.qps - cap_p).max(0.0f64));
+  return;
+}
+
+// What the placements cost per hour.
+pub fn spend(p : &Plan) -> f64 {
+  let mut t = 0.0f64;
+  for i in 0..p.places.len() {
+    t = t + p.places.get(i).cand.cost_hr;
+  }
+  return t;
+}
+
+// Places the services, a service at a time in the given order, each the way its mode says. In
+// mode 2 both ways are tried and the one that leaves less of the service unmet wins (then the one
+// that costs less an hour; then the co-located).
+pub fn schedule_in_order(f : &Fleet, svcs : &Vec<Service>, order : &Vec<i32>) -> Plan {
+  let ns = svcs.len();
+  let mut plan = new_plan(f, svcs);
   for o in 0..ns {
     let k = order.get(o);
     let s = svcs.get(k);
-    let mut left = s.qps;
-    while left > 0.000000001f64 {
-      let p = best_for(s, f, &plan.free);
-      if p.cand.ok == 0 {
-        break;
-      }
-      let served = left.min(p.cand.rate);
-      let start = plan.members.len();
-      for x in 0..p.members.len() {
-        plan.members.push(p.members.get(x));
-        plan.free.set(p.members.get(x), 0);
-      }
-      plan.places.push(Placement { svc: k, cand: p.cand, mstart: start, mcount: p.members.len(), served: served });
-      left = left - served;
+    if s.mode == 0 {
+      place_colocated(&mut plan, f, s, k);
     }
-    plan.unmet.set(k, left.max(0.0f64));
+    if s.mode == 1 {
+      place_disaggregated(&mut plan, f, s, k);
+    }
+    if s.mode == 2 {
+      let mut a = clone_plan(&plan);
+      place_colocated(&mut a, f, s, k);
+      let mut b = clone_plan(&plan);
+      place_disaggregated(&mut b, f, s, k);
+      if b.unmet.get(k) < a.unmet.get(k) - 0.000000001f64 || (b.unmet.get(k) < a.unmet.get(k) + 0.000000001f64 && spend(&b) < spend(&a)) {
+        plan = b;
+      } else {
+        plan = a;
+      }
+    }
   }
   return plan;
 }
@@ -254,15 +522,6 @@ pub fn shortfall(svcs : &Vec<Service>, p : &Plan) -> f64 {
   let mut t = 0.0f64;
   for k in 0..svcs.len() {
     t = t + p.unmet.get(k) / svcs.get(k).qps;
-  }
-  return t;
-}
-
-// What the placements cost per hour.
-pub fn spend(p : &Plan) -> f64 {
-  let mut t = 0.0f64;
-  for i in 0..p.places.len() {
-    t = t + p.places.get(i).cand.cost_hr;
   }
   return t;
 }
