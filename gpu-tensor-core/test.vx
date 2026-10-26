@@ -1,0 +1,126 @@
+// Tests for gpu-tensor-core: C = A @ B for f32, f16 and bf16 on a 16 x 48 by 48 x 32 product, and
+// a chain of two products, against plain host loops. The data is small whole numbers (0, 1, 2),
+// so every sum is at most 96 (and the chain's at most 4592, in f32 only) and exact in all three types, whatever order and precision the
+// device adds in. Returns the number of failed checks, and prints "ok" when there are none. It
+// also prints three entries of each result, which check.py computes again in Python.
+//
+//   ./build.sh
+
+import core::convert;
+import matmul;
+
+macro_rules a_val { ($i : expr, $k : expr) => { ((($i) * 7 + ($k) * ($k) + 1) % 3) as f32 }; }
+macro_rules b_val { ($k : expr, $j : expr) => { ((($k) * 5 + ($j) * ($j) + ($k) * ($j)) % 3) as f32 }; }
+macro_rules e_val { ($j : expr, $l : expr) => { ((($j) * ($j) + ($l) * 5 + ($j)) % 3) as f32 }; }
+
+// Stamps a test of one element type: fills A and B, multiplies on the device, and compares every
+// entry of C with a host loop.
+macro_rules stamp_test {
+  ($name : ident, $t : ident, $label : expr) => {
+    fn $name() -> i32 {
+      let mut a_h = unsafe { Tensor<$t, [16, 48]>::uninit() };
+      let mut b_h = unsafe { Tensor<$t, [48, 32]>::uninit() };
+      for i in 0..16 {
+        for k in 0..48 { a_h[i][k] = a_val!(i, k) as $t; }
+      }
+      for k in 0..48 {
+        for j in 0..32 { b_h[k][j] = b_val!(k, j) as $t; }
+      }
+      let ga = transfer(a_h, Memory::HBM);
+      let gb = transfer(b_h, Memory::HBM);
+      let mut gc = unsafe { Tensor<$t, [16, 32], Memory::HBM>::uninit() };
+      matmul_into!(gc, ga, gb);
+      let c = transfer(gc, Memory::CPU_DRAM);
+      let mut wrong = 0;
+      for i in 0..16 {
+        for j in 0..32 {
+          let mut s : f32 = 0.0;
+          for k in 0..48 { s += a_val!(i, k) * b_val!(k, j); }
+          let got = c[i][j] as f32;
+          if got != s { wrong += 1; }
+        }
+      }
+      print!($label);
+      print!(": ");
+      print!(f64::from(c[0][0] as f32));
+      print!(" ");
+      print!(f64::from(c[7][13] as f32));
+      print!(" ");
+      print!(f64::from(c[15][31] as f32));
+      print!("\n");
+      if wrong > 0 {
+        print!("  FAIL: ");
+        print!(wrong);
+        print!(" entries differ from the host loop\n");
+        return 1;
+      }
+      return 0;
+    }
+  };
+}
+
+stamp_test!(test_f32, f32, "f32");
+stamp_test!(test_f16, f16, "f16");
+stamp_test!(test_bf16, bf16, "bf16");
+
+// Two products in a row on the device: D = (A @ B) @ E, with only A, B and E moved there.
+fn test_chain() -> i32 {
+  let mut a_h = unsafe { Tensor<f32, [16, 48]>::uninit() };
+  let mut b_h = unsafe { Tensor<f32, [48, 32]>::uninit() };
+  let mut e_h = unsafe { Tensor<f32, [32, 8]>::uninit() };
+  for i in 0..16 {
+    for k in 0..48 { a_h[i][k] = a_val!(i, k); }
+  }
+  for k in 0..48 {
+    for j in 0..32 { b_h[k][j] = b_val!(k, j); }
+  }
+  for j in 0..32 {
+    for l in 0..8 { e_h[j][l] = e_val!(j, l); }
+  }
+  let ga = transfer(a_h, Memory::HBM);
+  let gb = transfer(b_h, Memory::HBM);
+  let ge = transfer(e_h, Memory::HBM);
+  let mut gc = unsafe { Tensor<f32, [16, 32], Memory::HBM>::uninit() };
+  let mut gd = unsafe { Tensor<f32, [16, 8], Memory::HBM>::uninit() };
+  matmul_into!(gc, ga, gb);
+  matmul_into!(gd, gc, ge);
+  let d = transfer(gd, Memory::CPU_DRAM);
+  let mut wrong = 0;
+  for i in 0..16 {
+    for l in 0..8 {
+      let mut s : f32 = 0.0;
+      for j in 0..32 {
+        let mut cij : f32 = 0.0;
+        for k in 0..48 { cij += a_val!(i, k) * b_val!(k, j); }
+        s += cij * e_val!(j, l);
+      }
+      if d[i][l] != s { wrong += 1; }
+    }
+  }
+  print!("chain: ");
+  print!(f64::from(d[0][0]));
+  print!(" ");
+  print!(f64::from(d[9][4]));
+  print!(" ");
+  print!(f64::from(d[15][7]));
+  print!("\n");
+  if wrong > 0 {
+    print!("  FAIL: ");
+    print!(wrong);
+    print!(" entries differ from the host loop\n");
+    return 1;
+  }
+  return 0;
+}
+
+fn main() -> i32 {
+  let mut failed = 0;
+  failed += test_f32();
+  failed += test_f16();
+  failed += test_bf16();
+  failed += test_chain();
+  if failed == 0 {
+    print!("ok\n");
+  }
+  return failed;
+}
