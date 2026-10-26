@@ -1,0 +1,164 @@
+// gpu-mla: multi-head latent attention (MLA), the attention of DeepSeek and GLM models, on the
+// GPU. The cache does not hold a key and a value for each head. For each position it holds one
+// latent vector `c` of 512 numbers and one rope key `pe` of 64 numbers, shared by all heads.
+// Head h makes its keys and values from the latent with two matrices:
+//
+//   k_nope[t][h] = c[t] . wuk[h]  (dn numbers)     v[t][h] = c[t] . wuv[h]  (dv numbers)
+//   score[t]     = (q_nope[h] . k_nope[t][h] + q_pe[h] . pe[t]) * scale
+//
+// The kernels here use the absorbed form, which never makes the keys and values: the matrix wuk
+// is folded into the query once per row (`mla_absorb_q`: qlat = q_nope . wuk, 512 numbers), then
+//
+//   score[t] = (qlat . c[t] + q_pe . pe[t]) * scale        olat = sum over t of softmax(score)[t] * c[t]
+//
+// is attention over the latents themselves, and `mla_expand_out` turns the weighted latent into
+// the head's output with wuv. Both ways give the same numbers (the test checks the absorbed form
+// against the expanded one). `mla_attention` serves decode and prefill: a row is one query, it
+// reads sequence `qseq[row]` of the cache and attends to its first `qlen[row]` positions. Decode
+// is one row for each sequence with qlen = its length. Prefill is one row for each position t
+// of a prompt with qlen = t + 1, which is the causal mask. Each row needs qlen of at least 1.
+//
+// The cache is flat: position t of sequence s is at row `s * stride + t`, latent at
+// `row * 512 + j` and rope key at `row * 64 + d` (the writes of `mla_append` go to positions only
+// the data knows, so they are atomic stores). `mla_attention` walks the positions in chunks of 128
+// with an online softmax (a running maximum, sum and weighted sum, rescaled when a later chunk
+// raises the maximum), so a length is not limited. Its loop over chunks is bounded by the host
+// value `max_len`, and each lane masks positions at or past the row's length.
+//
+// The absorbed form does more work for each score than the expanded one (576 numbers instead of
+// dn + 64), but it reads the small latent cache once for all heads' worth of data, and it is the
+// form that fits decode, where reading the cache is the cost.
+
+import core::num;
+import core::sync::atomic;
+
+// Writes the new token's latent and rope key at position lens[s] of each sequence.
+pub fn mla_append(cc : &Tensor<f32, [?], Memory::HBM>, cpe : &Tensor<f32, [?], Memory::HBM>, c_new : &Tensor<f32, [?, 512], Memory::HBM>, pe_new : &Tensor<f32, [?, 64], Memory::HBM>, lens : &Tensor<i32, [?], Memory::HBM>, seqs : i32, stride : i32) -> void {
+  spawn on(Topology::Device) {
+    for s in 0..seqs across blocks {
+      for j in 0..512 across lanes(256) {
+        atomic_store_f32(cc, (s * stride + lens[s]) * 512 + j, c_new[s][j], AtomicOrdering::Relaxed);
+      }
+      for d in 0..64 across lanes {
+        atomic_store_f32(cpe, (s * stride + lens[s]) * 64 + d, pe_new[s][d], AtomicOrdering::Relaxed);
+      }
+    }
+  }
+  return;
+}
+
+// lens[s] += 1, after an append.
+pub fn mla_advance(lens : &mut Tensor<i32, [?], Memory::HBM>, seqs : i32) -> void {
+  spawn on(Topology::Device) {
+    for b in 0..(seqs + 127) / 128 across blocks {
+      for l in 0..128 across lanes {
+        let s = b * 128 + l;
+        if s < seqs {
+          lens[s] = lens[s] + 1;
+        }
+      }
+    }
+  }
+  return;
+}
+
+// qlat[r][h][j] = sum over d < dn of qn[r][h][d] * wuk[h][d][j].
+pub fn mla_absorb_q(qlat : &mut Tensor<f32, [?, ?, 512], Memory::HBM>, qn : &Tensor<f32, [?, ?, ?], Memory::HBM>, wuk : &Tensor<f32, [?, ?, 512], Memory::HBM>, rows : i32, heads : i32, dn : i32) -> void {
+  spawn on(Topology::Device) {
+    for r in 0..rows across blocks {
+      for h in 0..heads across blocks {
+        for j in 0..512 across lanes(256) {
+          let mut s : f32 = 0.0;
+          for d in 0..dn {
+            s = s + qn[r][h][d] * wuk[h][d][j];
+          }
+          qlat[r][h][j] = s;
+        }
+      }
+    }
+  }
+  return;
+}
+
+// olat[r][h] = the softmax-weighted sum of the latents that row r attends to, for head h.
+pub fn mla_attention(olat : &mut Tensor<f32, [?, ?, 512], Memory::HBM>, qlat : &Tensor<f32, [?, ?, 512], Memory::HBM>, qpe : &Tensor<f32, [?, ?, 64], Memory::HBM>, cc : &Tensor<f32, [?], Memory::HBM>, cpe : &Tensor<f32, [?], Memory::HBM>, qseq : &Tensor<i32, [?], Memory::HBM>, qlen : &Tensor<i32, [?], Memory::HBM>, rows : i32, heads : i32, stride : i32, max_len : i32, scale : f32) -> void {
+  spawn on(Topology::Device) {
+    for r in 0..rows across blocks {
+      for h in 0..heads across blocks {
+        let mut part = unsafe { Tensor<f32, [128], Memory::SMEM>::uninit() };
+        let mut acc = unsafe { Tensor<f32, [512], Memory::SMEM>::uninit() };
+        // stat: 0 = running maximum, 1 = running sum, 2 = factor for the old state.
+        let mut stat = unsafe { Tensor<f32, [3], Memory::SMEM>::uninit() };
+        stat[0] = -1000000000.0;
+        stat[1] = 0.0;
+        stat[2] = 1.0;
+        for j in 0..512 across lanes(256) {
+          acc[j] = 0.0;
+        }
+        for c in 0..(max_len + 127) / 128 {
+          for l in 0..128 across lanes {
+            let pos = c * 128 + l;
+            let mut sc : f32 = -1000000000.0;
+            if pos < qlen[r] {
+              let row = qseq[r] * stride + pos;
+              let mut dot : f32 = 0.0;
+              for j in 0..512 {
+                dot = dot + qlat[r][h][j] * cc[row * 512 + j];
+              }
+              for d in 0..64 {
+                dot = dot + qpe[r][h][d] * cpe[row * 64 + d];
+              }
+              sc = dot * scale;
+            }
+            part[l] = sc;
+          }
+          let mut cm : f32 = part[0];
+          for k in 1..128 {
+            cm = cm.max(part[k]);
+          }
+          let m_old = stat[0];
+          let m_new = m_old.max(cm);
+          stat[0] = m_new;
+          stat[2] = (m_old - m_new).exp();
+          for l in 0..128 across lanes {
+            part[l] = (part[l] - stat[0]).exp();
+          }
+          let z = lanes::sum(&part, 128);
+          stat[1] = stat[1] * stat[2] + z;
+          for j in 0..512 across lanes(256) {
+            let mut a : f32 = acc[j] * stat[2];
+            for t in 0..128 {
+              let pos = c * 128 + t;
+              if pos < qlen[r] {
+                a = a + part[t] * cc[(qseq[r] * stride + pos) * 512 + j];
+              }
+            }
+            acc[j] = a;
+          }
+        }
+        for j in 0..512 across lanes(256) {
+          olat[r][h][j] = acc[j] / stat[1];
+        }
+      }
+    }
+  }
+  return;
+}
+
+// out[r][h][d] = sum over j < 512 of olat[r][h][j] * wuv[h][j][d], for d < dv.
+pub fn mla_expand_out(out : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, olat : &Tensor<f32, [?, ?, 512], Memory::HBM>, wuv : &Tensor<f32, [?, 512, ?], Memory::HBM>, rows : i32, heads : i32, dv : i32) -> void {
+  spawn on(Topology::Device) {
+    for r in 0..rows across blocks {
+      for h in 0..heads across blocks {
+        for d in 0..dv across lanes(256) {
+          let mut s : f32 = 0.0;
+          for j in 0..512 {
+            s = s + olat[r][h][j] * wuv[h][j][d];
+          }
+          out[r][h][d] = s;
+        }
+      }
+    }
+  }
+  return;
+}
