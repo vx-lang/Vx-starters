@@ -1,0 +1,38 @@
+// A datacenter, and five services to put on it: the whole of fleet-graph in one program.
+//
+//   vxc -a run-jit examples/datacenter.vx
+//
+// The fleet is two NVL72 racks, twelve H200 nodes and twenty-four A100-80 nodes, on seven leaf
+// switches with the links to the spine cut to half. The services are DeepSeek-V3 and GLM-4.5 for
+// chat, DeepSeek-V3 for long documents and for agents, and GLM-4.5 for a million-token context. Each is placed
+// co-located or on separate prefill and decode pools, whichever leaves less unmet and costs less.
+
+import core::convert;
+import core::num;
+import fleet;
+import hw;
+import model;
+import plan;
+import report;
+import std::vec;
+
+fn main() -> i32 {
+  let mut f = new_fleet();
+  for i in 0..2 { add_domain(&mut f, nvl72(b200()), i); }
+  for i in 0..12 { add_domain(&mut f, hgx8(h200()), 2 + i / 6); }
+  for i in 0..24 { add_domain(&mut f, hgx8(a100_80()), 4 + i / 8); }
+  wire(&mut f, 2.0f64);
+
+  let mut svcs = Vec<Service>::with_capacity(5);
+  svcs.push(with_mode(with_name(make_service(deepseek_v3(), 30.0f64, 8192, 512, 0.05f64, 2.0f64, 1.0f64, 1, 2048), "chat-ds"), 2));
+  svcs.push(with_mode(with_name(make_service(glm_4_5(), 20.0f64, 4096, 512, 0.05f64, 2.0f64, 2.0f64, 0, 2048), "chat-glm"), 2));
+  svcs.push(with_mode(with_name(make_service(deepseek_v3(), 2.0f64, 131072, 1024, 0.08f64, 60.0f64, 1.0f64, 1, 128), "docs-ds"), 2));
+  svcs.push(with_mode(with_name(make_service(glm_4_5(), 0.02f64, 1000000, 256, 0.15f64, 600.0f64, 2.0f64, 0, 32), "repo-glm"), 2));
+
+  svcs.push(with_mode(with_name(make_service(deepseek_v3(), 15.0f64, 32768, 256, 0.06f64, 10.0f64, 1.0f64, 1, 512), "agents-ds"), 2));
+
+  let plan = schedule(&f, &svcs);
+  print_report(&f, &svcs, &plan);
+  print_losses(&f, &svcs, &plan);
+  return 0;
+}

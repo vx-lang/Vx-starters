@@ -247,6 +247,13 @@ fail in another.
 
 ## Language
 
+- **fleet-graph, main d25deea9: every call of `Vec::get` costs about 55 ms of compile time.**
+  `v.get(..)` repeated 50, 200 and 800 times takes 2.4, 11.7 and 44 s to compile
+  ([vx-lang/Vx#2261](https://github.com/vx-lang/Vx/issues/2261)); running it a million times costs
+  nothing. A planner of 1000 lines with a few hundred `Vec` calls takes 8 to 15 s to compile each
+  program that imports it, and `build.sh` (three such programs and a test) takes a minute. The code
+  keeps its `Vec` calls few where it can (class numbers instead of comparing structs), but a program
+  of datacenter size is the size where this shows.
 - **fleet-graph, main d25deea9: four small walls in plain host code.** Float literals with an
   exponent (`1.5e12`) do not parse ([vx-lang/Vx#1654](https://github.com/vx-lang/Vx/issues/1654)),
   so `hw.vx` writes `1.5 * tera()` with `tera()` a function. `pub struct` and `pub const` do not
