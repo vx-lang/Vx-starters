@@ -28,7 +28,7 @@ Plain host code: no GPU and no CUDA. Every figure is an estimate (see *What it i
 | `fleet.vx` | A fleet: a vertex for each domain, one leaf switch for each group of domains, one spine, with the leaf-to-spine links cut by an oversubscription factor. `group_bandwidth` and `group_latency` of a set of domains read off the graph, with a leaf link shared by the members under it; `pick_group` chooses domains of one class that are as close as the graph allows |
 | `model.vx` | `Model`: layers, dense layers, hidden size, MLA or GQA attention, experts. Parameter counts, KV size of a token, and the attention FLOPs of a query-key pair all follow from those fields. `deepseek_v3()` and `glm_4_5()` |
 | `cost.vx` | `Deploy`: a group of whole domains, attention data or tensor parallel, a context-parallel degree, number formats. `fits`, `decode_step` and `prefill_time` |
-| `plan.vx` | `Service` (model, request rate, prompt, output, targets for time per token and time to first token); `evaluate`, `best_for`, `schedule` |
+| `plan.vx` | `Service` (model, request rate, prompt, output, targets for time per token and time to first token, and whether it is served co-located or on separate prefill and decode pools); `evaluate`, `evaluate_prefill`, `evaluate_decode`, `best_role`, `schedule` |
 
 ## The cost model
 
@@ -66,18 +66,51 @@ One algorithm, with no rule about a SKU or a model:
    (memory and step time only grow with the batch, so a bisection finds it), the time to first
    token, and from them the requests a second one replica serves, `1 / (ttft + out * step / batch)`,
    and what a request costs.
-3. `best_for` tries every candidate the free part of the fleet offers and takes the cheapest
-   request that meets both targets.
+3. `best_role` tries every candidate the free part of the fleet offers and takes the one that
+   covers the rate still needed for the least an hour in *whole replicas* (`price`: a rack that
+   could serve a hundred times the rate still costs a whole rack), then the one with the cheaper
+   request.
 4. `schedule` places a replica at a time until a service's rate is met or nothing feasible is left,
    for each service in turn. A greedy depends on the order, since the first service takes the best
    of what is free, so it tries the order with the most demanding service first and, for up to 5
    services, every other order, and keeps the plan with the least rate unmet.
 
-In the test, a mixed fleet (one NVL72 rack, four H200 nodes, eight A100-80 nodes) serves 20
+### Prefill and decode on separate pools
+
+A service's `mode` says how it is served: 0 co-located, 1 disaggregated, 2 whichever leaves less of
+it unmet and then costs less.
+
+* **Co-located.** A replica takes its prefills and its decode steps in turns.
+* **Disaggregated.** The prompt is read on a pool of *prefill* replicas, its KV cache is sent over
+  the network, and the tokens are written on a pool of *decode* replicas. Each pool is chosen for
+  its own work and can sit on other GPUs and be split another way: prefill is arithmetic and wants
+  FLOP/s, decode is memory traffic and wants HBM and bandwidth, and no prefill steals a decode
+  step. A prefill replica serves `1 / prefill_time` requests a second and a decode replica
+  `batch / (out * step)`. The first token waits for the prefill and for the transfer of the
+  prompt's cache (prompt x cache bytes per token), which crosses at the slower NIC of the two
+  sides over as many GPUs in parallel as the smaller side has, plus the latency the graph gives.
+  The two pools are grown together, the one with less capacity getting the next replica, so that
+  neither takes every domain the other needs. The first decode replica fixes the cache format and
+  what the prefill replicas are priced against; a later decode replica must be no worse for the
+  transfer. If no prefill replica fits, the decode replicas are given back.
+
+On the test fleet of one B200 node and four H200 nodes, DeepSeek-V3 with a 32k prompt, 512 output
+tokens, 2.4 requests a second and a first token in half a second:
+
+| | placement | cost an hour |
+| --- | --- | --- |
+| co-located | the B200 node, and all four H200 nodes as one group of 32 (the only H200 layout that is fast enough) | 112 |
+| disaggregated | prefill on the B200 node, decode on one H200 node (tensor parallel attention, the cache cut in 8) | 52 |
+
+On a fleet with a big NVL72 rack the co-located replicas win, since one rack does both jobs: the
+pools pay for two sets of weights. The scheduler takes whichever is better in each case.
+
+In the test, the mixed fleet (one NVL72 rack, four H200 nodes, eight A100-80 nodes) serves 20
 requests a second of DeepSeek-V3 at 8k and 10 of GLM-4.5 at 32k. Taking GLM first gives it the
 NVL72 rack and leaves 93% of the demand unmet; the best order puts DeepSeek on four H200 nodes (fp8
-weights and cache, batch 920) and GLM on the rack and all eight A100 nodes (in groups of 3, 3 and 2), leaving 14% of the GLM rate
-unmet. A plan that is best over all orders is still a greedy's: it is not the best split of the fleet.
+weights and cache, batch 920) and GLM on the rack and all eight A100 nodes (in groups of 3, 3 and 2),
+leaving 14% of the GLM rate unmet. A plan that is best over all orders is still a greedy's: it is
+not the best split of the fleet.
 
 ## What the tests check
 
@@ -100,7 +133,13 @@ unmet. A plan that is best over all orders is still a greedy's: it is not the be
    replica serves no more than its rate, served plus unmet is the demand, and the same inputs give
    the same plan; less fleet leaves at least as much unmet in the tested cases; an impossible
    service is left whole.
-6. **Python.** `check.py` prices the same layouts again from the architectures and the formulas,
+6. **Pools.** The cache transfer worked out by hand; the price of whole replicas; a decode replica
+   serves `batch / (out * step)`, a prefill replica `1 / prefill_time`, and the first token waits
+   for the transfer; on the B200 + H200 fleet the pools cost less than the co-located replicas and
+   mode 2 takes them; mode 2 leaves no more unmet than either way, and costs no more, in four
+   settings; decode replicas with no prefill to feed them are given back; the pools of a service
+   share one cache format.
+7. **Python.** `check.py` prices the same layouts again from the architectures and the formulas,
    written out a second time, and every placement of the schedule too; they agree to 1e-9.
 
 ## What it is not
@@ -109,9 +148,10 @@ unmet. A plan that is best over all orders is still a greedy's: it is not the be
   not checked (see the note in `hw.vx`); the cost of a GPU is a placeholder, not a price. The 40%,
   75% and 70% are the usual size, not a measurement. Routing is uniform, and a real router is not,
   so a real step is slower. Put your own figures in and measure before using a plan.
-* **A replica is co-located.** Prefill and decode share the GPUs and take turns. Splitting them onto
-  different pools (prefill on compute-rich GPUs, decode on bandwidth-rich ones, with the cache moved
-  between them) is the next thing to add; the pieces are here.
+* **The pools are a heuristic.** The decode pool comes first and fixes the cache format; the two
+  grow together. It does not try the prefill pool first, a different cache format for each pool
+  (with a conversion), or a rebalance after the fact. The transfer is priced as the cache over the
+  NICs of one replica; the spine, shared by all the services at once, is not.
 * **No queueing.** A service is a steady rate, with no bursts and no waiting.
 * **Missing:** pipeline parallelism, speculative
   decoding and prefix caching.

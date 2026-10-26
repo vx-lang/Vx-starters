@@ -10,13 +10,13 @@ import sys
 GIB = 1073741824.0
 TERA, GIGA = 1e12, 1e9
 
-# name: (hbm, hbm_bw, bf16, fp8, nvlink)
+# name: (hbm, hbm_bw, bf16, fp8, nvlink, nic)
 SKU = {
-    "A100-80": (80 * GIB, 2.039 * TERA, 312 * TERA, 0.0, 300 * GIGA),
-    "H200": (141 * GIB, 4.8 * TERA, 989 * TERA, 1979 * TERA, 450 * GIGA),
-    "B200": (183359 * 1048576.0, 7.7 * TERA, 2250 * TERA, 4500 * TERA, 900 * GIGA),
-    "toy": (1e30, 1e12, 1e30, 0.0, 1e30),
-    "toy-flops": (1e30, 1e30, 1e15, 0.0, 1e30),
+    "A100-80": (80 * GIB, 2.039 * TERA, 312 * TERA, 0.0, 300 * GIGA, 25 * GIGA),
+    "H200": (141 * GIB, 4.8 * TERA, 989 * TERA, 1979 * TERA, 450 * GIGA, 50 * GIGA),
+    "B200": (183359 * 1048576.0, 7.7 * TERA, 2250 * TERA, 4500 * TERA, 900 * GIGA, 50 * GIGA),
+    "toy": (1e30, 1e12, 1e30, 0.0, 1e30, 1e30),
+    "toy-flops": (1e30, 1e30, 1e15, 0.0, 1e30, 1e30),
 }
 
 MFU, MEM_EFF, COMM_EFF, LAYER_OVERHEAD, USABLE = 0.4, 0.75, 0.7, 0.00003, 0.9
@@ -85,7 +85,7 @@ GLM = Model(kind="gqa", layers=92, dense_layers=3, hidden=5120, vocab=151552, he
 
 class Dep:
     def __init__(self, sku, domains, gpd, dp, cp, wb, kb, cross, lat):
-        self.hbm, self.bw, self.bf16, self.fp8, self.nvl = SKU[sku]
+        self.hbm, self.bw, self.bf16, self.fp8, self.nvl, self.nic = SKU[sku]
         self.domains, self.gpd, self.dp, self.cp, self.wb, self.kb = domains, gpd, dp, cp, wb, kb
         self.cross, self.lat = cross, lat
         self.g = domains * gpd
@@ -170,8 +170,12 @@ def prefill_time(m, d, n):
     return max(mem, comp) + comm + m.layers * LAYER_OVERHEAD
 
 
-# service 0 and 1 of the test: DeepSeek-V3 at 8192 + 1024 tokens, GLM-4.5 at 32768 + 512.
-SERVICES = {0: (DS, 8192, 1024), 1: (GLM, 32768, 512)}
+# The services of the test, by the tag of the placement lines: model, prompt, output, the target
+# for a token and for the first token. All have a largest batch of 1024.
+SERVICES = {
+    "placed": {0: (DS, 8192, 1024, 0.05, 5.0), 1: (GLM, 32768, 512, 0.05, 10.0)},
+    "pooled": {0: (DS, 32768, 512, 0.06, 0.5)},
+}
 
 want = {
     "models": [DS.total(), DS.active(), GLM.total()],
@@ -199,32 +203,48 @@ seen = set()
 placed = 0
 for line in sys.stdin:
     name, _, rest = line.partition(": ")
-    if name == "placed":
+    if name in SERVICES:
         f = rest.split()
-        svc, sku = int(f[0]), f[1]
-        domains, gpd, dp, cp = (int(v) for v in f[2:6])
-        wb, kb, cross, lat = (float(v) for v in f[6:10])
-        batch, step, ttft = int(f[10]), float(f[11]), float(f[12])
-        m, prompt, out = SERVICES[svc]
+        svc, role, sku = int(f[0]), int(f[1]), f[2]
+        domains, gpd, dp, cp = (int(v) for v in f[3:7])
+        wb, kb, cross, lat = (float(v) for v in f[7:11])
+        batch, step, ttft, xfer, xnic, xs, xlat = int(f[11]), float(f[12]), float(f[13]), float(f[14]), float(f[15]), int(f[16]), float(f[17])
+        m, prompt, out, slo_tpot, slo_ttft = SERVICES[name][svc]
         dep = Dep(sku, domains, gpd, dp, cp, wb, kb, cross, lat)
-        want_step = decode_step(m, dep, batch, prompt + out // 2)
-        want_ttft = prefill_time(m, dep, prompt)
         placed += 1
-        if not (close(step, want_step) and close(ttft, want_ttft)):
-            print(f"FAIL: placement {line.strip()} is priced {want_step} and {want_ttft} in Python")
-            failed += 1
-        # The batch must be the largest that fits and meets 50 ms a token.
-        slo = 0.05
         ctx = prompt + out
 
         def ok(b):
             return (weight_bytes(m, dep) + kv_bytes(m, dep, b, ctx) <= USABLE * dep.hbm
-                    and decode_step(m, dep, b, prompt + out // 2) <= slo)
+                    and decode_step(m, dep, b, prompt + out // 2) <= slo_tpot)
 
-        bmax = 1024
-        if not ok(batch) or (batch < bmax and ok(batch + 1)):
-            print(f"FAIL: batch {batch} is not the largest that fits and meets the target ({line.strip()})")
-            failed += 1
+        if role in (0, 2):
+            # The step is priced again, and the batch is the largest that fits and meets the target.
+            want_step = decode_step(m, dep, batch, prompt + out // 2)
+            if not close(step, want_step):
+                print(f"FAIL: decode step {step} of {line.strip()} is {want_step} in Python")
+                failed += 1
+            if not ok(batch) or (batch < 1024 and ok(batch + 1)):
+                print(f"FAIL: batch {batch} is not the largest that fits and meets the target ({line.strip()})")
+                failed += 1
+        if role == 0:
+            want_ttft = prefill_time(m, dep, prompt)
+            if not close(ttft, want_ttft):
+                print(f"FAIL: first token {ttft} of {line.strip()} is {want_ttft} in Python")
+                failed += 1
+        if role == 1:
+            # Prefill plus the transfer of the prompt's cache over the slower NIC of the two sides, as
+            # many GPUs in parallel as the smaller side has.
+            nic = min(dep.nic, xnic)
+            streams = min(dep.g, xs)
+            want_xfer = prompt * m.kv_elems() * dep.kb / (nic * streams) + xlat
+            want_ttft = prefill_time(m, dep, prompt) + want_xfer
+            if not (close(xfer, want_xfer) and close(ttft, want_ttft)):
+                print(f"FAIL: prefill replica {line.strip()} is priced {want_xfer} and {want_ttft} in Python")
+                failed += 1
+            if weight_bytes(m, dep) + kv_bytes(m, dep, 1, prompt) > USABLE * dep.hbm or want_ttft > slo_ttft:
+                print(f"FAIL: prefill replica {line.strip()} does not fit or is late")
+                failed += 1
         continue
     if name not in want:
         continue

@@ -183,3 +183,8 @@ pub fn pick_group(f : &Fleet, class_of : i32, want : i32, free : &Vec<i32>) -> V
   }
   return best;
 }
+
+// The least latency between two domains, seconds.
+pub fn latency_between(f : &Fleet, a : i32, b : i32) -> f64 {
+  return f.late.get(a * f.nv + b);
+}
