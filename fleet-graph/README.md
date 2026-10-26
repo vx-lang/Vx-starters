@@ -195,10 +195,10 @@ monotone, so this is the boundary of one search, not a promise for every placeme
 `examples/procure.vx` runs the planner over a grid of fleets (0 to 2 NVL72 racks, 0 to 12 H200 nodes,
 0 to 24 A100 nodes) for four services (the chat services, the long documents, the agents) and prints a
 line for each: the price (the hourly cost of all its GPUs, used or not) and the unmet share. Of the 26
-fleets, six carry the load. The cheapest is one rack, twelve H200 nodes and twenty-four A100 nodes, 720
-an hour; the fleet with the most hardware per GPU price (two racks and twelve H200 nodes, 816) is not
-the cheapest, and without speculation and a prefix cache the A100 nodes were of no use (the same grid
-needed two racks and twelve H200 nodes: 816 an hour). `check_procure.py` works the prices out again and
+fleets, six carry the load. The cheapest is one rack, twelve H200 nodes and twenty-four A100 nodes, 720 an hour. Before speculation
+and the prefix cache were in the model the cheapest was two racks and twelve H200 nodes, 816 an hour, and
+the A100 nodes were of no use; with them, the A100 nodes carry the chat decode and a rack is saved.
+`check_procure.py` works the prices out again and
 checks that no cheaper fleet of the table carries the load. The grid is coarse and the services are
 placed in one order; it is a way to see where the money goes, not an optimizer.
 
