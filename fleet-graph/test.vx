@@ -1,0 +1,709 @@
+// Tests for fleet-graph. Returns the number of failed checks, and prints "ok" when there are none.
+// It also prints the numbers behind some checks, which check.py computes again in Python from
+// the architectures and the formulas.
+//
+//   1. The models: derived parameter counts against the published ones, the KV size of a token
+//      and the size of an expert by hand.
+//   2. The graph: widest path and least latency against two other algorithms (a threshold search
+//      and Bellman-Ford) on random graphs.
+//   3. The fleet: the bandwidth and latency of groups of domains, worked out by hand for a small
+//      fleet, and the choice of a group.
+//   4. The cost model: a decode step and a prefill on a machine that has only one limit, worked
+//      out by hand; what must grow, shrink or stay when one thing changes; what fits where.
+//   5. The planner: no better candidate than the one chosen, and the schedule of a mixed fleet:
+//      no domain twice, every placement meets its targets, the rates add up, the same answer
+//      twice, less fleet never meets more.
+//
+//   ./build.sh
+
+import core::convert;
+import core::num;
+import cost;
+import fleet;
+import graph;
+import hw;
+import model;
+import plan;
+import std::vec;
+
+fn fl(x : i32) -> f64 {
+  return f64::from(x);
+}
+
+fn big() -> f64 {
+  return 1000000.0f64 * 1000000.0f64 * 1000000.0f64 * 1000000.0f64 * 1000000.0f64;
+}
+
+fn close(a : f64, b : f64, rel : f64) -> bool {
+  // An infinite value is never close to anything (inf - inf would pass the test below).
+  if a > 1000000000000000000000.0f64 || b > 1000000000000000000000.0f64 {
+    return false;
+  }
+  let d = if a > b { a - b } else { b - a };
+  let m = if a > b { a } else { b };
+  return d <= rel * m;
+}
+
+fn expect(ok : bool, what : *const i8) -> i32 {
+  if ok {
+    return 0;
+  }
+  print!("  FAIL: ");
+  print!(what);
+  print!("\n");
+  return 1;
+}
+
+fn show(name : *const i8, a : f64, b : f64, c : f64) -> void {
+  print!(name);
+  print!(": ");
+  print!(a);
+  print!(" ");
+  print!(b);
+  print!(" ");
+  print!(c);
+  print!("\n");
+  return;
+}
+
+// ---------------------------------------------------------------------------------------------
+// 1. Models
+
+fn test_models() -> i32 {
+  let mut failed = 0;
+  let d = deepseek_v3();
+  let g = glm_4_5();
+  let giga = 1000000000.0f64;
+  // Published: DeepSeek-V3 671B total and 37B active; GLM-4.5 355B total and 32B active.
+  failed += expect(close(total_params(d), 671.0f64 * giga, 0.005f64), "DeepSeek-V3 total is within 0.5% of 671B");
+  failed += expect(close(active_params(d), 37.0f64 * giga, 0.02f64), "DeepSeek-V3 active is within 2% of 37B");
+  failed += expect(close(total_params(g), 355.0f64 * giga, 0.01f64), "GLM-4.5 total is within 1% of 355B");
+  failed += expect(close(active_params(g), 32.0f64 * giga, 0.03f64), "GLM-4.5 active is within 3% of 32B");
+  // By hand: one expert is 3 * 7168 * 2048, the routed experts 58 layers of 256, the attention of a
+  // layer the five MLA matrices, the cache of a token 61 layers of 512 + 64.
+  failed += expect(expert_params(d) == 44040192.0f64, "an expert of DeepSeek-V3 is 44040192 numbers");
+  failed += expect(routed_params(d) == 653908770816.0f64, "the routed experts of DeepSeek-V3 are 653908770816 numbers");
+  failed += expect(attn_params(d) == 187105280.0f64, "MLA attention of DeepSeek-V3 is 187105280 numbers a layer");
+  failed += expect(attn_params(g) == 136314880.0f64, "GQA attention of GLM-4.5 is 136314880 numbers a layer");
+  failed += expect(dense_part(d) == 17116626944.0f64, "DeepSeek-V3 without routed experts is 17116626944 numbers");
+  failed += expect(kv_elems(d) == 35136.0f64, "the cache of a DeepSeek-V3 token is 35136 numbers");
+  failed += expect(kv_elems(g) == 188416.0f64, "the cache of a GLM-4.5 token is 188416 numbers");
+  failed += expect(pair_flops(d, 0) == 81920.0f64, "MLA prefill is 81920 FLOP for a pair of tokens in a layer");
+  failed += expect(pair_flops(d, 1) == 2.0f64 * 128.0f64 * 1088.0f64, "MLA decode is 2 * 128 * 1088 FLOP for a pair");
+  // Only a quarter of the cache per number of an MLA layer is in the cache of a GQA layer.
+  failed += expect(kv_elems(g) / fl(g.layers) > kv_elems(d) / fl(d.layers), "a GQA layer keeps more than an MLA layer");
+  show("models", total_params(d), active_params(d), total_params(g));
+  show("models_glm", active_params(g), kv_elems(d), kv_elems(g));
+  return failed;
+}
+
+// ---------------------------------------------------------------------------------------------
+// 2. The graph
+
+fn next_rand(x : i32) -> i32 {
+  return (x * 75 + 74) % 65537;
+}
+
+// The widest path by thresholds: the largest t for which u and v are joined by edges of at least t.
+fn widest_by_threshold(g : &Graph, u : i32, v : i32) -> f64 {
+  if u == v {
+    return none();
+  }
+  let n = g.n;
+  let mut best = 0.0f64;
+  for e in 0..g.eu.len() {
+    let t = g.bw.get(e);
+    if t > best {
+      let mut reach = Vec<i32>::with_capacity(n);
+      for i in 0..n {
+        reach.push(if i == u { 1 } else { 0 });
+      }
+      for round in 0..n {
+        for k in 0..g.eu.len() {
+          if g.bw.get(k) >= t {
+            if reach.get(g.eu.get(k)) == 1 { reach.set(g.ev.get(k), 1); }
+            if reach.get(g.ev.get(k)) == 1 { reach.set(g.eu.get(k), 1); }
+          }
+        }
+      }
+      if reach.get(v) == 1 {
+        best = t;
+      }
+    }
+  }
+  return best;
+}
+
+// The least latency by Bellman-Ford from u.
+fn fastest_by_relaxing(g : &Graph, u : i32, v : i32) -> f64 {
+  let n = g.n;
+  let mut dist = Vec<f64>::with_capacity(n);
+  for i in 0..n {
+    dist.push(if i == u { 0.0f64 } else { none() });
+  }
+  for round in 0..n {
+    for k in 0..g.eu.len() {
+      let a = g.eu.get(k);
+      let b = g.ev.get(k);
+      if dist.get(a) + g.lat.get(k) < dist.get(b) { dist.set(b, dist.get(a) + g.lat.get(k)); }
+      if dist.get(b) + g.lat.get(k) < dist.get(a) { dist.set(a, dist.get(b) + g.lat.get(k)); }
+    }
+  }
+  return dist.get(v);
+}
+
+fn test_graph() -> i32 {
+  let mut failed = 0;
+  // By hand: 0-1 at 10, 1-2 at 5, 0-2 at 3 (slow, high latency); vertex 3 alone.
+  let mut g = new_graph(4);
+  add_edge(&mut g, 0, 1, 10.0f64, 1.0f64);
+  add_edge(&mut g, 1, 2, 5.0f64, 1.0f64);
+  add_edge(&mut g, 0, 2, 3.0f64, 5.0f64);
+  let w = widest(&g);
+  let f = fastest(&g);
+  failed += expect(w.get(2) == 5.0f64, "0 to 2 goes through 1 at 5, not directly at 3");
+  failed += expect(w.get(1) == 10.0f64, "0 to 1 is 10");
+  failed += expect(w.get(3) == 0.0f64, "vertex 3 is not reachable");
+  failed += expect(f.get(2) == 2.0f64, "0 to 2 takes 2 through 1, not 5 directly");
+  failed += expect(f.get(3) == none(), "vertex 3 is at no latency");
+  failed += expect(w.get(0) == none() && f.get(0) == 0.0f64, "a vertex to itself");
+  // Random graphs against the two other algorithms.
+  let mut wrong_w = 0;
+  let mut wrong_f = 0;
+  let mut x = 7;
+  for trial in 0..12 {
+    let n = 5 + trial % 4;
+    let mut h = new_graph(n);
+    for e in 0..(n + 3) {
+      x = next_rand(x);
+      let a = x % n;
+      x = next_rand(x);
+      let b = x % n;
+      x = next_rand(x);
+      let bw = fl(x % 9 + 1) * 10.0f64;
+      x = next_rand(x);
+      let lat = fl(x % 7 + 1);
+      if a != b {
+        add_edge(&mut h, a, b, bw, lat);
+      }
+    }
+    let wh = widest(&h);
+    let fh = fastest(&h);
+    for u in 0..n {
+      for v in 0..n {
+        if wh.get(u * n + v) != widest_by_threshold(&h, u, v) { wrong_w += 1; }
+        if fh.get(u * n + v) != fastest_by_relaxing(&h, u, v) { wrong_f += 1; }
+        if wh.get(u * n + v) != wh.get(v * n + u) || fh.get(u * n + v) != fh.get(v * n + u) { wrong_w += 1; }
+      }
+    }
+  }
+  failed += expect(wrong_w == 0, "widest paths of 12 random graphs agree with the threshold search, and are symmetric");
+  failed += expect(wrong_f == 0, "least latencies of 12 random graphs agree with Bellman-Ford");
+  show("graph", w.get(2), f.get(2), fl(wrong_w + wrong_f));
+  return failed;
+}
+
+// ---------------------------------------------------------------------------------------------
+// 3. The fleet
+
+// Domains 0 and 1: H200 nodes on leaf 0; 2 an H200 node and 3 an A100 node on leaf 1. Uplinks: 400
+// GB/s for an H200 node (8 x 50), 200 for an A100 node.
+fn small_fleet(oversub : f64) -> Fleet {
+  let mut f = new_fleet();
+  add_domain(&mut f, hgx8(h200()), 0);
+  add_domain(&mut f, hgx8(h200()), 0);
+  add_domain(&mut f, hgx8(h200()), 1);
+  add_domain(&mut f, hgx8(a100_80()), 1);
+  wire(&mut f, oversub);
+  return f;
+}
+
+fn pair(a : i32, b : i32) -> Vec<i32> {
+  let mut v = Vec<i32>::with_capacity(2);
+  v.push(a);
+  v.push(b);
+  return v;
+}
+
+fn test_fleet() -> i32 {
+  let mut failed = 0;
+  let gb = 1000000000.0f64;
+  let f = small_fleet(2.0f64);
+  // Same leaf: 400 GB/s over 8 GPUs = 50 GB/s each; 2 hops of 1 us.
+  let same = pair(0, 1);
+  failed += expect(group_bandwidth(&f, &same) == 50.0f64 * gb, "two domains on one leaf get 50 GB/s a GPU");
+  failed += expect(close(group_latency(&f, &same), 0.000002f64, 0.000001f64), "two domains on one leaf are 2 us apart");
+  // Different leaves: leaf 0 holds 800 GB/s of uplinks and leaf 1 600, cut by 2: 400 and 300. The
+  // narrower, 300 GB/s, over 8 GPUs is 37.5 GB/s. 1 + 2 + 2 + 1 = 6 us.
+  let apart = pair(0, 2);
+  failed += expect(group_bandwidth(&f, &apart) == 37.5f64 * gb, "domains on two leaves get 37.5 GB/s a GPU");
+  failed += expect(close(group_latency(&f, &apart), 0.000006f64, 0.000001f64), "domains on two leaves are 6 us apart");
+  // Three domains, two on leaf 0 and one on leaf 1: the leaf 0 link (400) is shared by two members,
+  // 200 each, the leaf 1 link (300) by one, 300: the narrowest pair is domain 0 or 1 to 2 at 200.
+  let mut three = pair(0, 1);
+  three.push(2);
+  failed += expect(group_bandwidth(&f, &three) == 25.0f64 * gb, "a shared leaf link is split between the members under it");
+  // Oversubscription 4: leaf links 200 and 150; 150 / 8 = 18.75.
+  let tight = small_fleet(4.0f64);
+  failed += expect(group_bandwidth(&tight, &apart) == 18.75f64 * gb, "oversubscription 4 cuts the cross-leaf rate to 18.75 GB/s");
+  failed += expect(group_bandwidth(&tight, &same) == 50.0f64 * gb, "oversubscription does not touch one leaf");
+  failed += expect(group_bandwidth(&f, &pair(0, 0)) == 0.0f64 || count(&f) == 4, "a single domain");
+  // pick_group takes the pair on one leaf when it can, and a lone domain of a class.
+  let mut free = Vec<i32>::with_capacity(4);
+  for i in 0..4 { free.push(1); }
+  let g2 = pick_group(&f, 0, 2, &free);
+  failed += expect(g2.len() == 2 && g2.get(0) == 0 && g2.get(1) == 1, "the group of two H200 nodes is the two on leaf 0");
+  free.set(1, 0);
+  let g3 = pick_group(&f, 0, 2, &free);
+  failed += expect(g3.len() == 2 && g3.get(0) == 0 && g3.get(1) == 2, "with node 1 taken, the group is 0 and 2");
+  free.set(0, 0);
+  let g4 = pick_group(&f, 0, 2, &free);
+  failed += expect(g4.len() == 0, "one H200 node left cannot make a group of two");
+  let g5 = pick_group(&f, 3, 1, &free);
+  failed += expect(g5.len() == 1 && g5.get(0) == 3, "the A100 node is its own class");
+  // Two NVL72 racks on two leaves: 72 x 50 = 3600 GB/s of uplink each, a leaf link of 1800 at
+  // oversubscription 2, 25 GB/s a GPU over 72 GPUs. A rack and an 8-GPU node: 400 GB/s over the
+  // rack's 72 GPUs is the narrower, 5.56 GB/s a GPU, and over the node's 8 would be 50.
+  let mut racks = new_fleet();
+  add_domain(&mut racks, nvl72(b200()), 0);
+  add_domain(&mut racks, nvl72(b200()), 1);
+  add_domain(&mut racks, hgx8(b200()), 1);
+  wire(&mut racks, 2.0f64);
+  failed += expect(group_bandwidth(&racks, &pair(0, 1)) == 25.0f64 * gb, "two NVL72 racks on two leaves get 25 GB/s a GPU");
+  failed += expect(close(group_bandwidth(&racks, &pair(0, 2)), 400.0f64 * gb / 72.0f64, 0.000000001f64), "the rack side of a rack and a node sets the rate per GPU");
+  show("fleet", group_bandwidth(&f, &same), group_bandwidth(&f, &apart), group_bandwidth(&f, &three));
+  return failed;
+}
+
+// ---------------------------------------------------------------------------------------------
+// 4. The cost model
+
+// A machine with one limit: HBM bandwidth 1 TB/s, everything else effectively infinite.
+fn toy() -> Sku {
+  return Sku { name: "toy", hbm: big(), hbm_bw: 1000000000000.0f64, bf16: big(), fp8: 0.0f64, nvlink: big(), nic: big(), cost: 1.0f64 };
+}
+
+// The same, limited by arithmetic only: 1 PFLOP/s.
+fn toy_flops() -> Sku {
+  return Sku { name: "toy-flops", hbm: big(), hbm_bw: big(), bf16: 1000000000000000.0f64, fp8: 0.0f64, nvlink: big(), nic: big(), cost: 1.0f64 };
+}
+
+fn deploy(sku : Sku, domains : i32, gpd : i32, dp : i32, cp : i32, wb : f64, kb : f64, cross : f64, lat : f64) -> Deploy {
+  return Deploy { sku: sku, domains: domains, gpd: gpd, dp: dp, cp: cp, wb: wb, kb: kb, cross: cross, lat: lat };
+}
+
+fn test_cost() -> i32 {
+  let mut failed = 0;
+  let d = deepseek_v3();
+  let g = glm_4_5();
+
+  // A decode step of 1 sequence with 1000 tokens of context on 8 toy GPUs, data parallel attention,
+  // fp8 weights and cache: 1 TB/s * 0.75 moves the touched experts (8 of 256 in each of 58 layers,
+  // one per GPU), all the other weights but the input embedding, and the cache. 61 layers add
+  // 30 us each. By hand:
+  //   experts 58 * 44040192 = 2554331136, others 16189947904, cache 1000 * 35136 = 35136000.
+  let t = deploy(toy(), 1, 8, 1, 1, 1.0f64, 1.0f64, 0.0f64, 0.0f64);
+  let want_step = (2554331136.0f64 + 16189947904.0f64 + 35136000.0f64) / 750000000000.0f64 + 61.0f64 * 0.00003f64;
+  let got_step = decode_step(d, t, 1, 1000);
+  failed += expect(close(got_step, want_step, 0.000000001f64), "a decode step on a machine with only memory bandwidth is bytes over bandwidth plus overhead");
+
+  // A prefill of 1000 tokens on 8 GPUs of 1 PFLOP/s at 40%: 2 * layer_active * 1000 plus attention
+  // 1000^2 / 2 * 61 * 81920, over 8 * 1e15 * 0.4, plus the overhead. layer_active by hand:
+  // 61 * 187105280 + 9 * 7168 * 18432 + 58 * (9 * 44040192 + 7168 * 256).
+  let la = 61.0f64 * 187105280.0f64 + 9.0f64 * 7168.0f64 * 18432.0f64 + 58.0f64 * (9.0f64 * 44040192.0f64 + 7168.0f64 * 256.0f64);
+  let flops = 2.0f64 * la * 1000.0f64 + 1000.0f64 * 1000.0f64 / 2.0f64 * 61.0f64 * 81920.0f64;
+  let want_pre = flops / (8.0f64 * 1000000000000000.0f64 * 0.4f64) + 61.0f64 * 0.00003f64;
+  let tf = deploy(toy_flops(), 1, 8, 1, 1, 2.0f64, 2.0f64, 0.0f64, 0.0f64);
+  failed += expect(close(prefill_time(d, tf, 1000), want_pre, 0.000000001f64), "a prefill on a machine with only arithmetic is FLOPs over rate plus overhead");
+  // A prefill of one token is limited by reading the weights once: the routed experts over 8 GPUs and
+  // the rest, in fp8, over 1 TB/s at 75%.
+  let tm = deploy(toy(), 1, 8, 1, 1, 1.0f64, 1.0f64, 0.0f64, 0.0f64);
+  failed += expect(close(prefill_time(d, tm, 1), (653908770816.0f64 / 8.0f64 + 16189947904.0f64) / 750000000000.0f64 + 61.0f64 * 0.00003f64, 0.000001f64), "a one-token prefill is the weights over the bandwidth");
+  failed += expect(close(layer_active_params(d), la, 0.0000000001f64), "layer_active_params is the hand sum");
+
+  // Decode limited by arithmetic: 8 sequences of 100000 tokens on 8 GPUs of 1 PFLOP/s, data parallel
+  // attention cut in 4 (2 groups of 4 GPUs, 4 sequences each, a quarter of the tokens a GPU):
+  // 2 * active * 8 / 8 + 4 * 25000 * 61 * 2 * 128 * 1088 FLOP, at 40%, and the overhead. With the
+  // cache not cut (8 groups, one sequence each) the attention of a GPU is 100000 tokens, not 25000.
+  let tfc = deploy(toy_flops(), 1, 8, 1, 4, 2.0f64, 2.0f64, 0.0f64, 0.0f64);
+  let attn_cp = 4.0f64 * 25000.0f64 * 61.0f64 * 2.0f64 * 128.0f64 * 1088.0f64;
+  let want_cp = (2.0f64 * active_params(d) + attn_cp) / (1000000000000000.0f64 * 0.4f64) + 61.0f64 * 0.00003f64;
+  failed += expect(close(decode_step(d, tfc, 8, 100000), want_cp, 0.000001f64), "a compute-bound step with the cache cut in 4: attention over a quarter of the tokens");
+  let tfn = deploy(toy_flops(), 1, 8, 1, 1, 2.0f64, 2.0f64, 0.0f64, 0.0f64);
+  let attn_no = 1.0f64 * 100000.0f64 * 61.0f64 * 2.0f64 * 128.0f64 * 1088.0f64;
+  let want_no = (2.0f64 * active_params(d) + attn_no) / (1000000000000000.0f64 * 0.4f64) + 61.0f64 * 0.00003f64;
+  failed += expect(close(decode_step(d, tfn, 8, 100000), want_no, 0.000001f64), "and not cut: attention over all the tokens");
+  // fp8 weights on a GPU with no fp8 cores still compute at the bf16 rate; with fp8 cores, at that.
+  let tf8 = deploy(toy_flops(), 1, 8, 1, 1, 1.0f64, 1.0f64, 0.0f64, 0.0f64);
+  failed += expect(close(prefill_time(d, tf8, 1000), want_pre, 0.000000001f64), "fp8 weights on a GPU without fp8 cores compute at the bf16 rate");
+  let fast8 = Sku { name: "toy-fp8", hbm: big(), hbm_bw: big(), bf16: 1000000000000000.0f64, fp8: 2000000000000000.0f64, nvlink: big(), nic: big(), cost: 1.0f64 };
+  let tfp8 = deploy(fast8, 1, 8, 1, 1, 1.0f64, 1.0f64, 0.0f64, 0.0f64);
+  failed += expect(close(prefill_time(d, tfp8, 1000), (want_pre - 61.0f64 * 0.00003f64) / 2.0f64 + 61.0f64 * 0.00003f64, 0.000000001f64), "and with fp8 cores at twice the rate, twice as fast");
+
+  // Memory by hand: DeepSeek-V3 on 72 GPUs with fp8 weights and data-parallel attention is the
+  // routed experts over 72 plus all the rest.
+  let n72 = deploy(b200(), 1, 72, 1, 1, 1.0f64, 1.0f64, 0.0f64, 0.0f64);
+  failed += expect(close(weight_bytes(d, n72), 653908770816.0f64 / 72.0f64 + 17116626944.0f64, 0.000000001f64), "weights per GPU, data parallel attention");
+  let tp = deploy(b200(), 1, 72, 0, 1, 1.0f64, 1.0f64, 0.0f64, 0.0f64);
+  failed += expect(close(weight_bytes(d, tp), (653908770816.0f64 + 17116626944.0f64) / 72.0f64, 0.000000001f64), "weights per GPU, tensor parallel attention");
+  // The cache of 4 sequences of 8192 on 72 GPUs, data parallel: each group of cp = 1 holds ceil(4 / 72) = 1.
+  failed += expect(kv_bytes(d, n72, 4, 8192) == 8192.0f64 * 35136.0f64, "one sequence per GPU when there are more GPUs than sequences");
+  let cp8 = deploy(b200(), 1, 72, 1, 8, 1.0f64, 1.0f64, 0.0f64, 0.0f64);
+  failed += expect(close(kv_bytes(d, cp8, 18, 8192), 2.0f64 * 8192.0f64 * 35136.0f64 / 8.0f64, 0.000000001f64), "context parallel 8 on 72 GPUs: 9 groups, 2 sequences each, cut in 8");
+  // Tensor parallel MLA keeps the whole cache on every GPU; GQA splits it over the KV heads.
+  failed += expect(kv_bytes(d, tp, 4, 8192) == 4.0f64 * 8192.0f64 * 35136.0f64, "tensor parallel MLA keeps the whole cache on every GPU");
+  let tg = deploy(h200(), 1, 8, 0, 1, 2.0f64, 2.0f64, 0.0f64, 0.0f64);
+  failed += expect(close(kv_bytes(g, tg, 4, 8192), 4.0f64 * 8192.0f64 * 188416.0f64 * 2.0f64 / 8.0f64, 0.000000001f64), "tensor parallel GQA splits the cache over 8 KV heads");
+
+  // What fits. DeepSeek-V3 in bf16 is 1.34 TB: not on 8 A100-80 (640 GB) nor 8 H200 (1.1 TB); fp8 is
+  // 671 GB: on 8 H200 only with the cache small. A million tokens of fp8 cache is 35 GB.
+  let a8 = deploy(a100_80(), 1, 8, 1, 1, 2.0f64, 2.0f64, 0.0f64, 0.0f64);
+  failed += expect(!fits(d, a8, 1, 8192), "DeepSeek-V3 in bf16 does not fit 8 A100-80");
+  let h8bf = deploy(h200(), 1, 8, 1, 1, 2.0f64, 2.0f64, 0.0f64, 0.0f64);
+  failed += expect(!fits(d, h8bf, 1, 8192), "DeepSeek-V3 in bf16 does not fit 8 H200");
+  let h8 = deploy(h200(), 1, 8, 1, 1, 1.0f64, 1.0f64, 0.0f64, 0.0f64);
+  failed += expect(fits(d, h8, 1, 8192), "DeepSeek-V3 in fp8 fits 8 H200 at 8k (99 GB of weights)");
+  let h8kv = deploy(h200(), 1, 8, 1, 1, 1.0f64, 2.0f64, 0.0f64, 0.0f64);
+  failed += expect(!fits(d, h8kv, 1, 1000000), "but not with a million tokens of bf16 cache on one group (70 GB)");
+  let h8cp = deploy(h200(), 1, 8, 1, 2, 1.0f64, 2.0f64, 0.0f64, 0.0f64);
+  failed += expect(fits(d, h8cp, 1, 1000000), "and with the cache cut in two it does");
+  failed += expect(fits(d, n72, 1, 1000000), "a million tokens fit 72 B200");
+
+  // What must change with one thing changed.
+  let mut mono_b = 0;
+  let mut mono_s = 0;
+  let mut prev = 0.0f64;
+  for k in 0..12 {
+    let b = 1 << k;
+    let st = decode_step(d, n72, b, 8192);
+    if st < prev { mono_b += 1; }
+    prev = st;
+  }
+  prev = 0.0f64;
+  for k in 0..10 {
+    let s = 1024 << k;
+    let st = decode_step(d, n72, 64, s);
+    if st < prev { mono_s += 1; }
+    prev = st;
+  }
+  failed += expect(mono_b == 0, "a decode step never gets shorter as the batch grows");
+  failed += expect(mono_s == 0, "a decode step never gets shorter as the context grows");
+  // The same layout on a faster SKU is not slower.
+  let on_a = deploy(a100_80(), 1, 8, 1, 1, 2.0f64, 2.0f64, 0.0f64, 0.0f64);
+  let on_h = deploy(h200(), 1, 8, 1, 1, 2.0f64, 2.0f64, 0.0f64, 0.0f64);
+  let on_b = deploy(b200(), 1, 8, 1, 1, 2.0f64, 2.0f64, 0.0f64, 0.0f64);
+  failed += expect(decode_step(g, on_b, 32, 8192) <= decode_step(g, on_h, 32, 8192) && decode_step(g, on_h, 32, 8192) <= decode_step(g, on_a, 32, 8192), "B200 <= H200 <= A100 for the same GLM layout");
+  failed += expect(prefill_time(g, on_b, 8192) <= prefill_time(g, on_h, 8192) && prefill_time(g, on_h, 8192) <= prefill_time(g, on_a, 8192), "and for a prefill");
+  // Smaller weights read less.
+  let fp8 = deploy(h200(), 1, 8, 1, 1, 1.0f64, 2.0f64, 0.0f64, 0.0f64);
+  failed += expect(decode_step(d, fp8, 8, 8192) < decode_step(d, on_h, 8, 8192), "fp8 weights make a memory-bound step shorter");
+  // A slower link between domains makes an all-to-all longer, and never shorter than within one.
+  let two_fast = deploy(h200(), 2, 8, 1, 1, 1.0f64, 1.0f64, 50000000000.0f64, 0.000002f64);
+  let two_slow = deploy(h200(), 2, 8, 1, 1, 1.0f64, 1.0f64, 12500000000.0f64, 0.000002f64);
+  failed += expect(decode_step(d, two_slow, 256, 8192) >= decode_step(d, two_fast, 256, 8192), "a slower network never makes a step shorter");
+  // Prefill grows faster than linearly in the prompt (attention is quadratic).
+  failed += expect(prefill_time(d, n72, 32768) > 4.0f64 * prefill_time(d, n72, 8192), "a prefill 4 times as long takes more than 4 times as long");
+  // Uniform routing: one token touches k experts; a huge batch touches them all.
+  failed += expect(close(touched(d, 1.0f64), 8.0f64, 0.000000001f64), "one token touches 8 experts");
+  failed += expect(touched(d, 100000.0f64) > 255.9f64, "a large batch touches all 256");
+  show("cost_toy", got_step, want_pre, prefill_time(d, tf, 1000));
+  // For the Python port: realistic layouts, one with several domains, one tensor parallel, one cut in contexts.
+  show("cost_nvl72", weight_bytes(d, n72), decode_step(d, n72, 512, 8192), prefill_time(d, n72, 8192));
+  show("cost_two_nodes", weight_bytes(d, two_fast), decode_step(d, two_fast, 256, 8192), prefill_time(d, two_fast, 8192));
+  show("cost_tp_glm", weight_bytes(g, tg), decode_step(g, tg, 32, 8192), prefill_time(g, tg, 8192));
+  let cut = deploy(b200(), 1, 72, 1, 8, 1.0f64, 1.0f64, 0.0f64, 0.0f64);
+  show("cost_cp8", kv_bytes(d, cut, 18, 1000000), decode_step(d, cut, 18, 200000), prefill_time(d, cut, 200000));
+  return failed;
+}
+
+// ---------------------------------------------------------------------------------------------
+// 5. The planner
+
+fn test_plan() -> i32 {
+  let mut failed = 0;
+  let d = deepseek_v3();
+  let g = glm_4_5();
+
+  // The mixed fleet: one NVL72 rack, four H200 nodes and eight A100-80 nodes, on three leaves.
+  let mut f = new_fleet();
+  add_domain(&mut f, nvl72(b200()), 0);
+  for i in 0..4 { add_domain(&mut f, hgx8(h200()), 1); }
+  for i in 0..8 { add_domain(&mut f, hgx8(a100_80()), 2); }
+  wire(&mut f, 2.0f64);
+  let n = count(&f);
+  let mut all = Vec<i32>::with_capacity(n);
+  for i in 0..n { all.push(1); }
+
+  // A service nothing can serve: a step of 61 layers cannot take less than the overhead of 61 x 30 us.
+  let hopeless = make_service(d, 1.0f64, 8192, 100, 0.001f64, 600.0f64, 1.0f64, 1, 64);
+  failed += expect(best_for(hopeless, &f, &all).cand.ok == 0, "a token in 1 ms has no candidate: the layers alone take 1.8 ms");
+
+  // The chosen candidate is no dearer than any other way to split the model on the same group.
+  let s1 = make_service(d, 20.0f64, 8192, 1024, 0.05f64, 5.0f64, 1.0f64, 1, 1024);
+  let p1 = best_for(s1, &f, &all);
+  failed += expect(p1.cand.ok == 1, "DeepSeek-V3 at 8k has a candidate");
+  let mut cheaper = 0;
+  let mut tried = 0;
+  let mut k = 0;
+  while k < count(&f) {
+    // all the groups of one class and one to four domains
+    let mut m = 1;
+    while m <= 4 {
+      let grp = pick_group(&f, k, m, &all);
+      if grp.len() == m {
+        let proto = domain(&f, k);
+        let cross = group_bandwidth(&f, &grp);
+        let lat = group_latency(&f, &grp);
+        for dp in 0..2 {
+          for cpi in 0..4 {
+            for wi in 0..2 {
+              for ki in 0..2 {
+                let dep = deploy(proto.sku, m, proto.gpus, dp, 1 << cpi, if wi == 0 { 2.0f64 } else { 1.0f64 }, if ki == 0 { 2.0f64 } else { 1.0f64 }, cross, lat);
+                if (m * proto.gpus) % (1 << cpi) == 0 {
+                  let c = evaluate(s1, dep);
+                  tried += 1;
+                  if c.ok == 1 && c.per_req < p1.cand.per_req { cheaper += 1; }
+                }
+              }
+            }
+          }
+        }
+      }
+      m += 1;
+    }
+    k += 1;
+  }
+  failed += expect(cheaper == 0, "no candidate tried is cheaper than the chosen one");
+  failed += expect(tried > 100, "enough candidates were tried");
+
+  // The search reaches several domains and context parallelism when a service needs them. DeepSeek-V3
+  // in bf16 is 1.34 TB: on A100-80 nodes (72 GB usable each) it takes at least 3.
+  let mut a100s = new_fleet();
+  for i in 0..8 { add_domain(&mut a100s, hgx8(a100_80()), 0); }
+  wire(&mut a100s, 2.0f64);
+  let mut a100_free = Vec<i32>::with_capacity(8);
+  for i in 0..8 { a100_free.push(1); }
+  let heavy = make_service(d, 1.0f64, 4096, 256, 1.0f64, 600.0f64, 2.0f64, 0, 64);
+  let hp = best_for(heavy, &a100s, &a100_free);
+  failed += expect(hp.cand.ok == 1 && hp.cand.dep.domains >= 3 && hp.members.len() == hp.cand.dep.domains, "DeepSeek-V3 in bf16 on A100 nodes takes 3 or more");
+  // A million tokens of bf16 cache (70 GB) do not fit one group of 8 H200 beside fp8 weights (99 GB);
+  // the search finds a context-parallel layout.
+  let mut one = new_fleet();
+  add_domain(&mut one, hgx8(h200()), 0);
+  wire(&mut one, 2.0f64);
+  let mut one_free = Vec<i32>::with_capacity(1);
+  one_free.push(1);
+  let long = make_service(d, 0.01f64, 1000000, 100, 5.0f64, 36000.0f64, 1.0f64, 0, 4);
+  let lp = best_for(long, &one, &one_free);
+  failed += expect(lp.cand.ok == 1 && lp.cand.dep.cp >= 2, "a million tokens of bf16 cache on 8 H200 need the cache cut");
+  // The chosen batch is the largest that fits and meets the target.
+  let at = p1.cand;
+  failed += expect(batch_ok_for(s1, at.dep, at.batch), "the chosen batch is ok");
+  failed += expect(at.batch == s1.bmax || !batch_ok_for(s1, at.dep, at.batch + 1), "one more would not be ok");
+  failed += expect(at.step <= s1.slo_tpot && at.ttft <= s1.slo_ttft, "the chosen candidate meets both targets");
+  failed += expect(close(at.rate, 1.0f64 / (at.ttft + fl(s1.out) * at.step / fl(at.batch)), 0.000000001f64), "a replica serves 1 / (ttft + out * step / batch) requests a second");
+  failed += expect(close(at.cost_hr, fl(gpus(at.dep)) * at.dep.sku.cost, 0.000000001f64) && close(at.per_req, at.cost_hr / 3600.0f64 / at.rate, 0.000000001f64), "the cost of a request is the hourly cost over the requests an hour");
+  // A time to first token no deployment can reach leaves no candidate; the same service with the
+  // target loosened has one.
+  // The fastest prefill of 8192 tokens on this fleet is 10 ms (fp8 on the NVL72 rack).
+  let strict = make_service(d, 20.0f64, 8192, 1024, 0.05f64, 0.005f64, 1.0f64, 1, 1024);
+  failed += expect(best_for(strict, &f, &all).cand.ok == 0, "a first token in 5 ms has no candidate");
+  let eager = make_service(d, 20.0f64, 8192, 1024, 0.05f64, 0.05f64, 1.0f64, 1, 1024);
+  failed += expect(best_for(eager, &f, &all).cand.ok == 1, "a first token in 50 ms has one");
+
+  // Schedule two services.
+  let mut sv = Vec<Service>::with_capacity(3);
+  sv.push(s1);
+  sv.push(make_service(g, 10.0f64, 32768, 512, 0.05f64, 10.0f64, 2.0f64, 0, 1024));
+  let pl = schedule(&f, &sv);
+  failed += check_plan(&f, &sv, &pl);
+  let pl2 = schedule(&f, &sv);
+  failed += expect(same_plan(&pl, &pl2), "the same inputs give the same plan");
+
+  // Four services, where the best order is neither the given one nor the one with the most
+  // demanding first. Needs: DeepSeek-V3 at 8k 8 GPUs, GLM at 16k 72, DeepSeek-V3 at 32k 72, GLM at 4k
+  // 8. Given order 0, 1, 2, 3 leaves 124% of a service's rate unmet (summed over the services),
+  // the most demanding first (1, 2, 0, 3) 109%, and the order 1, 3, 0, 2 79%.
+  let mut sv4 = Vec<Service>::with_capacity(4);
+  sv4.push(make_service(d, 12.0f64, 8192, 1024, 0.05f64, 5.0f64, 1.0f64, 1, 1024));
+  sv4.push(make_service(g, 6.0f64, 16384, 512, 0.05f64, 10.0f64, 2.0f64, 0, 1024));
+  sv4.push(make_service(d, 3.0f64, 32768, 256, 0.06f64, 20.0f64, 1.0f64, 1, 512));
+  sv4.push(make_service(g, 6.0f64, 4096, 256, 0.04f64, 5.0f64, 2.0f64, 0, 512));
+  let pl4s = schedule(&f, &sv4);
+  failed += check_plan(&f, &sv4, &pl4s);
+  failed += expect(shortfall(&sv4, &pl4s) < 0.8f64, "the best of 24 orders of four services leaves under 80% unmet");
+  show("four", shortfall(&sv4, &pl4s), spend(&pl4s), fl(pl4s.places.len()));
+  // Less fleet never meets more: without the NVL72 rack, and with a third of the A100 nodes.
+  let mut f2 = new_fleet();
+  for i in 0..4 { add_domain(&mut f2, hgx8(h200()), 1); }
+  for i in 0..8 { add_domain(&mut f2, hgx8(a100_80()), 2); }
+  wire(&mut f2, 2.0f64);
+  let pl3 = schedule(&f2, &sv);
+  failed += check_plan(&f2, &sv, &pl3);
+  failed += expect(shortfall(&sv, &pl3) >= shortfall(&sv, &pl) - 0.000000001f64, "without the NVL72 rack at least as much is left unmet");
+  let mut f3 = new_fleet();
+  for i in 0..4 { add_domain(&mut f3, hgx8(a100_80()), 0); }
+  wire(&mut f3, 2.0f64);
+  let pl4 = schedule(&f3, &sv);
+  failed += check_plan(&f3, &sv, &pl4);
+  failed += expect(shortfall(&sv, &pl4) >= shortfall(&sv, &pl3) - 0.000000001f64, "with four A100 nodes at least as much is left unmet");
+  // A service that cannot be placed is left whole.
+  let mut sv2 = Vec<Service>::with_capacity(1);
+  sv2.push(hopeless);
+  let pl5 = schedule(&f, &sv2);
+  failed += expect(pl5.places.len() == 0 && pl5.unmet.get(0) == 1.0f64, "an impossible service is left whole");
+  // An easy service on a big fleet is met in full.
+  let mut sv3 = Vec<Service>::with_capacity(1);
+  sv3.push(make_service(g, 1.0f64, 8192, 256, 0.08f64, 10.0f64, 2.0f64, 0, 256));
+  let pl6 = schedule(&f, &sv3);
+  failed += check_plan(&f, &sv3, &pl6);
+  failed += expect(pl6.unmet.get(0) == 0.0f64, "one request a second of GLM-4.5 at 8k is met in full");
+
+  // The plan is no worse than the one made by taking the services in the given order, either way.
+  let mut o01 = Vec<i32>::with_capacity(2);
+  o01.push(0);
+  o01.push(1);
+  let mut o10 = Vec<i32>::with_capacity(2);
+  o10.push(1);
+  o10.push(0);
+  let q01 = schedule_in_order(&f, &sv, &o01);
+  let q10 = schedule_in_order(&f, &sv, &o10);
+  failed += check_plan(&f, &sv, &q01);
+  failed += check_plan(&f, &sv, &q10);
+  failed += expect(shortfall(&sv, &pl) <= shortfall(&sv, &q01) + 0.000000001f64 && shortfall(&sv, &pl) <= shortfall(&sv, &q10) + 0.000000001f64, "the chosen plan leaves no more unmet than either order");
+  failed += expect(close(shortfall(&sv, &pl), pl.unmet.get(0) / sv.get(0).qps + pl.unmet.get(1) / sv.get(1).qps, 0.000000001f64), "the shortfall is the unmet share of each service, added");
+  failed += expect(close(shortfall(&sv, &q10), q10.unmet.get(0) / 20.0f64 + q10.unmet.get(1) / 10.0f64, 0.000000001f64), "by hand: unmet over 20 and over 10");
+  // Every order of three is tried once, in order, and then there is no next.
+  let mut perm = Vec<i32>::with_capacity(3);
+  perm.push(0);
+  perm.push(1);
+  perm.push(2);
+  let mut seen = 1;
+  let mut sum = 0;
+  while next_order(&mut perm) {
+    seen += 1;
+    sum = sum * 7 + perm.get(0) * 9 + perm.get(1) * 3 + perm.get(2);
+  }
+  failed += expect(seen == 6, "next_order gives all 6 orders of 3");
+  failed += expect(perm.get(0) == 2 && perm.get(1) == 1 && perm.get(2) == 0, "and ends at the last");
+  show("orders", shortfall(&sv, &q01), shortfall(&sv, &q10), shortfall(&sv, &pl));
+  print_plan(&pl);
+  show("plan", pl.unmet.get(0), pl.unmet.get(1), fl(pl.places.len()));
+  return failed;
+}
+
+fn batch_ok_for(s : Service, dep : Deploy, b : i32) -> bool {
+  return fits(s.model, dep, b, s.prompt + s.out) && decode_step(s.model, dep, b, s.prompt + s.out / 2) <= s.slo_tpot;
+}
+
+// The invariants of a plan.
+fn check_plan(f : &Fleet, sv : &Vec<Service>, p : &Plan) -> i32 {
+  let mut failed = 0;
+  let n = count(f);
+  let mut used = Vec<i32>::with_capacity(n);
+  for i in 0..n { used.push(0); }
+  let mut served = Vec<f64>::with_capacity(sv.len());
+  for k in 0..sv.len() { served.push(0.0f64); }
+  let mut twice = 0;
+  let mut bad_group = 0;
+  let mut missed = 0;
+  let mut over_rate = 0;
+  let mut bad_free = 0;
+  for i in 0..p.places.len() {
+    let pl = p.places.get(i);
+    let s = sv.get(pl.svc);
+    let proto = domain(f, p.members.get(pl.mstart));
+    for x in 0..pl.mcount {
+      let dom = p.members.get(pl.mstart + x);
+      if used.get(dom) == 1 { twice += 1; }
+      used.set(dom, 1);
+      if !same_class(domain(f, dom), proto) { bad_group += 1; }
+    }
+    if pl.mcount != pl.cand.dep.domains || pl.cand.dep.gpd != proto.gpus { bad_group += 1; }
+    if !batch_ok_for(s, pl.cand.dep, pl.cand.batch) || pl.cand.ttft > s.slo_ttft { missed += 1; }
+    if pl.served > pl.cand.rate * 1.000000001f64 || pl.served <= 0.0f64 { over_rate += 1; }
+    served.set(pl.svc, served.get(pl.svc) + pl.served);
+  }
+  for i in 0..n {
+    if (used.get(i) == 1) == (p.free.get(i) == 1) { bad_free += 1; }
+  }
+  let mut sums = 0;
+  for k in 0..sv.len() {
+    if !close(served.get(k) + p.unmet.get(k), sv.get(k).qps, 0.000000001f64) { sums += 1; }
+  }
+  failed += expect(twice == 0, "no domain is used twice");
+  failed += expect(bad_group == 0, "every placement is a group of one class, as the deployment says");
+  failed += expect(missed == 0, "every placement meets its targets");
+  failed += expect(over_rate == 0, "no placement serves more than its replica can");
+  failed += expect(bad_free == 0, "the free list is the complement of the used domains");
+  failed += expect(sums == 0, "served plus unmet is the rate of each service");
+  return failed;
+}
+
+fn same_plan(a : &Plan, b : &Plan) -> bool {
+  if a.places.len() != b.places.len() || a.members.len() != b.members.len() {
+    return false;
+  }
+  for i in 0..a.places.len() {
+    let x = a.places.get(i);
+    let y = b.places.get(i);
+    if x.svc != y.svc || x.mstart != y.mstart || x.mcount != y.mcount || x.cand.batch != y.cand.batch || x.cand.step != y.cand.step || x.served != y.served {
+      return false;
+    }
+  }
+  for i in 0..a.members.len() {
+    if a.members.get(i) != b.members.get(i) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// One line for each placement, for the Python port to price again: the layout and what was found.
+fn print_plan(p : &Plan) -> void {
+  for i in 0..p.places.len() {
+    let pl = p.places.get(i);
+    let c = pl.cand;
+    print!("placed: ");
+    print!(pl.svc);
+    print!(" ");
+    print!(c.dep.sku.name);
+    print!(" ");
+    print!(c.dep.domains);
+    print!(" ");
+    print!(c.dep.gpd);
+    print!(" ");
+    print!(c.dep.dp);
+    print!(" ");
+    print!(c.dep.cp);
+    print!(" ");
+    print!(c.dep.wb);
+    print!(" ");
+    print!(c.dep.kb);
+    print!(" ");
+    print!(c.dep.cross);
+    print!(" ");
+    print!(c.dep.lat);
+    print!(" ");
+    print!(c.batch);
+    print!(" ");
+    print!(c.step);
+    print!(" ");
+    print!(c.ttft);
+    print!("\n");
+  }
+  return;
+}
+
+fn main() -> i32 {
+  let mut failed = 0;
+  failed += test_models();
+  failed += test_graph();
+  failed += test_fleet();
+  failed += test_cost();
+  failed += test_plan();
+  if failed == 0 {
+    print!("ok\n");
+  }
+  return failed;
+}

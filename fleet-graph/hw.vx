@@ -1,0 +1,75 @@
+// fleet-graph, hardware: the GPUs a data center is built from, and the domains (a node or a rack
+// on one NVLink fabric) they sit in.
+//
+// Every figure is a vendor figure typed in from memory of the public spec sheets, NOT checked
+// against the datasheets (the same rule as the machine files in `fleet/`). Memory sizes and HBM
+// bandwidth follow those machine files where they have one. The cost is a placeholder in
+// relative units (an A100-80 is 1.0), not a price: put your own in.
+//
+// Units are bytes, bytes per second, FLOP per second and seconds. A link figure is for one
+// direction.
+
+import core::num;
+
+pub fn giga() -> f64 {
+  return 1000000000.0f64;
+}
+
+pub fn tera() -> f64 {
+  return 1000000000000.0f64;
+}
+
+pub fn peta() -> f64 {
+  return 1000000000000000.0f64;
+}
+
+struct Sku {
+  name : *const i8,
+  hbm : f64,         // bytes of HBM
+  hbm_bw : f64,      // bytes/s
+  bf16 : f64,        // dense bf16 FLOP/s
+  fp8 : f64,         // dense fp8 FLOP/s, 0 if the GPU has no fp8 tensor cores
+  nvlink : f64,      // bytes/s per GPU to the other GPUs of its domain
+  nic : f64,         // bytes/s per GPU out of the domain
+  cost : f64,        // relative cost of one GPU-hour
+}
+
+impl Copy for Sku {}
+
+pub fn a100_40() -> Sku {
+  return Sku { name: "A100-40", hbm: 40.0f64 * 1073741824.0f64, hbm_bw: 1.555f64 * tera(), bf16: 312.0f64 * tera(), fp8: 0.0f64, nvlink: 300.0f64 * giga(), nic: 25.0f64 * giga(), cost: 0.7f64 };
+}
+
+pub fn a100_80() -> Sku {
+  return Sku { name: "A100-80", hbm: 80.0f64 * 1073741824.0f64, hbm_bw: 2.039f64 * tera(), bf16: 312.0f64 * tera(), fp8: 0.0f64, nvlink: 300.0f64 * giga(), nic: 25.0f64 * giga(), cost: 1.0f64 };
+}
+
+pub fn h200() -> Sku {
+  return Sku { name: "H200", hbm: 141.0f64 * 1073741824.0f64, hbm_bw: 4.8f64 * tera(), bf16: 989.0f64 * tera(), fp8: 1979.0f64 * tera(), nvlink: 450.0f64 * giga(), nic: 50.0f64 * giga(), cost: 2.5f64 };
+}
+
+pub fn b200() -> Sku {
+  return Sku { name: "B200", hbm: 183359.0f64 * 1048576.0f64, hbm_bw: 7.7f64 * tera(), bf16: 2250.0f64 * tera(), fp8: 4500.0f64 * tera(), nvlink: 900.0f64 * giga(), nic: 50.0f64 * giga(), cost: 4.0f64 };
+}
+
+// A domain: `gpus` GPUs of one SKU that talk to each other at `sku.nvlink` each (an 8-GPU HGX node
+// behind NVSwitch, or a 72-GPU NVL72 rack), and reach the rest of the fleet through
+// `gpus * sku.nic` bytes/s of network.
+struct Domain {
+  sku : Sku,
+  gpus : i32,
+}
+
+impl Copy for Domain {}
+
+pub fn hgx8(sku : Sku) -> Domain {
+  return Domain { sku: sku, gpus: 8 };
+}
+
+pub fn nvl72(sku : Sku) -> Domain {
+  return Domain { sku: sku, gpus: 72 };
+}
+
+pub fn uplink(d : Domain) -> f64 {
+  return (d.gpus as f64) * d.sku.nic;
+}

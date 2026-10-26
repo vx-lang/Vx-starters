@@ -1,0 +1,341 @@
+// fleet-graph, plan: choosing where each service runs. One algorithm, no rule about a SKU or a
+// model:
+//
+//   1. A service is a model, a request rate, a prompt and an output length, and a target for the
+//      time between tokens (TPOT) and for the time to the first token (TTFT).
+//   2. A candidate is a group of free domains of one class (a SKU and a size), with a way to
+//      split the model over them (attention data or tensor parallel, a context-parallel degree,
+//      the weight and cache number formats the service allows). `evaluate` prices it with the
+//      cost model: the largest batch that fits in memory and meets the TPOT target, the TTFT, and
+//      from them the requests per second one replica serves and what a request costs.
+//   3. `best_for` tries every candidate the free part of the fleet can offer (the groups come
+//      from the graph, so their bandwidth is what the wiring gives) and takes the cheapest
+//      request that meets both targets; ties go to the first found.
+//   4. `schedule` places the services one at a time, the most demanding first (the one whose
+//      best candidate needs the most GPUs), a replica at a time, until the rate is met or
+//      nothing feasible is left; what is not met is reported.
+//
+// It is a greedy: the first services take the best of what is free and the later ones may be
+// left with worse. `schedule` makes no promise of the best total, only that every placement
+// meets its targets and that no domain is used twice.
+//
+// A replica does its prefills and its decode steps in turns (no overlap), so it serves
+// 1 / (ttft + out * step / batch) requests a second. Decode is costed at the average context
+// (prompt + out / 2), memory at the largest (prompt + out).
+
+import core::convert;
+import core::num;
+import cost;
+import fleet;
+import hw;
+import model;
+import std::vec;
+
+struct Service {
+  model : Model,
+  qps : f64,
+  prompt : i32,
+  out : i32,
+  slo_tpot : f64,
+  slo_ttft : f64,
+  min_wb : f64,        // the smallest bytes per weight the service accepts: 2 = bf16 only, 1 = fp8 too
+  kv_fp8 : i32,        // 1 if an fp8 cache is acceptable
+  bmax : i32,
+}
+
+impl Copy for Service {}
+
+struct Candidate {
+  ok : i32,
+  dep : Deploy,
+  batch : i32,
+  step : f64,
+  ttft : f64,
+  rate : f64,          // requests/s one replica serves
+  cost_hr : f64,
+  per_req : f64,       // cost units per request
+}
+
+impl Copy for Candidate {}
+
+struct Pick {
+  cand : Candidate,
+  members : Vec<i32>,
+}
+
+struct Placement {
+  svc : i32,
+  cand : Candidate,
+  mstart : i32,        // this placement's domains are plan.members[mstart .. mstart + mcount]
+  mcount : i32,
+  served : f64,
+}
+
+impl Copy for Placement {}
+
+struct Plan {
+  places : Vec<Placement>,
+  members : Vec<i32>,
+  free : Vec<i32>,
+  unmet : Vec<f64>,    // requests/s of each service left unplaced
+}
+
+fn fl(x : i32) -> f64 {
+  return f64::from(x);
+}
+
+pub fn make_service(m : Model, qps : f64, prompt : i32, out : i32, slo_tpot : f64, slo_ttft : f64, min_wb : f64, kv_fp8 : i32, bmax : i32) -> Service {
+  return Service { model: m, qps: qps, prompt: prompt, out: out, slo_tpot: slo_tpot, slo_ttft: slo_ttft, min_wb: min_wb, kv_fp8: kv_fp8, bmax: bmax };
+}
+
+fn no_candidate(dep : Deploy) -> Candidate {
+  return Candidate { ok: 0, dep: dep, batch: 0, step: 0.0f64, ttft: 0.0f64, rate: 0.0f64, cost_hr: 0.0f64, per_req: 0.0f64 };
+}
+
+// Can the deployment run the service at batch b: it fits, and a step meets the TPOT target.
+fn batch_ok(s : Service, dep : Deploy, b : i32) -> bool {
+  let ctx = s.prompt + s.out;
+  let avg = s.prompt + s.out / 2;
+  return fits(s.model, dep, b, ctx) && decode_step(s.model, dep, b, avg) <= s.slo_tpot;
+}
+
+// Prices one deployment for one service.
+pub fn evaluate(s : Service, dep : Deploy) -> Candidate {
+  if !batch_ok(s, dep, 1) {
+    return no_candidate(dep);
+  }
+  let ttft = prefill_time(s.model, dep, s.prompt);
+  if ttft > s.slo_ttft {
+    return no_candidate(dep);
+  }
+  // The largest batch that is still ok (ok is true for smaller ones: memory and step time only
+  // grow with the batch).
+  let mut lo = 1;
+  let mut hi = s.bmax + 1;
+  while hi - lo > 1 {
+    let mid = (lo + hi) / 2;
+    if batch_ok(s, dep, mid) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  let avg = s.prompt + s.out / 2;
+  let step = decode_step(s.model, dep, lo, avg);
+  let rate = 1.0f64 / (ttft + fl(s.out) * step / fl(lo));
+  let cost_hr = fl(gpus(dep)) * dep.sku.cost;
+  return Candidate { ok: 1, dep: dep, batch: lo, step: step, ttft: ttft, rate: rate, cost_hr: cost_hr, per_req: cost_hr / 3600.0f64 / rate };
+}
+
+// The cheapest candidate on `members` (a group of domains of one class), over the ways to split
+// the model. `none` if there is none.
+pub fn best_on(s : Service, f : &Fleet, members : &Vec<i32>, best : Candidate) -> Candidate {
+  let proto = domain(f, members.get(0));
+  let m = members.len();
+  let cross = group_bandwidth(f, members);
+  let lat = group_latency(f, members);
+  let g = m * proto.gpus;
+  let mut out = best;
+  let mut dp = 1;
+  while dp >= 0 {
+    let mut cp = 1;
+    while cp <= 64 && cp <= g {
+      if g % cp == 0 {
+        let mut wb = 2.0f64;
+        while wb >= 0.9f64 {
+          if wb >= s.min_wb {
+            let mut kb = 2.0f64;
+            while kb >= 0.9f64 {
+              if kb > 1.5f64 || s.kv_fp8 == 1 {
+                let dep = Deploy { sku: proto.sku, domains: m, gpd: proto.gpus, dp: dp, cp: cp, wb: wb, kb: kb, cross: cross, lat: lat };
+                let c = evaluate(s, dep);
+                if c.ok == 1 && (out.ok == 0 || c.per_req < out.per_req) {
+                  out = c;
+                }
+              }
+              kb = kb / 2.0f64;
+            }
+          }
+          wb = wb / 2.0f64;
+        }
+      }
+      cp = cp * 2;
+    }
+    dp = dp - 1;
+  }
+  return out;
+}
+
+// The best candidate the free domains can offer for a service, with the domains it would use.
+pub fn best_for(s : Service, f : &Fleet, free : &Vec<i32>) -> Pick {
+  let n = count(f);
+  let mut best = no_candidate(Deploy { sku: domain(f, 0).sku, domains: 0, gpd: 0, dp: 0, cp: 1, wb: 2.0f64, kb: 2.0f64, cross: 0.0f64, lat: 0.0f64 });
+  let mut best_members = Vec<i32>::with_capacity(1);
+  for i in 0..n {
+    // i represents its class if it is free and no lower free domain is of that class.
+    let mut first = free.get(i) == 1;
+    for j in 0..i {
+      if free.get(j) == 1 && same_class(domain(f, j), domain(f, i)) {
+        first = false;
+      }
+    }
+    if first {
+      let mut avail = 0;
+      for j in 0..n {
+        if free.get(j) == 1 && same_class(domain(f, j), domain(f, i)) {
+          avail += 1;
+        }
+      }
+      let mut m = 1;
+      while m <= avail && m <= 16 {
+        let group = pick_group(f, i, m, free);
+        if group.len() == m {
+          let c = best_on(s, f, &group, best);
+          if c.ok == 1 && (best.ok == 0 || c.per_req < best.per_req) {
+            best = c;
+            best_members = group;
+          }
+        }
+        m += 1;
+      }
+    }
+  }
+  return Pick { cand: best, members: best_members };
+}
+
+// The GPUs the best candidate for the service needs, on an empty fleet; 0 if there is none.
+fn demand_size(s : Service, f : &Fleet) -> i32 {
+  let mut free = Vec<i32>::with_capacity(count(f));
+  for i in 0..count(f) {
+    free.push(1);
+  }
+  let p = best_for(s, f, &free);
+  if p.cand.ok == 0 {
+    return 0;
+  }
+  return gpus(p.cand.dep);
+}
+
+// Places the services, a service at a time in the given order.
+pub fn schedule_in_order(f : &Fleet, svcs : &Vec<Service>, order : &Vec<i32>) -> Plan {
+  let ns = svcs.len();
+  let mut plan = Plan { places: Vec<Placement>::with_capacity(8), members: Vec<i32>::with_capacity(8), free: Vec<i32>::with_capacity(count(f)), unmet: Vec<f64>::with_capacity(ns) };
+  for i in 0..count(f) {
+    plan.free.push(1);
+  }
+  for k in 0..ns {
+    plan.unmet.push(svcs.get(k).qps);
+  }
+  for o in 0..ns {
+    let k = order.get(o);
+    let s = svcs.get(k);
+    let mut left = s.qps;
+    while left > 0.000000001f64 {
+      let p = best_for(s, f, &plan.free);
+      if p.cand.ok == 0 {
+        break;
+      }
+      let served = left.min(p.cand.rate);
+      let start = plan.members.len();
+      for x in 0..p.members.len() {
+        plan.members.push(p.members.get(x));
+        plan.free.set(p.members.get(x), 0);
+      }
+      plan.places.push(Placement { svc: k, cand: p.cand, mstart: start, mcount: p.members.len(), served: served });
+      left = left - served;
+    }
+    plan.unmet.set(k, left.max(0.0f64));
+  }
+  return plan;
+}
+
+// How much of the demand a plan leaves: the unmet share of each service, added up.
+pub fn shortfall(svcs : &Vec<Service>, p : &Plan) -> f64 {
+  let mut t = 0.0f64;
+  for k in 0..svcs.len() {
+    t = t + p.unmet.get(k) / svcs.get(k).qps;
+  }
+  return t;
+}
+
+// What the placements cost per hour.
+pub fn spend(p : &Plan) -> f64 {
+  let mut t = 0.0f64;
+  for i in 0..p.places.len() {
+    t = t + p.places.get(i).cand.cost_hr;
+  }
+  return t;
+}
+
+// The next arrangement of v in order; false after the last.
+pub fn next_order(v : &mut Vec<i32>) -> bool {
+  let n = v.len();
+  let mut i = n - 1;
+  while i > 0 && v.get(i - 1) >= v.get(i) {
+    i = i - 1;
+  }
+  if i == 0 {
+    return false;
+  }
+  let mut j = n - 1;
+  while v.get(j) <= v.get(i - 1) {
+    j = j - 1;
+  }
+  let t = v.get(i - 1);
+  v.set(i - 1, v.get(j));
+  v.set(j, t);
+  let mut a = i;
+  let mut b = n - 1;
+  while a < b {
+    let u = v.get(a);
+    v.set(a, v.get(b));
+    v.set(b, u);
+    a += 1;
+    b = b - 1;
+  }
+  return true;
+}
+
+// Places the services on the fleet. A greedy depends on the order, and the first service takes
+// the best of what is free, so this tries the order with the most demanding service first and,
+// for up to 5 services, every other order, and keeps the plan that leaves the least unmet (then the
+// one that costs the least an hour; then the first found).
+pub fn schedule(f : &Fleet, svcs : &Vec<Service>) -> Plan {
+  let ns = svcs.len();
+  let mut size = Vec<i32>::with_capacity(ns);
+  for k in 0..ns {
+    size.push(demand_size(svcs.get(k), f));
+  }
+  let mut order = Vec<i32>::with_capacity(ns);
+  for k in 0..ns {
+    order.push(k);
+  }
+  for a in 0..ns {
+    for b in a + 1..ns {
+      let x = order.get(a);
+      let y = order.get(b);
+      if size.get(y) > size.get(x) || (size.get(y) == size.get(x) && y < x) {
+        order.set(a, y);
+        order.set(b, x);
+      }
+    }
+  }
+  let mut best = schedule_in_order(f, svcs, &order);
+  if ns <= 5 && ns > 1 {
+    let mut other = Vec<i32>::with_capacity(ns);
+    for k in 0..ns {
+      other.push(k);
+    }
+    let mut more = true;
+    while more {
+      let p = schedule_in_order(f, svcs, &other);
+      let a = shortfall(svcs, &p);
+      let b = shortfall(svcs, &best);
+      if a < b - 0.000000001f64 || (a < b + 0.000000001f64 && spend(&p) < spend(&best)) {
+        best = p;
+      }
+      more = next_order(&mut other);
+    }
+  }
+  return best;
+}
