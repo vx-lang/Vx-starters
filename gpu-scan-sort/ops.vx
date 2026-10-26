@@ -1,0 +1,158 @@
+// gpu-scan-sort: prefix scan, histogram and a stable radix sort on the GPU. The scan gives the
+// same order every run, which an atomic counter (as in `gpu-moe`) does not: a lane that wins the
+// counter first gets the lower slot, and that changes from run to run.
+//
+// `scan_tiles` scans tiles of 256 numbers in shared memory, with 8 steps of Hillis-Steele between
+// two buffers (each step reads one buffer and writes the other, so no lane reads a number
+// another lane is writing). `scan_exclusive` scans the tile sums the same way and adds them back,
+// so it handles up to 65536 numbers. `radix_sort` is a stable sort of non-negative i32 keys by
+// their low `bits` bits, one bit at a time: the keys with a 0 in that bit keep their order and go
+// first, the ones with a 1 follow, in their order, and the positions come from `scan_exclusive`.
+// The values travel with the keys; sort `0..n` as the values to get the permutation.
+//
+// The final writes of a pass go to positions only the data knows, so they are atomic stores (the
+// race proof refuses a plain write there).
+
+import core::num;
+import core::sync::atomic;
+
+// out[i] = the sum of inp[t * 256 .. i) inside i's tile t; sums[t] = the sum of tile t.
+pub fn scan_tiles(out : &mut Tensor<i32, [?], Memory::HBM>, sums : &mut Tensor<i32, [?], Memory::HBM>, inp : &Tensor<i32, [?], Memory::HBM>, n : i32) -> void {
+  spawn on(Topology::Device) {
+    for t in 0..(n + 255) / 256 across blocks {
+      let mut a = unsafe { Tensor<i32, [256], Memory::SMEM>::uninit() };
+      let mut b = unsafe { Tensor<i32, [256], Memory::SMEM>::uninit() };
+      for l in 0..256 across lanes {
+        let i = t * 256 + l;
+        if i < n {
+          a[l] = inp[i];
+        } else {
+          a[l] = 0;
+        }
+      }
+      for l in 0..256 across lanes {
+        if l >= 1 { b[l] = a[l] + a[l - 1]; } else { b[l] = a[l]; }
+      }
+      for l in 0..256 across lanes {
+        if l >= 2 { a[l] = b[l] + b[l - 2]; } else { a[l] = b[l]; }
+      }
+      for l in 0..256 across lanes {
+        if l >= 4 { b[l] = a[l] + a[l - 4]; } else { b[l] = a[l]; }
+      }
+      for l in 0..256 across lanes {
+        if l >= 8 { a[l] = b[l] + b[l - 8]; } else { a[l] = b[l]; }
+      }
+      for l in 0..256 across lanes {
+        if l >= 16 { b[l] = a[l] + a[l - 16]; } else { b[l] = a[l]; }
+      }
+      for l in 0..256 across lanes {
+        if l >= 32 { a[l] = b[l] + b[l - 32]; } else { a[l] = b[l]; }
+      }
+      for l in 0..256 across lanes {
+        if l >= 64 { b[l] = a[l] + a[l - 64]; } else { b[l] = a[l]; }
+      }
+      for l in 0..256 across lanes {
+        if l >= 128 { a[l] = b[l] + b[l - 128]; } else { a[l] = b[l]; }
+      }
+      // a is the inclusive scan of the tile; the exclusive one takes the number itself away.
+      for l in 0..256 across lanes {
+        let i = t * 256 + l;
+        if i < n {
+          out[i] = a[l] - inp[i];
+        }
+      }
+      sums[t] = a[255];
+    }
+  }
+  return;
+}
+
+// out[i] += add[i / 256].
+pub fn scan_add(out : &mut Tensor<i32, [?], Memory::HBM>, add : &Tensor<i32, [?], Memory::HBM>, n : i32) -> void {
+  spawn on(Topology::Device) {
+    for t in 0..(n + 255) / 256 across blocks {
+      for l in 0..256 across lanes {
+        let i = t * 256 + l;
+        if i < n {
+          out[i] = out[i] + add[t];
+        }
+      }
+    }
+  }
+  return;
+}
+
+// out[i] = inp[0] + .. + inp[i - 1], for n up to 65536. `sums`, `offs` and `top` are scratch of at
+// least (n + 255) / 256, (n + 255) / 256 and 1 numbers.
+pub fn scan_exclusive(out : &mut Tensor<i32, [?], Memory::HBM>, sums : &mut Tensor<i32, [?], Memory::HBM>, offs : &mut Tensor<i32, [?], Memory::HBM>, top : &mut Tensor<i32, [?], Memory::HBM>, inp : &Tensor<i32, [?], Memory::HBM>, n : i32) -> void {
+  scan_tiles(out, sums, inp, n);
+  scan_tiles(offs, top, sums, (n + 255) / 256);
+  scan_add(out, offs, n);
+  return;
+}
+
+// bins[keys[i]] += 1, for keys in 0..bins.
+pub fn histogram(bins : &Tensor<i32, [?], Memory::HBM>, keys : &Tensor<i32, [?], Memory::HBM>, n : i32) -> void {
+  spawn on(Topology::Device) {
+    for t in 0..(n + 255) / 256 across blocks {
+      for l in 0..256 across lanes {
+        let i = t * 256 + l;
+        if i < n {
+          let _old = atomic_fetch_add_i32(bins, keys[i], 1, AtomicOrdering::Relaxed);
+        }
+      }
+    }
+  }
+  return;
+}
+
+// zeros[i] = 1 if bit `bit` of keys[i] is 0, else 0.
+pub fn bit_flags(zeros : &mut Tensor<i32, [?], Memory::HBM>, keys : &Tensor<i32, [?], Memory::HBM>, n : i32, bit : i32) -> void {
+  spawn on(Topology::Device) {
+    for t in 0..(n + 255) / 256 across blocks {
+      for l in 0..256 across lanes {
+        let i = t * 256 + l;
+        if i < n {
+          zeros[i] = 1 - ((keys[i] >> bit) & 1);
+        }
+      }
+    }
+  }
+  return;
+}
+
+// One stable pass: the entries with a 0 bit go first, in order, then the ones with a 1 bit. `before`
+// is the exclusive scan of `zeros`.
+pub fn split_pass(keys_out : &Tensor<i32, [?], Memory::HBM>, vals_out : &Tensor<i32, [?], Memory::HBM>, keys : &Tensor<i32, [?], Memory::HBM>, vals : &Tensor<i32, [?], Memory::HBM>, zeros : &Tensor<i32, [?], Memory::HBM>, before : &Tensor<i32, [?], Memory::HBM>, n : i32) -> void {
+  spawn on(Topology::Device) {
+    for t in 0..(n + 255) / 256 across blocks {
+      for l in 0..256 across lanes {
+        let i = t * 256 + l;
+        if i < n {
+          let total_zeros = before[n - 1] + zeros[n - 1];
+          let mut pos = total_zeros + i - before[i];
+          if zeros[i] == 1 {
+            pos = before[i];
+          }
+          atomic_store_i32(keys_out, pos, keys[i], AtomicOrdering::Relaxed);
+          atomic_store_i32(vals_out, pos, vals[i], AtomicOrdering::Relaxed);
+        }
+      }
+    }
+  }
+  return;
+}
+
+// Sorts keys (with vals) by their low `bits` bits, stable. `bits` must be even, so the result is back
+// in keys and vals; tk and tv are scratch of n numbers, and the rest as in `scan_exclusive`.
+pub fn radix_sort(keys : &mut Tensor<i32, [?], Memory::HBM>, vals : &mut Tensor<i32, [?], Memory::HBM>, tk : &mut Tensor<i32, [?], Memory::HBM>, tv : &mut Tensor<i32, [?], Memory::HBM>, zeros : &mut Tensor<i32, [?], Memory::HBM>, before : &mut Tensor<i32, [?], Memory::HBM>, sums : &mut Tensor<i32, [?], Memory::HBM>, offs : &mut Tensor<i32, [?], Memory::HBM>, top : &mut Tensor<i32, [?], Memory::HBM>, n : i32, bits : i32) -> void {
+  for p in 0..bits / 2 {
+    bit_flags(zeros, keys, n, 2 * p);
+    scan_exclusive(before, sums, offs, top, zeros, n);
+    split_pass(tk, tv, keys, vals, zeros, before, n);
+    bit_flags(zeros, tk, n, 2 * p + 1);
+    scan_exclusive(before, sums, offs, top, zeros, n);
+    split_pass(keys, vals, tk, tv, zeros, before, n);
+  }
+  return;
+}
