@@ -306,6 +306,21 @@ counts only the wire, as the transfer is pipelined, so the compiler's sum is an 
 I broke the bridge five ways (a wrong HBM size, the cache split over one NIC instead of all, `fits`
 without the weights, with the wrong comparison, with the whole of HBM as the limit); each fails.
 
+## How far to trust the numbers
+
+A rough check, from memory of the figures DeepSeek published for its own deployment (about 14.8 thousand
+output tokens a second per H800 node at about 50 ms a token and an average context of 4989 tokens, and
+about 73.7 thousand input tokens a second per node for prefill, 56% of them cache hits; I have not
+re-checked these). The model gives one H200 node 33.9 thousand output tokens a second at 50 ms a token
+and a context of 4989, and 58 thousand prompt tokens a second of prefill. An H200 has 1.43 times the
+memory bandwidth of an H800 (4.8 against 3.35 TB/s), which would put the decode figure near 21 thousand,
+so the model is about 1.6 times too fast there; on prefill, with the same arithmetic rate and 44% of the
+prompt computed, the published figure is about 32 thousand computed tokens a second, and the model is
+about 1.8 times too fast. That is the direction the README says to expect (uniform routing, efficiency
+factors that are guesses, no queueing), and under a factor of two. Before trusting an absolute number,
+set the factors in `cost.vx` from a measured run; the comparison between two fleets or two layouts is
+less sensitive to them than the throughput of either.
+
 ## What it is not
 
 * **The numbers are not measured.** Hardware figures are typed from memory of the vendor sheets and
