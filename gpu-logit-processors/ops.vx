@@ -1,0 +1,103 @@
+// gpu-logit-processors: the changes a serving loop makes to the logits before it picks a token,
+// done on the GPU so the logits never cross to the host. They run before `gpu-sampling`, in
+// this order:
+//
+//   1. `count_history` and `count_token` keep, for each row, how many times each token has
+//      appeared (the prompt and what was generated).
+//   2. `apply_penalties` changes the logit of each token that has appeared: repetition (a
+//      positive logit is divided by `rep`, a negative one multiplied), then frequency (minus
+//      `freq` for each time) and presence (minus `pres` once). Each row has its own values.
+//   3. `apply_bias_mask` adds a bias for each token, shared by the rows, and turns the logit of
+//      a token a row does not allow to -infinity.
+//   4. `scale_temperature` divides a row by its temperature; a temperature of 0 or less leaves
+//      the row as it is (greedy). Then call `sample_rows` with a temperature of 1.0.
+//
+// All the work is elementwise, so the kernels are a block for each row and a lane for each
+// token, 256 at a time, except the two counters, which add with atomics (the race proof refuses
+// a plain write at a position only the data knows).
+
+import core::num;
+import core::sync::atomic;
+
+// counts[r * vocab + t] += 1 for each token t in hist[r][0..lens[r]]. `counts` has rows * vocab
+// values; start from zeros, or from the counts of earlier calls.
+pub fn count_history(counts : &Tensor<i32, [?], Memory::HBM>, hist : &Tensor<i32, [?, ?], Memory::HBM>, lens : &Tensor<i32, [?], Memory::HBM>, rows : i32, maxlen : i32, vocab : i32) -> void {
+  spawn on(Topology::Device) {
+    for r in 0..rows across blocks {
+      for l in 0..256 across lanes {
+        for q in 0..(maxlen + 255) / 256 {
+          let p = l + 256 * q;
+          if p < lens[r] {
+            let _old = atomic_fetch_add_i32(counts, r * vocab + hist[r][p], 1, AtomicOrdering::Relaxed);
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+// counts[r * vocab + tokens[r]] += 1: the token just picked for each row.
+pub fn count_token(counts : &Tensor<i32, [?], Memory::HBM>, tokens : &Tensor<i32, [?], Memory::HBM>, rows : i32, vocab : i32) -> void {
+  spawn on(Topology::Device) {
+    for b in 0..(rows + 255) / 256 across blocks {
+      for l in 0..256 across lanes {
+        let r = b * 256 + l;
+        if r < rows {
+          let _old = atomic_fetch_add_i32(counts, r * vocab + tokens[r], 1, AtomicOrdering::Relaxed);
+        }
+      }
+    }
+  }
+  return;
+}
+
+// Repetition, frequency and presence penalties, in place. Only tokens with a count above 0 change.
+pub fn apply_penalties(logits : &mut Tensor<f32, [?, ?], Memory::HBM>, counts : &Tensor<i32, [?], Memory::HBM>, rep : &Tensor<f32, [?], Memory::HBM>, freq : &Tensor<f32, [?], Memory::HBM>, pres : &Tensor<f32, [?], Memory::HBM>, rows : i32, vocab : i32) -> void {
+  spawn on(Topology::Device) {
+    for r in 0..rows across blocks {
+      for c in 0..vocab across lanes(256) {
+        let n = counts[r * vocab + c];
+        if n > 0 {
+          let x = logits[r][c];
+          let mut y = x * rep[r];
+          if x > 0.0 {
+            y = x / rep[r];
+          }
+          logits[r][c] = y - freq[r] * (n as f32) - pres[r];
+        }
+      }
+    }
+  }
+  return;
+}
+
+// logits[r][c] += bias[c], then -infinity where allowed[r][c] is 0.
+pub fn apply_bias_mask(logits : &mut Tensor<f32, [?, ?], Memory::HBM>, bias : &Tensor<f32, [?], Memory::HBM>, allowed : &Tensor<i32, [?, ?], Memory::HBM>, rows : i32, vocab : i32) -> void {
+  spawn on(Topology::Device) {
+    for r in 0..rows across blocks {
+      for c in 0..vocab across lanes(256) {
+        let mut y = logits[r][c] + bias[c];
+        if allowed[r][c] == 0 {
+          y = 0.0 - 1.0 / 0.0;
+        }
+        logits[r][c] = y;
+      }
+    }
+  }
+  return;
+}
+
+// logits[r][c] /= temp[r], for rows with temp[r] > 0.
+pub fn scale_temperature(logits : &mut Tensor<f32, [?, ?], Memory::HBM>, temp : &Tensor<f32, [?], Memory::HBM>, rows : i32, vocab : i32) -> void {
+  spawn on(Topology::Device) {
+    for r in 0..rows across blocks {
+      for c in 0..vocab across lanes(256) {
+        if temp[r] > 0.0 {
+          logits[r][c] = logits[r][c] / temp[r];
+        }
+      }
+    }
+  }
+  return;
+}
