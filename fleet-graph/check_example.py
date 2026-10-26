@@ -80,6 +80,8 @@ for m in re.finditer(r"^  (\S+) x(\d+): (\d+) domains \((\d+) GPUs\), (\d+) in u
 if in_use != len(domains):
     fail(f"the fleet says {in_use} domains are in use, the placements list {len(domains)}")
 
+if not re.search(r"^headroom: [\d.]+ (times this load|of this load)", text, re.M):
+    fail("no headroom line")
 if "losses" not in text or "the worst leaf switch" not in text:
     fail("no losses section")
 if failed:

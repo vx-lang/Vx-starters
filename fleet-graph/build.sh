@@ -36,3 +36,8 @@ python3 -I admit.py "$VX_HOME" "$scratch" < "$scratch/lines"
 "$VX_HOME/bin/vxc" -a run-jit examples/datacenter.vx 2> /dev/null | grep -v '^\[' > "$scratch/report"
 cat "$scratch/report"
 python3 -I check_example.py < "$scratch/report"
+
+# 5. What to buy: the same planner over a grid of fleets. The table must add up.
+"$VX_HOME/bin/vxc" -a run-jit examples/procure.vx 2> /dev/null | grep -v '^\[' > "$scratch/procure"
+grep -E '^(fleets|  [0-9]+ racks|cheapest)' "$scratch/procure"
+python3 -I check_procure.py < "$scratch/procure"

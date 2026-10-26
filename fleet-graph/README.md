@@ -28,7 +28,7 @@ Plain host code: no GPU and no CUDA. Every figure is an estimate (see *What it i
 | `fleet.vx` | A fleet: a vertex for each domain, one leaf switch for each group of domains, one spine, with the leaf-to-spine links cut by an oversubscription factor. `group_bandwidth` and `group_latency` of a set of domains read off the graph, with a leaf link shared by the members under it; `pick_group` chooses domains of one class that are as close as the graph allows |
 | `model.vx` | `Model`: layers, dense layers, hidden size, MLA or GQA attention, experts. Parameter counts, KV size of a token, and the attention FLOPs of a query-key pair all follow from those fields. `deepseek_v3()` and `glm_4_5()` |
 | `cost.vx` | `Deploy`: a group of whole domains, attention data or tensor parallel, a context-parallel degree, number formats. `fits`, `decode_step` and `prefill_time` |
-| `report.vx`, `examples/datacenter.vx` | A plan as text (services, placements, fleet use) and what losing a domain or a leaf switch does to it; and a whole datacenter in one program (below) |
+| `report.vx`, `examples/datacenter.vx`, `examples/procure.vx` | A plan as text (services, placements, fleet use) and what losing a domain or a leaf switch does to it, and the headroom; a whole datacenter in one program, and the cheapest fleet that carries a load (below) |
 | `emit.vx`, `admit.py` | The bridge to the compiler (below): what the planner believes, printed as lines, and a Vx program for each, compiled against the machine files of the toolchain |
 | `plan.vx` | `Service` (model, request rate, prompt, output, targets for time per token and time to first token, and whether it is served co-located or on separate prefill and decode pools); `evaluate`, `evaluate_prefill`, `evaluate_decode`, `best_role`, `schedule` |
 
@@ -158,6 +158,30 @@ placement, the GPUs of a service are those of its placements, the domains in use
 the spend is the sum of the services' costs, what a service is served is what its replicas serve, and
 the unmet share follows from the asked and served.
 
+### Headroom
+
+`headroom` answers "how much more load does the fleet carry?": the largest factor, to about 1%, by
+which every rate can be multiplied with nothing left unmet (below 1 when the load as given is not
+met), found by doubling and bisection. On the example fleet it is 0.43: with the million-token service
+asked for at 0.02 requests a second, nothing is left unmet only at about 0.4 of the whole load. On
+two H200 nodes carrying half a replica's rate it is 4.00, as it must be (two nodes, one replica each,
+and half a replica's rate asked), and with three replicas' rate asked it is 0.66, which the test
+checks. The greedy is not monotone, so this is the boundary of one search, not a promise for every
+placement.
+
+### What to buy
+
+`examples/procure.vx` runs the planner over a grid of fleets (0 to 2 NVL72 racks, 0 to 12 H200 nodes,
+0 to 24 A100 nodes) for four services (DeepSeek-V3 chat, GLM-4.5 chat, long documents, agents) and
+prints a line for each: the price (the hourly cost of all its GPUs, used or not) and the unmet share.
+Of the 26 fleets, only three carry the load, and all three have two racks and twelve H200 nodes (with
+0, 12 or 24 A100 nodes). The cheapest is the one without A100 nodes, 816 an hour: with these targets the
+A100 nodes do not make a smaller fleet of the others sufficient (the best of the other fleets still
+leaves 0.71 of a service unmet, even with a rack, twelve H200 nodes and 24 A100 nodes), so they only add
+to the price. `check_procure.py` works the prices out again and checks that no cheaper fleet of the
+table carries the load. The grid is coarse and the services are placed in
+one order; it is a way to see where the money goes, not an optimizer.
+
 ## What the tests check
 
 `test.vx` returns the number of failed checks and prints `ok` when there are none.
@@ -188,7 +212,9 @@ the unmet share follows from the asked and served.
 7. **Losses and the report.** A domain that is down is not used and not free, the search over orders
    keeps to the same fleet, and a service whose every host is down is left whole; the number formatter
    against Python's.
-8. **Python.** `check.py` prices the same layouts again from the architectures and the formulas,
+8. **Headroom.** On two nodes: 4.0 times the load for half a replica's rate, 0.66 for three
+   replicas' rate, and at the boundary the load is met and 5% more is not.
+9. **Python.** `check.py` prices the same layouts again from the architectures and the formulas,
    written out a second time, and every placement of the schedule too; they agree to 1e-9.
 
 ## The compiler checks the planner

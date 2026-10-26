@@ -301,3 +301,17 @@ pub fn print_losses(f : &Fleet, svcs : &Vec<Service>, base : &Plan) -> void {
   print_loss_line(f, svcs, base, &order, &down);
   return;
 }
+
+// How much more load the fleet carries before something goes unmet (or how much of it, below 1).
+pub fn print_headroom(f : &Fleet, svcs : &Vec<Service>) -> void {
+  let order = demand_order(f, svcs);
+  let h = headroom(f, svcs, &order);
+  print!("headroom: ");
+  print_f(h, 2);
+  if h >= 1.0f64 {
+    print!(" times this load before something goes unmet\n");
+  } else {
+    print!(" of this load is met; above that something goes unmet\n");
+  }
+  return;
+}
