@@ -1,0 +1,191 @@
+// Tests for gpu-sampling: greedy, top-k, top-p, min-p and the three together, 64 rows each, against
+// a host sampler that ranks the candidates by repeated scans and draws over the whole vocabulary
+// in id order, as the `sampler` starter does. Every token must be equal. Returns the number of
+// failed checks, and prints "ok" when there are none. It also prints some tokens, which
+// check.py computes again in Python.
+//
+//   ./build.sh
+
+import core::convert;
+import core::num;
+import ops;
+
+const ROWS : i32 = 64;
+const VOCAB : i32 = 1000;
+const CAP : i32 = 16;
+
+fn neg_inf() -> f32 {
+  return 0.0 - 1.0 / 0.0;
+}
+
+// The logits of row r. Four patterns (r mod 4) on a grid of 1/16 that repeats every 101 tokens,
+// so many tokens tie; every 123rd token (from the pattern's offset) is boosted by 8, so that a
+// few tokens hold most of the mass at a low temperature; every 50th token starting at 7 is
+// masked in rows 2 and 3. Rows 1, 5, .. have a three-way tie at the top.
+fn logit(r : i32, c : i32) -> f32 {
+  let pat = r % 4;
+  if r % 4 >= 2 && c % 50 == 7 {
+    return neg_inf();
+  }
+  // Rows of pattern 1 have three tokens tied for the largest logit; 70 and 582 are in the same
+  // lane of the kernels (they differ by 512), 300 is in another.
+  if pat == 1 && (c == 70 || c == 300 || c == 582) {
+    return 20.0;
+  }
+  let mut v : f32 = (((c * 37 + pat * 11) % 101) as f32) / 16.0 - 3.0;
+  if c % 123 == pat {
+    v = v + 8.0;
+  }
+  return v;
+}
+
+fn uniform(r : i32) -> f32 {
+  return ((r as f32) + 0.5) / 64.0;
+}
+
+// The host sampler for one row. `order` gets the CAP largest logits (ties: lower id), and the
+// kept set is the intersection of the three cuts. Returns the drawn token, or -1 if the kept set
+// needs more than CAP tokens (the test data must not).
+fn host_sample(r : i32, t : f32, k : i32, mass : f32, ratio : f32) -> i32 {
+  let mut lg = Tensor<f32, [1000]>::new();
+  let mut used = Tensor<i32, [1000]>::new();
+  let mut order = Tensor<i32, [16]>::new();
+  for c in 0..VOCAB { lg[c] = logit(r, c); }
+  for j in 0..CAP {
+    let mut best : i32 = 0;
+    let mut have = 0;
+    for c in 0..VOCAB {
+      if used[c] == 0 && (have == 0 || lg[c] > lg[best]) {
+        best = c;
+        have = 1;
+      }
+    }
+    order[j] = best;
+    used[best] = 1;
+  }
+  let top = lg[order[0]];
+  let mut z : f32 = 0.0;
+  for c in 0..VOCAB { z += ((lg[c] - top) / t).exp(); }
+  let mut keep = Tensor<i32, [1000]>::new();
+  let mut cum : f32 = 0.0;
+  let mut kept_sum : f32 = 0.0;
+  for j in 0..CAP {
+    let p = ((lg[order[j]] - top) / t).exp() / z;
+    if j < k && cum < mass && p >= ratio * (1.0 / z) && p > 0.0 {
+      keep[order[j]] = 1;
+      kept_sum += p;
+    }
+    cum += p;
+  }
+  // If the cuts would still be open past the last candidate, the set may need more than CAP.
+  if k > CAP || (cum < mass && ratio == 0.0 && k >= CAP) { return -1; }
+  // The draw, over the whole vocabulary in id order.
+  let u = uniform(r);
+  let mut total : f32 = 0.0;
+  let mut last : i32 = 0;
+  for c in 0..VOCAB {
+    if keep[c] != 0 {
+      let p = ((lg[c] - top) / t).exp() / z / kept_sum;
+      total += p;
+      last = c;
+      if u < total { return c; }
+    }
+  }
+  return last;
+}
+
+// Compares the device tokens of one configuration with the host's for every row.
+fn compare(name : *const i8, out : &Tensor<i32, [?]>, t : f32, k : i32, mass : f32, ratio : f32) -> i32 {
+  let mut wrong = 0;
+  let mut short = 0;
+  for r in 0..ROWS {
+    let want = host_sample(r, t, k, mass, ratio);
+    if want < 0 { short += 1; }
+    if out[r] != want { wrong += 1; }
+  }
+  print!(name);
+  print!(": ");
+  print!(out[0]);
+  print!(" ");
+  print!(out[31]);
+  print!(" ");
+  print!(out[63]);
+  print!("\n");
+  let mut failed = 0;
+  if wrong > 0 {
+    print!("  FAIL: ");
+    print!(wrong);
+    print!(" tokens differ from the host sampler\n");
+    failed += 1;
+  }
+  if short > 0 {
+    print!("  FAIL: the test data needs more than CAP candidates in ");
+    print!(short);
+    print!(" rows\n");
+    failed += 1;
+  }
+  return failed;
+}
+
+fn main() -> i32 {
+  let mut failed = 0;
+  let mut lg_h = Tensor<f32, [64, 1000]>::new();
+  let mut u_h = Tensor<f32, [64]>::new();
+  for r in 0..ROWS {
+    u_h[r] = uniform(r);
+    for c in 0..VOCAB { lg_h[r][c] = logit(r, c); }
+  }
+  let logits = transfer(lg_h, Memory::HBM);
+  let u = transfer(u_h, Memory::HBM);
+  let mut ids = transfer(Tensor<i32, [64]>::new(), Memory::HBM);
+  let mut topi = transfer(Tensor<i32, [64, 16]>::new(), Memory::HBM);
+  let mut topv = transfer(Tensor<f32, [64, 16]>::new(), Memory::HBM);
+  let work = transfer(Tensor<f32, [64000]>::new(), Memory::HBM);
+
+  // Greedy: the host takes the first largest logit.
+  argmax_rows(&mut ids, &logits, ROWS, VOCAB);
+  let greedy = transfer(ids, Memory::CPU_DRAM);
+  let mut wrong = 0;
+  for r in 0..ROWS {
+    let mut best : i32 = 0;
+    for c in 1..VOCAB {
+      if logit(r, c) > logit(r, best) { best = c; }
+    }
+    if greedy[r] != best { wrong += 1; }
+  }
+  print!("greedy: ");
+  print!(greedy[0]);
+  print!(" ");
+  print!(greedy[31]);
+  print!(" ");
+  print!(greedy[63]);
+  print!("\n");
+  if wrong > 0 {
+    print!("  FAIL: ");
+    print!(wrong);
+    print!(" greedy tokens differ\n");
+    failed += 1;
+  }
+
+  topk_candidates(&mut topi, &mut topv, &work, &logits, ROWS, VOCAB, CAP);
+  let mut o1 = transfer(Tensor<i32, [64]>::new(), Memory::HBM);
+  let mut o2 = transfer(Tensor<i32, [64]>::new(), Memory::HBM);
+  let mut o3 = transfer(Tensor<i32, [64]>::new(), Memory::HBM);
+  let mut o4 = transfer(Tensor<i32, [64]>::new(), Memory::HBM);
+  sample_rows(&mut o1, &logits, &topi, &topv, &u, ROWS, VOCAB, CAP, 0.8, 5, 2.0, 0.0);
+  sample_rows(&mut o2, &logits, &topi, &topv, &u, ROWS, VOCAB, CAP, 0.5, 16, 0.9, 0.0);
+  sample_rows(&mut o3, &logits, &topi, &topv, &u, ROWS, VOCAB, CAP, 0.5, 16, 2.0, 0.3);
+  sample_rows(&mut o4, &logits, &topi, &topv, &u, ROWS, VOCAB, CAP, 0.6, 8, 0.95, 0.1);
+  let c1 = transfer(o1, Memory::CPU_DRAM);
+  let c2 = transfer(o2, Memory::CPU_DRAM);
+  let c3 = transfer(o3, Memory::CPU_DRAM);
+  let c4 = transfer(o4, Memory::CPU_DRAM);
+  failed += compare("top_k", &c1, 0.8, 5, 2.0, 0.0);
+  failed += compare("top_p", &c2, 0.5, 16, 0.9, 0.0);
+  failed += compare("min_p", &c3, 0.5, 16, 2.0, 0.3);
+  failed += compare("all_three", &c4, 0.6, 8, 0.95, 0.1);
+  if failed == 0 {
+    print!("ok\n");
+  }
+  return failed;
+}

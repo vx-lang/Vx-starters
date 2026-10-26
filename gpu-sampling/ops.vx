@@ -1,0 +1,169 @@
+// gpu-sampling: picking the next token from the logits on the GPU, so the logits (one row of
+// vocabulary size for each sequence) never cross to the host. The GPU form of the `sampler`
+// starter, and it follows that starter's rules:
+//
+//   * the probabilities are softmax(logits / T) over the whole vocabulary;
+//   * top-k keeps the k most likely tokens (ties go to the lower id);
+//   * top-p keeps the most likely tokens, in order, until their total reaches `mass`;
+//   * min-p keeps the tokens at least `ratio` times as likely as the most likely one;
+//   * the kept probabilities are scaled to add up to 1, a logit of -infinity is a masked token
+//     with probability 0, and a draw takes uniform u in [0, 1) and returns the first kept token,
+//     in id order, whose running total passes u.
+//
+// Three kernels. `argmax_rows` is greedy. `topk_candidates` finds the `cap` largest logits of
+// each row, in order, by `cap` rounds of a block argmax. `sample_rows` turns those into one
+// token: it adds up the whole row's softmax with `lanes::sum`, cuts the candidates, and draws.
+//
+// The cuts are intersected, and each is read off the full softmax; to switch one off pass
+// k = cap, mass = 2.0 or ratio = 0.0. Every kept token must be among the `cap` candidates, so
+// top-p and min-p are exact only when their set has at most `cap` tokens (`cap` is at most 64);
+// otherwise the draw is from the best `cap` of them.
+//
+// Block and lanes are 256. Each lane scans a strided slice of the row.
+
+import core::num;
+import core::sync::atomic;
+
+// out[r] = the largest logit's token of row r, the lower id on a tie.
+pub fn argmax_rows(out : &mut Tensor<i32, [?], Memory::HBM>, logits : &Tensor<f32, [?, ?], Memory::HBM>, rows : i32, vocab : i32) -> void {
+  spawn on(Topology::Device) {
+    for r in 0..rows across blocks {
+      let mut sa = unsafe { Tensor<f32, [256], Memory::SMEM>::uninit() };
+      let mut ia = unsafe { Tensor<i32, [256], Memory::SMEM>::uninit() };
+      for l in 0..256 across lanes {
+        let mut best : f32 = 0.0;
+        let mut best_id : i32 = -1;
+        let mut c = l;
+        while c < vocab {
+          let v = logits[r][c];
+          if best_id < 0 || v > best {
+            best = v;
+            best_id = c;
+          }
+          c = c + 256;
+        }
+        sa[l] = best;
+        ia[l] = best_id;
+      }
+      let chosen = lanes::argmax(&sa, &ia, 256);
+      out[r] = chosen;
+    }
+  }
+  return;
+}
+
+// topi[r][j] and topv[r][j]: the token and logit of row r's j-th largest logit, j < cap. `work`
+// is a scratch of rows * vocab values: the row is copied there and each round blots out the
+// token it picked, with an atomic store (the race proof refuses a plain write at an index that
+// only the data knows).
+pub fn topk_candidates(topi : &mut Tensor<i32, [?, ?], Memory::HBM>, topv : &mut Tensor<f32, [?, ?], Memory::HBM>, work : &Tensor<f32, [?], Memory::HBM>, logits : &Tensor<f32, [?, ?], Memory::HBM>, rows : i32, vocab : i32, cap : i32) -> void {
+  spawn on(Topology::Device) {
+    for r in 0..rows across blocks {
+      let mut sa = unsafe { Tensor<f32, [256], Memory::SMEM>::uninit() };
+      let mut ia = unsafe { Tensor<i32, [256], Memory::SMEM>::uninit() };
+      for l in 0..256 across lanes {
+        for q in 0..(vocab + 255) / 256 {
+          let c = l + 256 * q;
+          if c < vocab {
+            atomic_store_f32(work, r * vocab + c, logits[r][c], AtomicOrdering::Relaxed);
+          }
+        }
+      }
+      for j in 0..cap {
+        for l in 0..256 across lanes {
+          let mut best : f32 = 0.0;
+          let mut best_id : i32 = -1;
+          let mut c = l;
+          while c < vocab {
+            let v = atomic_load_f32(work, r * vocab + c, AtomicOrdering::Relaxed);
+            if best_id < 0 || v > best {
+              best = v;
+              best_id = c;
+            }
+            c = c + 256;
+          }
+          sa[l] = best;
+          ia[l] = best_id;
+        }
+        let chosen = lanes::argmax(&sa, &ia, 256);
+        topi[r][j] = chosen;
+        topv[r][j] = logits[r][chosen];
+        atomic_store_f32(work, r * vocab + chosen, -300000000000000000000000000000000000000.0, AtomicOrdering::Relaxed);
+      }
+    }
+  }
+  return;
+}
+
+// One token for each row, drawn with u[r]. temperature > 0.
+pub fn sample_rows(out : &mut Tensor<i32, [?], Memory::HBM>, logits : &Tensor<f32, [?, ?], Memory::HBM>, topi : &Tensor<i32, [?, ?], Memory::HBM>, topv : &Tensor<f32, [?, ?], Memory::HBM>, u : &Tensor<f32, [?], Memory::HBM>, rows : i32, vocab : i32, cap : i32, temperature : f32, k : i32, mass : f32, ratio : f32) -> void {
+  spawn on(Topology::Device) {
+    for r in 0..rows across blocks {
+      let mut part = unsafe { Tensor<f32, [256], Memory::SMEM>::uninit() };
+      for l in 0..256 across lanes {
+        let mut s : f32 = 0.0;
+        let mut c = l;
+        while c < vocab {
+          s = s + ((logits[r][c] - topv[r][0]) / temperature).exp();
+          c = c + 256;
+        }
+        part[l] = s;
+      }
+      let z = lanes::sum(&part, 256);
+      // p of the j-th candidate is exp((v_j - v_0) / T) / z. A candidate is kept if it is within
+      // the top k, its predecessors' total is still below `mass`, and it is at least `ratio`
+      // times the largest. `kept_sum` is the kept total.
+      let mut kept_sum : f32 = 0.0;
+      let mut before : f32 = 0.0;
+      for j in 0..cap {
+        let p = ((topv[r][j] - topv[r][0]) / temperature).exp() / z;
+        if j < k && before < mass && p >= ratio * (1.0 / z) && p > 0.0 {
+          kept_sum = kept_sum + p;
+        }
+        before = before + p;
+      }
+      // The first kept token in id order whose running total passes u * kept_sum: for each kept
+      // candidate, add up the kept candidates with smaller ids.
+      let target = u[r] * kept_sum;
+      let mut chosen : i32 = -1;
+      let mut last_id : i32 = -1;
+      let mut before_j : f32 = 0.0;
+      for j in 0..cap {
+        let pj = ((topv[r][j] - topv[r][0]) / temperature).exp() / z;
+        let mut kept_j : i32 = 0;
+        if j < k && before_j < mass && pj >= ratio * (1.0 / z) && pj > 0.0 {
+          kept_j = 1;
+        }
+        before_j = before_j + pj;
+        if kept_j != 0 {
+          let mut run : f32 = 0.0;
+          for i in 0..cap {
+            let pi = ((topv[r][i] - topv[r][0]) / temperature).exp() / z;
+            let mut kept_i : i32 = 0;
+            let mut cum : f32 = 0.0;
+            for q in 0..i {
+              cum = cum + ((topv[r][q] - topv[r][0]) / temperature).exp() / z;
+            }
+            if i < k && cum < mass && pi >= ratio * (1.0 / z) && pi > 0.0 {
+              kept_i = 1;
+            }
+            if kept_i != 0 && topi[r][i] < topi[r][j] {
+              run = run + pi;
+            }
+          }
+          if last_id < topi[r][j] {
+            last_id = topi[r][j];
+          }
+          if chosen < 0 && target >= run && target < run + pj {
+            chosen = topi[r][j];
+          }
+        }
+      }
+      if chosen < 0 {
+        chosen = last_id;
+      }
+      out[r] = chosen;
+    }
+  }
+  return;
+}
