@@ -31,3 +31,8 @@ scratch="$(mktemp -d)"
 trap 'rm -rf "$scratch"' EXIT
 "$VX_HOME/bin/vxc" -a run-jit emit.vx 2> /dev/null | grep -v '^\[' > "$scratch/lines"
 python3 -I admit.py "$VX_HOME" "$scratch" < "$scratch/lines"
+
+# 4. The example: a datacenter and four services, planned and reported. Its numbers must add up.
+"$VX_HOME/bin/vxc" -a run-jit examples/datacenter.vx 2> /dev/null | grep -v '^\[' > "$scratch/report"
+cat "$scratch/report"
+python3 -I check_example.py < "$scratch/report"

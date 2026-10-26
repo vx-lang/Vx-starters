@@ -20,6 +20,8 @@ struct Fleet {
   wide : Vec<f64>,       // widest path between any two vertices
   late : Vec<f64>,       // least latency between any two vertices
   nv : i32,
+  cls : Vec<i32>,        // the first domain of the same class (same SKU and size): a class number
+  ngpu : Vec<i32>,       // GPUs of each domain
 }
 
 fn fl(x : i32) -> f64 {
@@ -27,7 +29,7 @@ fn fl(x : i32) -> f64 {
 }
 
 pub fn new_fleet() -> Fleet {
-  return Fleet { doms: Vec<Domain>::with_capacity(8), leaf: Vec<i32>::with_capacity(8), leaves: 0, wide: Vec<f64>::with_capacity(1), late: Vec<f64>::with_capacity(1), nv: 0 };
+  return Fleet { doms: Vec<Domain>::with_capacity(8), leaf: Vec<i32>::with_capacity(8), leaves: 0, wide: Vec<f64>::with_capacity(1), late: Vec<f64>::with_capacity(1), nv: 0, cls: Vec<i32>::with_capacity(8), ngpu: Vec<i32>::with_capacity(8) };
 }
 
 // Adds a domain under leaf switch `leaf` (numbered from 0). Call `wire` when all are added.
@@ -69,6 +71,20 @@ pub fn wire(f : &mut Fleet, oversub : f64) -> void {
   }
   f.wide = widest(&g);
   f.late = fastest(&g);
+  // The class of each domain, and its size, as numbers: comparing two domains' structs for every
+  // pair is where a placement search would spend its time.
+  f.cls = Vec<i32>::with_capacity(n);
+  f.ngpu = Vec<i32>::with_capacity(n);
+  for i in 0..n {
+    let mut c = i;
+    for j in 0..i {
+      if c == i && same_class(f.doms.get(j), f.doms.get(i)) {
+        c = f.cls.get(j);
+      }
+    }
+    f.cls.push(c);
+    f.ngpu.push(f.doms.get(i).gpus);
+  }
   return;
 }
 
@@ -105,7 +121,7 @@ pub fn group_bandwidth(f : &Fleet, members : &Vec<i32>) -> f64 {
           let leaf_up = f.wide.get((n + f.leaf.get(a)) * f.nv + (n + f.leaves));
           bw = bw.min(leaf_up / fl(share));
         }
-        let per_gpu = bw / fl(f.doms.get(a).gpus);
+        let per_gpu = bw / fl(f.ngpu.get(a));
         if per_gpu < best {
           best = per_gpu;
         }
@@ -114,6 +130,59 @@ pub fn group_bandwidth(f : &Fleet, members : &Vec<i32>) -> f64 {
   }
   if m < 2 {
     return 0.0f64;
+  }
+  return best;
+}
+
+// The same as `group_bandwidth` for domains of one class, in time for the leaves instead of the
+// pairs: two members on one leaf are alike, so it looks at one member of each leaf and, where a
+// leaf has two or more, one pair inside it.
+pub fn group_bandwidth_of_class(f : &Fleet, members : &Vec<i32>) -> f64 {
+  let m = members.len();
+  if m < 2 {
+    return 0.0f64;
+  }
+  let n = f.doms.len();
+  let mut cnt = Vec<i32>::with_capacity(f.leaves);
+  let mut first = Vec<i32>::with_capacity(f.leaves);
+  let mut second = Vec<i32>::with_capacity(f.leaves);
+  for l in 0..f.leaves {
+    cnt.push(0);
+    first.push(0 - 1);
+    second.push(0 - 1);
+  }
+  for x in 0..m {
+    let a = members.get(x);
+    let l = f.leaf.get(a);
+    if cnt.get(l) == 0 {
+      first.set(l, a);
+    }
+    if cnt.get(l) == 1 {
+      second.set(l, a);
+    }
+    cnt.set(l, cnt.get(l) + 1);
+  }
+  let mut best = 1000000000000000.0f64;
+  for la in 0..f.leaves {
+    if cnt.get(la) > 0 {
+      let a = first.get(la);
+      if cnt.get(la) >= 2 {
+        let per_gpu = f.wide.get(a * f.nv + second.get(la)) / fl(f.ngpu.get(a));
+        if per_gpu < best {
+          best = per_gpu;
+        }
+      }
+      let leaf_up = f.wide.get((n + la) * f.nv + (n + f.leaves)) / fl(cnt.get(la));
+      for lb in 0..f.leaves {
+        if lb != la && cnt.get(lb) > 0 {
+          let bw = f.wide.get(a * f.nv + first.get(lb)).min(leaf_up);
+          let per_gpu = bw / fl(f.ngpu.get(a));
+          if per_gpu < best {
+            best = per_gpu;
+          }
+        }
+      }
+    }
   }
   return best;
 }
@@ -133,51 +202,70 @@ pub fn group_latency(f : &Fleet, members : &Vec<i32>) -> f64 {
   return worst;
 }
 
-// Chooses `want` free domains of the same class as domain `seed_class`, as close together as
-// the graph allows: for each free domain of the class as a start, add the free domain that keeps
-// the group's bandwidth highest (ties to the lower number), and keep the start that ends best
-// (ties to the lower number). `free[i]` is 1 for a free domain. Returns fewer than `want` if the
-// fleet has not that many.
-pub fn pick_group(f : &Fleet, class_of : i32, want : i32, free : &Vec<i32>) -> Vec<i32> {
+// The free domains of the class of `proto` that are not in `group`, one for each leaf (the lowest
+// number): two such domains on one leaf sit in the same place in the graph, so trying one of them
+// is trying both.
+pub fn representatives(f : &Fleet, free : &Vec<i32>, class : i32, group : &Vec<i32>) -> Vec<i32> {
   let n = f.doms.len();
-  let proto = f.doms.get(class_of);
+  let mut out = Vec<i32>::with_capacity(f.leaves);
+  let mut seen = Vec<i32>::with_capacity(f.leaves);
+  for l in 0..f.leaves {
+    seen.push(0);
+  }
+  for c in 0..n {
+    if free.get(c) == 1 && f.cls.get(c) == class && seen.get(f.leaf.get(c)) == 0 {
+      let mut taken = false;
+      for k in 0..group.len() {
+        if group.get(k) == c {
+          taken = true;
+        }
+      }
+      if !taken {
+        out.push(c);
+        seen.set(f.leaf.get(c), 1);
+      }
+    }
+  }
+  return out;
+}
+
+// Chooses `want` free domains of the same class as domain `class_of`, as close together as the
+// graph allows: for each start (a free domain of the class, one for each leaf) add the free
+// domain (again one for each leaf) that keeps the group's bandwidth highest (ties to the lower
+// number), and keep the start that ends best (ties to the lower number). `free[i]` is 1 for a free
+// domain. Returns fewer than `want` if the fleet has not that many.
+pub fn pick_group(f : &Fleet, class_of : i32, want : i32, free : &Vec<i32>) -> Vec<i32> {
+  let class = f.cls.get(class_of);
   let mut best = Vec<i32>::with_capacity(want);
   let mut best_bw = -1.0f64;
-  for s in 0..n {
-    if free.get(s) == 1 && same_class(f.doms.get(s), proto) {
-      let mut group = Vec<i32>::with_capacity(want);
-      group.push(s);
-      while group.len() < want {
-        let mut pick = -1;
-        let mut pick_bw = -1.0f64;
-        for c in 0..n {
-          let mut taken = false;
-          for k in 0..group.len() {
-            if group.get(k) == c {
-              taken = true;
-            }
-          }
-          if !taken && free.get(c) == 1 && same_class(f.doms.get(c), proto) {
-            group.push(c);
-            let bw = group_bandwidth(f, &group);
-            group.pop();
-            if bw > pick_bw {
-              pick_bw = bw;
-              pick = c;
-            }
-          }
+  let none = Vec<i32>::with_capacity(1);
+  let seeds = representatives(f, free, class, &none);
+  for si in 0..seeds.len() {
+    let mut group = Vec<i32>::with_capacity(want);
+    group.push(seeds.get(si));
+    while group.len() < want {
+      let cands = representatives(f, free, class, &group);
+      let mut pick = -1;
+      let mut pick_bw = -1.0f64;
+      for ci in 0..cands.len() {
+        group.push(cands.get(ci));
+        let bw = group_bandwidth_of_class(f, &group);
+        group.pop();
+        if bw > pick_bw {
+          pick_bw = bw;
+          pick = cands.get(ci);
         }
-        if pick < 0 {
-          break;
-        }
-        group.push(pick);
       }
-      if group.len() == want {
-        let bw = group_bandwidth(f, &group);
-        if bw > best_bw {
-          best_bw = bw;
-          best = group;
-        }
+      if pick < 0 {
+        break;
+      }
+      group.push(pick);
+    }
+    if group.len() == want {
+      let bw = group_bandwidth_of_class(f, &group);
+      if bw > best_bw {
+        best_bw = bw;
+        best = group;
       }
     }
   }
@@ -187,4 +275,9 @@ pub fn pick_group(f : &Fleet, class_of : i32, want : i32, free : &Vec<i32>) -> V
 // The least latency between two domains, seconds.
 pub fn latency_between(f : &Fleet, a : i32, b : i32) -> f64 {
   return f.late.get(a * f.nv + b);
+}
+
+// The class number of domain i: domains of one SKU and size share it.
+pub fn class_number(f : &Fleet, i : i32) -> i32 {
+  return f.cls.get(i);
 }

@@ -28,6 +28,7 @@ Plain host code: no GPU and no CUDA. Every figure is an estimate (see *What it i
 | `fleet.vx` | A fleet: a vertex for each domain, one leaf switch for each group of domains, one spine, with the leaf-to-spine links cut by an oversubscription factor. `group_bandwidth` and `group_latency` of a set of domains read off the graph, with a leaf link shared by the members under it; `pick_group` chooses domains of one class that are as close as the graph allows |
 | `model.vx` | `Model`: layers, dense layers, hidden size, MLA or GQA attention, experts. Parameter counts, KV size of a token, and the attention FLOPs of a query-key pair all follow from those fields. `deepseek_v3()` and `glm_4_5()` |
 | `cost.vx` | `Deploy`: a group of whole domains, attention data or tensor parallel, a context-parallel degree, number formats. `fits`, `decode_step` and `prefill_time` |
+| `report.vx`, `examples/datacenter.vx` | A plan as text (services, placements, fleet use) and what losing a domain or a leaf switch does to it; and a whole datacenter in one program (below) |
 | `emit.vx`, `admit.py` | The bridge to the compiler (below): what the planner believes, printed as lines, and a Vx program for each, compiled against the machine files of the toolchain |
 | `plan.vx` | `Service` (model, request rate, prompt, output, targets for time per token and time to first token, and whether it is served co-located or on separate prefill and decode pools); `evaluate`, `evaluate_prefill`, `evaluate_decode`, `best_role`, `schedule` |
 
@@ -113,6 +114,50 @@ weights and cache, batch 920) and GLM on the rack and all eight A100 nodes (in g
 leaving 14% of the GLM rate unmet. A plan that is best over all orders is still a greedy's: it is
 not the best split of the fleet.
 
+## A datacenter in one program
+
+`examples/datacenter.vx` is the whole of the library in 30 lines of Vx: the fleet (two NVL72 racks,
+twelve H200 nodes, twenty-four A100-80 nodes, seven leaf switches with the spine links cut to half),
+five services, `schedule`, and the report. `vxc -a run-jit examples/datacenter.vx` prints:
+
+```
+services (requests a second; cost in units an hour)
+  chat-ds: DeepSeek-V3, 8192 + 512 tokens, 30.00 asked, 30.00 served (0% unmet), 56 GPUs, 116
+  chat-glm: GLM-4.5, 4096 + 512 tokens, 20.00 asked, 20.00 served (0% unmet), 40 GPUs, 100
+  docs-ds: DeepSeek-V3, 131072 + 1024 tokens, 2.00 asked, 2.00 served (0% unmet), 80 GPUs, 308
+  repo-glm: GLM-4.5, 1000000 + 256 tokens, 0.0200 asked, 0.0078 served (61% unmet), 176 GPUs, 176
+  agents-ds: DeepSeek-V3, 32768 + 256 tokens, 15.00 asked, 15.00 served (0% unmet), 72 GPUs, 288
+placements
+  chat-ds both    H200 x1 of 8 (domains 2), attention data parallel, context split 1, weights 1B, cache 1B, batch 976, 42.5 ms a token, first token 0.15 s, HBM 90%, 5.81 of 5.81 a second
+  ...
+  docs-ds both    B200 x1 of 72 (domains 0), attention data parallel, context split 8, weights 1B, cache 1B, batch 128, 7.8 ms a token, first token 0.44 s, HBM 18%, 1.89 of 1.99 a second
+  repo-glm decode  A100-80 x2 of 8 (domains 16 17), attention tensor parallel, context split 2, ... batch 1, 22.2 ms a token, HBM 79%, 0.0200 of 0.18 a second
+  repo-glm prefill A100-80 x6 of 8 (domains 18 19 20 21 22 23), ... first token 424.64 s, HBM 83%, ...
+  ...
+fleet
+  B200 x72: 2 domains (144 GPUs), 2 in use, 0 free
+  H200 x8: 12 domains (96 GPUs), 11 in use, 1 free
+  A100-80 x8: 24 domains (192 GPUs), 24 in use, 0 free
+  spend 988 an hour
+losses (the services placed again, in the same order)
+  a domain in use (37 tried): 37 leave something unmet
+  the worst, domain 0 (B200 x72):
+    2.17 of a service more unmet, 268 an hour less
+  the worst leaf switch, 0 (1 domains):
+    2.17 of a service more unmet, 268 an hour less
+```
+
+Read it as a design review. The 1M-token GLM service takes 176 GPUs and still serves 39% of what was
+asked (every request waits 5 to 7 minutes for its first token); the long-document and agent services
+sit on one NVL72 rack each; and the fleet has no slack, so losing any domain in use leaves something
+unmet, and losing a rack leaves two services' worth. A planner that says that before the hardware is
+bought, or before a rack fails, is the point of writing it as a program.
+
+The build checks that the report adds up (`check_example.py`): every domain is in at most one
+placement, the GPUs of a service are those of its placements, the domains in use are the ones listed,
+the spend is the sum of the services' costs, what a service is served is what its replicas serve, and
+the unmet share follows from the asked and served.
+
 ## What the tests check
 
 `test.vx` returns the number of failed checks and prints `ok` when there are none.
@@ -140,7 +185,10 @@ not the best split of the fleet.
    mode 2 takes them; mode 2 leaves no more unmet than either way, and costs no more, in four
    settings; decode replicas with no prefill to feed them are given back; the pools of a service
    share one cache format.
-7. **Python.** `check.py` prices the same layouts again from the architectures and the formulas,
+7. **Losses and the report.** A domain that is down is not used and not free, the search over orders
+   keeps to the same fleet, and a service whose every host is down is left whole; the number formatter
+   against Python's.
+8. **Python.** `check.py` prices the same layouts again from the architectures and the formulas,
    written out a second time, and every placement of the schedule too; they agree to 1e-9.
 
 ## The compiler checks the planner

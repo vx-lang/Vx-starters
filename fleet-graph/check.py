@@ -200,6 +200,7 @@ def close(a, b):
 
 failed = 0
 seen = set()
+fmt_seen = False
 placed = 0
 for line in sys.stdin:
     name, _, rest = line.partition(": ")
@@ -246,6 +247,15 @@ for line in sys.stdin:
                 print(f"FAIL: prefill replica {line.strip()} does not fit or is late")
                 failed += 1
         continue
+    if name == "fmt":
+        got = rest.split()
+        want_fmt = [f"{3.14159:.2f}", f"{2.5:.1f}", f"{0.0004:.2f}", f"{123456.789:.2f}", f"{7.0:.0f}", f"{-1.234:.1f}", f"{99.6:.0f}"]
+        formatted = got
+        if got != want_fmt:
+            print(f"FAIL: print_f printed {got}, Python formats {want_fmt}")
+            failed += 1
+        fmt_seen = True
+        continue
     if name not in want:
         continue
     seen.add(name)
@@ -255,6 +265,9 @@ for line in sys.stdin:
         failed += 1
 for name in want.keys() - seen:
     print(f"FAIL: no {name} line")
+    failed += 1
+if not fmt_seen:
+    print("FAIL: no fmt line")
     failed += 1
 if placed == 0:
     print("FAIL: no placements printed")

@@ -26,6 +26,7 @@ import graph;
 import hw;
 import model;
 import plan;
+import report;
 import std::vec;
 
 fn fl(x : i32) -> f64 {
@@ -610,6 +611,12 @@ fn batch_ok_for(s : Service, dep : Deploy, b : i32) -> bool {
 
 // The invariants of a plan.
 fn check_plan(f : &Fleet, sv : &Vec<Service>, p : &Plan) -> i32 {
+  let none = Vec<i32>::with_capacity(1);
+  return check_plan_down(f, sv, p, &none);
+}
+
+// The same for a plan made with the domains in `down` out of service: they are not used, and not free.
+fn check_plan_down(f : &Fleet, sv : &Vec<Service>, p : &Plan, down : &Vec<i32>) -> i32 {
   let mut failed = 0;
   let n = count(f);
   let mut used = Vec<i32>::with_capacity(n);
@@ -683,8 +690,15 @@ fn check_plan(f : &Fleet, sv : &Vec<Service>, p : &Plan) -> i32 {
       if pl.role == 1 && (pl.cand.xnic != d0.dep.sku.nic || pl.cand.xs != gpus(d0.dep)) { bad_peer += 1; }
     }
   }
+  let mut is_down = Vec<i32>::with_capacity(n);
+  for i in 0..n { is_down.push(0); }
+  for x in 0..down.len() { is_down.set(down.get(x), 1); }
   for i in 0..n {
-    if (used.get(i) == 1) == (p.free.get(i) == 1) { bad_free += 1; }
+    if is_down.get(i) == 1 {
+      if used.get(i) == 1 || p.free.get(i) == 1 { bad_free += 1; }
+    } else {
+      if (used.get(i) == 1) == (p.free.get(i) == 1) { bad_free += 1; }
+    }
   }
   let mut sums = 0;
   for k in 0..ns {
@@ -1017,6 +1031,74 @@ fn test_pools() -> i32 {
   return failed;
 }
 
+// ---------------------------------------------------------------------------------------------
+// 7. Losses and the report
+
+fn test_losses() -> i32 {
+  let mut failed = 0;
+  let f = mixed_fleet();
+  let mut sv = Vec<Service>::with_capacity(2);
+  sv.push(make_service(deepseek_v3(), 20.0f64, 8192, 1024, 0.05f64, 5.0f64, 1.0f64, 1, 1024));
+  sv.push(make_service(glm_4_5(), 10.0f64, 32768, 512, 0.05f64, 10.0f64, 2.0f64, 0, 1024));
+  let order = demand_order(&f, &sv);
+  failed += expect(order.len() == 2 && order.get(0) == 0 && order.get(1) == 1, "both services are best on one H200 node (8 GPUs), so a tie goes to the lower number");
+  let mut big = Vec<Service>::with_capacity(3);
+  big.push(sv.get(0));
+  big.push(sv.get(1));
+  big.push(make_service(glm_4_5(), 0.004f64, 1000000, 256, 0.15f64, 600.0f64, 2.0f64, 0, 32));
+  let big_order = demand_order(&f, &big);
+  failed += expect(big_order.get(0) == 2 && big_order.get(1) == 0 && big_order.get(2) == 1, "a million tokens of GLM need the most GPUs: it comes first");
+  let none = Vec<i32>::with_capacity(1);
+  let base = schedule_in_order(&f, &sv, &order);
+  failed += expect(same_plan(&base, &schedule_down_in_order(&f, &sv, &order, &none)), "with nothing down the plan is the same");
+  // The rack and two of the H200 nodes down: nobody uses them, and they are not free.
+  let mut down = Vec<i32>::with_capacity(3);
+  down.push(0);
+  down.push(1);
+  down.push(2);
+  let hurt = schedule_down_in_order(&f, &sv, &order, &down);
+  failed += check_plan_down(&f, &sv, &hurt, &down);
+  failed += expect(shortfall(&sv, &hurt) >= shortfall(&sv, &base) - 0.000000001f64, "without the rack and two H200 nodes at least as much is unmet");
+  // The search over orders keeps to the same fleet.
+  let searched = schedule_down(&f, &sv, &down);
+  failed += check_plan_down(&f, &sv, &searched, &down);
+  failed += expect(shortfall(&sv, &searched) <= shortfall(&sv, &hurt) + 0.000000001f64, "the best of the orders is no worse than the first, with domains down");
+  // Everything that can host a service down: it is left whole.
+  let mut h2 = new_fleet();
+  add_domain(&mut h2, hgx8(h200()), 0);
+  add_domain(&mut h2, hgx8(h200()), 0);
+  wire(&mut h2, 2.0f64);
+  let mut one = Vec<Service>::with_capacity(1);
+  one.push(make_service(deepseek_v3(), 1.0f64, 8192, 512, 0.05f64, 5.0f64, 1.0f64, 1, 1024));
+  let mut both = Vec<i32>::with_capacity(2);
+  both.push(0);
+  both.push(1);
+  let gone = schedule_down(&h2, &one, &both);
+  failed += expect(gone.places.len() == 0 && gone.unmet.get(0) == 1.0f64, "with both nodes down the service is left whole");
+  failed += check_plan_down(&h2, &one, &gone, &both);
+  let mut first = Vec<i32>::with_capacity(1);
+  first.push(0);
+  let left = schedule_down(&h2, &one, &first);
+  failed += expect(left.unmet.get(0) == 0.0f64 && left.places.get(0).mcount == 1 && left.members.get(0) == 1, "with node 0 down the service runs on node 1");
+  // The number formatter of the report: lines that check.py compares with Python's.
+  print!("fmt: ");
+  print_f(3.14159f64, 2);
+  print!(" ");
+  print_f(2.5f64, 1);
+  print!(" ");
+  print_f(0.0004f64, 2);
+  print!(" ");
+  print_f(123456.789f64, 2);
+  print!(" ");
+  print_f(7.0f64, 0);
+  print!(" ");
+  print_f(0.0f64 - 1.234f64, 1);
+  print!(" ");
+  print_f(99.6f64, 0);
+  print!("\n");
+  return failed;
+}
+
 fn main() -> i32 {
   let mut failed = 0;
   failed += test_models();
@@ -1025,6 +1107,7 @@ fn main() -> i32 {
   failed += test_cost();
   failed += test_plan();
   failed += test_pools();
+  failed += test_losses();
   if failed == 0 {
     print!("ok\n");
   }

@@ -47,6 +47,7 @@ import model;
 import std::vec;
 
 struct Service {
+  name : *const i8,
   model : Model,
   qps : f64,
   prompt : i32,
@@ -107,12 +108,17 @@ fn fl(x : i32) -> f64 {
 }
 
 pub fn make_service(m : Model, qps : f64, prompt : i32, out : i32, slo_tpot : f64, slo_ttft : f64, min_wb : f64, kv_fp8 : i32, bmax : i32) -> Service {
-  return Service { model: m, qps: qps, prompt: prompt, out: out, slo_tpot: slo_tpot, slo_ttft: slo_ttft, min_wb: min_wb, kv_fp8: kv_fp8, bmax: bmax, mode: 0 };
+  return Service { name: "service", model: m, qps: qps, prompt: prompt, out: out, slo_tpot: slo_tpot, slo_ttft: slo_ttft, min_wb: min_wb, kv_fp8: kv_fp8, bmax: bmax, mode: 0 };
+}
+
+// The same service with a name, for reports.
+pub fn with_name(s : Service, name : *const i8) -> Service {
+  return Service { name: name, model: s.model, qps: s.qps, prompt: s.prompt, out: s.out, slo_tpot: s.slo_tpot, slo_ttft: s.slo_ttft, min_wb: s.min_wb, kv_fp8: s.kv_fp8, bmax: s.bmax, mode: s.mode };
 }
 
 // The same service served another way: 0 co-located, 1 disaggregated, 2 whichever is better.
 pub fn with_mode(s : Service, mode : i32) -> Service {
-  return Service { model: s.model, qps: s.qps, prompt: s.prompt, out: s.out, slo_tpot: s.slo_tpot, slo_ttft: s.slo_ttft, min_wb: s.min_wb, kv_fp8: s.kv_fp8, bmax: s.bmax, mode: mode };
+  return Service { name: s.name, model: s.model, qps: s.qps, prompt: s.prompt, out: s.out, slo_tpot: s.slo_tpot, slo_ttft: s.slo_ttft, min_wb: s.min_wb, kv_fp8: s.kv_fp8, bmax: s.bmax, mode: mode };
 }
 
 fn no_candidate(dep : Deploy) -> Candidate {
@@ -310,14 +316,14 @@ pub fn best_role(s : Service, f : &Fleet, free : &Vec<i32>, role : i32, peer : P
     // i represents its class if it is free and no lower free domain is of that class.
     let mut first = free.get(i) == 1;
     for j in 0..i {
-      if free.get(j) == 1 && same_class(domain(f, j), domain(f, i)) {
+      if free.get(j) == 1 && class_number(f, j) == class_number(f, i) {
         first = false;
       }
     }
     if first {
       let mut avail = 0;
       for j in 0..n {
-        if free.get(j) == 1 && same_class(domain(f, j), domain(f, i)) {
+        if free.get(j) == 1 && class_number(f, j) == class_number(f, i) {
           avail += 1;
         }
       }
@@ -358,9 +364,18 @@ fn demand_size(s : Service, f : &Fleet) -> i32 {
 }
 
 pub fn new_plan(f : &Fleet, svcs : &Vec<Service>) -> Plan {
+  let none = Vec<i32>::with_capacity(1);
+  return new_plan_down(f, svcs, &none);
+}
+
+// A plan with nothing placed, where the domains in `down` are out of service: not free, and not used.
+pub fn new_plan_down(f : &Fleet, svcs : &Vec<Service>, down : &Vec<i32>) -> Plan {
   let mut plan = Plan { places: Vec<Placement>::with_capacity(8), members: Vec<i32>::with_capacity(8), free: Vec<i32>::with_capacity(count(f)), unmet: Vec<f64>::with_capacity(svcs.len()) };
   for i in 0..count(f) {
     plan.free.push(1);
+  }
+  for x in 0..down.len() {
+    plan.free.set(down.get(x), 0);
   }
   for k in 0..svcs.len() {
     plan.unmet.push(svcs.get(k).qps);
@@ -491,8 +506,14 @@ pub fn spend(p : &Plan) -> f64 {
 // mode 2 both ways are tried and the one that leaves less of the service unmet wins (then the one
 // that costs less an hour; then the co-located).
 pub fn schedule_in_order(f : &Fleet, svcs : &Vec<Service>, order : &Vec<i32>) -> Plan {
+  let none = Vec<i32>::with_capacity(1);
+  return schedule_down_in_order(f, svcs, order, &none);
+}
+
+// The same with the domains in `down` out of service.
+pub fn schedule_down_in_order(f : &Fleet, svcs : &Vec<Service>, order : &Vec<i32>, down : &Vec<i32>) -> Plan {
   let ns = svcs.len();
-  let mut plan = new_plan(f, svcs);
+  let mut plan = new_plan_down(f, svcs, down);
   for o in 0..ns {
     let k = order.get(o);
     let s = svcs.get(k);
@@ -555,11 +576,9 @@ pub fn next_order(v : &mut Vec<i32>) -> bool {
   return true;
 }
 
-// Places the services on the fleet. A greedy depends on the order, and the first service takes
-// the best of what is free, so this tries the order with the most demanding service first and,
-// for up to 5 services, every other order, and keeps the plan that leaves the least unmet (then the
-// one that costs the least an hour; then the first found).
-pub fn schedule(f : &Fleet, svcs : &Vec<Service>) -> Plan {
+// The services in the order of the first try of `schedule`: the one whose best co-located candidate
+// needs the most GPUs first, ties to the lower number.
+pub fn demand_order(f : &Fleet, svcs : &Vec<Service>) -> Vec<i32> {
   let ns = svcs.len();
   let mut size = Vec<i32>::with_capacity(ns);
   for k in 0..ns {
@@ -579,7 +598,23 @@ pub fn schedule(f : &Fleet, svcs : &Vec<Service>) -> Plan {
       }
     }
   }
-  let mut best = schedule_in_order(f, svcs, &order);
+  return order;
+}
+
+// Places the services on the fleet. A greedy depends on the order, and the first service takes
+// the best of what is free, so this tries the order with the most demanding service first and,
+// for up to 5 services, every other order, and keeps the plan that leaves the least unmet (then the
+// one that costs the least an hour; then the first found).
+pub fn schedule(f : &Fleet, svcs : &Vec<Service>) -> Plan {
+  let none = Vec<i32>::with_capacity(1);
+  return schedule_down(f, svcs, &none);
+}
+
+// The same with the domains in `down` out of service.
+pub fn schedule_down(f : &Fleet, svcs : &Vec<Service>, down : &Vec<i32>) -> Plan {
+  let ns = svcs.len();
+  let order = demand_order(f, svcs);
+  let mut best = schedule_down_in_order(f, svcs, &order, down);
   if ns <= 5 && ns > 1 {
     let mut other = Vec<i32>::with_capacity(ns);
     for k in 0..ns {
@@ -587,7 +622,7 @@ pub fn schedule(f : &Fleet, svcs : &Vec<Service>) -> Plan {
     }
     let mut more = true;
     while more {
-      let p = schedule_in_order(f, svcs, &other);
+      let p = schedule_down_in_order(f, svcs, &other, down);
       let a = shortfall(svcs, &p);
       let b = shortfall(svcs, &best);
       if a < b - 0.000000001f64 || (a < b + 0.000000001f64 && spend(&p) < spend(&best)) {
