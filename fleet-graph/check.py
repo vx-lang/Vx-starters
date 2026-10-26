@@ -13,6 +13,7 @@ TERA, GIGA = 1e12, 1e9
 # name: (hbm, hbm_bw, bf16, fp8, nvlink, nic)
 SKU = {
     "A100-80": (80 * GIB, 2.039 * TERA, 312 * TERA, 0.0, 300 * GIGA, 25 * GIGA),
+    "H100": (80 * GIB, 3.35 * TERA, 989 * TERA, 1979 * TERA, 450 * GIGA, 50 * GIGA),
     "H200": (141 * GIB, 4.8 * TERA, 989 * TERA, 1979 * TERA, 450 * GIGA, 50 * GIGA),
     "B200": (183359 * 1048576.0, 7.7 * TERA, 2250 * TERA, 4500 * TERA, 900 * GIGA, 50 * GIGA),
     "toy": (1e30, 1e12, 1e30, 0.0, 1e30, 1e30),

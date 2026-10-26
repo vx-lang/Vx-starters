@@ -4,7 +4,7 @@
 //
 //   policy <fraction>
 //        the part of HBM a deployment may use (cost.vx), which admit.py reserves in each program.
-//   hw <name> <hbm bytes> <nic bytes/s> <nvlink bytes/s> <gpus in a node> <fp8 cores 0/1>
+//   hw <name> <hbm bytes> <nic bytes/s> <nvlink bytes/s> <gpus in a node> <fp8 cores 0/1> <hbm bytes/s>
 //        the hardware table of hw.vx; admit.py writes a machine file for a node from it.
 //   fit <tag> <sku> <weights bytes> <weight format bytes> <cache bytes> <cache format bytes> <expect>
 //        the resident set of one GPU for a layout and a batch: `expect` is `admitted` if
@@ -43,6 +43,8 @@ fn print_hw(s : Sku, gpus : i32) -> void {
     has8 = 1;
   }
   print!(has8);
+  print!(" ");
+  print!(s.hbm_bw);
   print!("\n");
   return;
 }
@@ -135,6 +137,7 @@ fn main() -> i32 {
   print!(usable());
   print!("\n");
   print_hw(a100_80(), 8);
+  print_hw(h100(), 8);
   print_hw(h200(), 8);
   print_hw(b200(), 8);
   print_hw(b200(), 72);
