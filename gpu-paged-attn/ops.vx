@@ -1,0 +1,117 @@
+// gpu-paged-attn: attention for decoding a batch of sequences over a paged key-value cache,
+// and the kernel that appends a new token to the cache. The GPU form of the `paged-kv` starter.
+//
+// The cache is a pool of pages of 16 positions. A block table maps a sequence's page number to a
+// page of the pool, so sequences of different lengths share the pool and a page can be anywhere.
+// Layout (flat, so the data-dependent writes can be atomic stores; the race proof refuses a plain
+// write at an index that only the data knows):
+//
+//   element (page, head, slot, d) is at ((page * heads + head) * 16 + slot) * 64 + d.
+//
+// Head size is 64. `table` is [seqs][max_pages] and `lens` is [seqs], the positions in use.
+//
+// `paged_attention_decode` has no limit on the length: a block (sequence, head) walks the cache
+// in chunks of 128 positions with an online softmax, which keeps a running maximum m, a running
+// sum l and the running weighted sum of V, and rescales them when a later chunk raises the
+// maximum. The loop over chunks is bounded by `max_len` (a host value), not by `lens[s]`: the
+// race proof wants the control around a lane loop to be uniform, so each lane masks positions
+// at or past the sequence's length.
+
+import core::num;
+import core::sync::atomic;
+
+// Writes the new token's keys and values (k_new, v_new: [seqs][heads][64]) at position lens[s]
+// of each sequence. The page for that position must already be in the table.
+pub fn kv_append(kc : &Tensor<f32, [?], Memory::HBM>, vc : &Tensor<f32, [?], Memory::HBM>, k_new : &Tensor<f32, [?, ?, 64], Memory::HBM>, v_new : &Tensor<f32, [?, ?, 64], Memory::HBM>, table : &Tensor<i32, [?, ?], Memory::HBM>, lens : &Tensor<i32, [?], Memory::HBM>, seqs : i32, heads : i32) -> void {
+  spawn on(Topology::Device) {
+    for s in 0..seqs across blocks {
+      for h in 0..heads across blocks {
+        for d in 0..64 across lanes {
+          let pos = lens[s];
+          let at = ((table[s][pos / 16] * heads + h) * 16 + pos % 16) * 64 + d;
+          atomic_store_f32(kc, at, k_new[s][h][d], AtomicOrdering::Relaxed);
+          atomic_store_f32(vc, at, v_new[s][h][d], AtomicOrdering::Relaxed);
+        }
+      }
+    }
+  }
+  return;
+}
+
+// lens[s] += 1, after an append.
+pub fn kv_advance(lens : &mut Tensor<i32, [?], Memory::HBM>, seqs : i32) -> void {
+  spawn on(Topology::Device) {
+    for b in 0..(seqs + 127) / 128 across blocks {
+      for l in 0..128 across lanes {
+        let s = b * 128 + l;
+        if s < seqs {
+          lens[s] = lens[s] + 1;
+        }
+      }
+    }
+  }
+  return;
+}
+
+// out[s][h] = softmax(q[s][h] . K * scale) . V over the lens[s] positions of sequence s.
+// Every sequence needs at least one position. `max_len` is an upper bound for the lengths.
+pub fn paged_attention_decode(out : &mut Tensor<f32, [?, ?, 64], Memory::HBM>, q : &Tensor<f32, [?, ?, 64], Memory::HBM>, kc : &Tensor<f32, [?], Memory::HBM>, vc : &Tensor<f32, [?], Memory::HBM>, table : &Tensor<i32, [?, ?], Memory::HBM>, lens : &Tensor<i32, [?], Memory::HBM>, seqs : i32, heads : i32, max_len : i32, scale : f32) -> void {
+  spawn on(Topology::Device) {
+    for s in 0..seqs across blocks {
+      for h in 0..heads across blocks {
+        let mut part = unsafe { Tensor<f32, [128], Memory::SMEM>::uninit() };
+        let mut acc = unsafe { Tensor<f32, [64], Memory::SMEM>::uninit() };
+        // stat: 0 = running maximum, 1 = running sum, 2 = factor for the old state.
+        let mut stat = unsafe { Tensor<f32, [3], Memory::SMEM>::uninit() };
+        stat[0] = -1000000000.0;
+        stat[1] = 0.0;
+        stat[2] = 1.0;
+        for d in 0..64 across lanes {
+          acc[d] = 0.0;
+        }
+        for c in 0..(max_len + 127) / 128 {
+          for l in 0..128 across lanes {
+            let pos = c * 128 + l;
+            let mut sc : f32 = -1000000000.0;
+            if pos < lens[s] {
+              let base = ((table[s][pos / 16] * heads + h) * 16 + pos % 16) * 64;
+              let mut dot : f32 = 0.0;
+              for d in 0..64 {
+                dot = dot + q[s][h][d] * kc[base + d];
+              }
+              sc = dot * scale;
+            }
+            part[l] = sc;
+          }
+          let mut cm : f32 = part[0];
+          for k in 1..128 {
+            cm = cm.max(part[k]);
+          }
+          let m_old = stat[0];
+          let m_new = m_old.max(cm);
+          stat[0] = m_new;
+          stat[2] = (m_old - m_new).exp();
+          for l in 0..128 across lanes {
+            part[l] = (part[l] - stat[0]).exp();
+          }
+          let z = lanes::sum(&part, 128);
+          stat[1] = stat[1] * stat[2] + z;
+          for d in 0..64 across lanes {
+            let mut a : f32 = acc[d] * stat[2];
+            for t in 0..128 {
+              let pos = c * 128 + t;
+              if pos < lens[s] {
+                a = a + part[t] * vc[((table[s][pos / 16] * heads + h) * 16 + pos % 16) * 64 + d];
+              }
+            }
+            acc[d] = a;
+          }
+        }
+        for d in 0..64 across lanes {
+          out[s][h][d] = acc[d] / stat[1];
+        }
+      }
+    }
+  }
+  return;
+}
