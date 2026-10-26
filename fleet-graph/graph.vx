@@ -1,0 +1,102 @@
+// fleet-graph, graph: an undirected graph with a bandwidth (bytes/s) and a latency (s) on every
+// edge, and the two questions a placement asks of it: how much can flow between two vertices
+// (the widest path: the largest bottleneck over all paths), and how soon does a message get
+// there (the least total latency). Both by Floyd-Warshall, which is plenty for a fleet of
+// hundreds of vertices.
+//
+// A fleet is built on top of this in fleet.vx: vertices for the domains and the switches.
+
+import core::convert;
+import core::num;
+import std::vec;
+
+// Stands for "no path" (infinite bandwidth from a vertex to itself, infinite latency).
+pub fn none() -> f64 {
+  return 1000000.0f64 * 1000000.0f64 * 1000000.0f64 * 1000000.0f64 * 1000000.0f64;
+}
+
+struct Graph {
+  n : i32,
+  eu : Vec<i32>,
+  ev : Vec<i32>,
+  bw : Vec<f64>,
+  lat : Vec<f64>,
+}
+
+pub fn new_graph(n : i32) -> Graph {
+  return Graph { n: n, eu: Vec<i32>::with_capacity(8), ev: Vec<i32>::with_capacity(8), bw: Vec<f64>::with_capacity(8), lat: Vec<f64>::with_capacity(8) };
+}
+
+pub fn add_edge(g : &mut Graph, u : i32, v : i32, bw : f64, lat : f64) -> void {
+  g.eu.push(u);
+  g.ev.push(v);
+  g.bw.push(bw);
+  g.lat.push(lat);
+  return;
+}
+
+fn filled(len : i32, v : f64) -> Vec<f64> {
+  let mut out = Vec<f64>::with_capacity(len);
+  for i in 0..len {
+    out.push(v);
+  }
+  return out;
+}
+
+// m[u * n + v] = the largest bottleneck bandwidth over all paths from u to v; 0 if there is no
+// path, `none()` (infinite) from a vertex to itself.
+pub fn widest(g : &Graph) -> Vec<f64> {
+  let n = g.n;
+  let mut m = filled(n * n, 0.0f64);
+  for u in 0..n {
+    m.set(u * n + u, none());
+  }
+  for e in 0..g.eu.len() {
+    let a = g.eu.get(e);
+    let b = g.ev.get(e);
+    if g.bw.get(e) > m.get(a * n + b) {
+      m.set(a * n + b, g.bw.get(e));
+      m.set(b * n + a, g.bw.get(e));
+    }
+  }
+  for k in 0..n {
+    for i in 0..n {
+      for j in 0..n {
+        let through = m.get(i * n + k).min(m.get(k * n + j));
+        if through > m.get(i * n + j) {
+          m.set(i * n + j, through);
+        }
+      }
+    }
+  }
+  return m;
+}
+
+// m[u * n + v] = the least total latency from u to v; `none()` if there is no path, 0 from a
+// vertex to itself.
+pub fn fastest(g : &Graph) -> Vec<f64> {
+  let n = g.n;
+  let mut m = filled(n * n, none());
+  for u in 0..n {
+    m.set(u * n + u, 0.0f64);
+  }
+  for e in 0..g.eu.len() {
+    let a = g.eu.get(e);
+    let b = g.ev.get(e);
+    if g.lat.get(e) < m.get(a * n + b) {
+      m.set(a * n + b, g.lat.get(e));
+      m.set(b * n + a, g.lat.get(e));
+    }
+  }
+  for k in 0..n {
+    for i in 0..n {
+      for j in 0..n {
+        let through = m.get(i * n + k) + m.get(k * n + j);
+        if through < m.get(i * n + j) {
+          m.set(i * n + j, through);
+        }
+      }
+    }
+  }
+  return m;
+}

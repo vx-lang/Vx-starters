@@ -1,0 +1,134 @@
+// fleet-graph, model: the shape of a mixture-of-experts transformer, and what follows from it:
+// parameter counts, the size of the KV cache for one token, the attention work for one query-key
+// pair. Everything is derived from the architecture fields, so a new model is a new set of
+// numbers and no new code. The test checks the derived totals against the published ones
+// (DeepSeek-V3 671B total and 37B active; GLM-4.5 355B and 32B).
+//
+// The architecture fields are typed in from memory of the public model configs, NOT checked
+// against them. The multi-token-prediction module is left out.
+//
+// Attention is one of two kinds. MLA (DeepSeek, and GLM models that use it) keeps one latent of
+// `kv_lora` numbers and one rope key of `qk_rope` numbers for each token and layer, shared by all
+// heads. GQA keeps `kv_heads` keys and values of `head_dim` numbers.
+
+import core::convert;
+import core::num;
+
+struct Model {
+  name : *const i8,
+  layers : i32,
+  dense_layers : i32,     // the first layers have a dense feed-forward network, not experts
+  hidden : i32,
+  vocab : i32,
+  heads : i32,
+  attn : i32,             // 0 = MLA, 1 = GQA
+  q_lora : i32,           // MLA
+  kv_lora : i32,
+  qk_nope : i32,
+  qk_rope : i32,
+  v_dim : i32,
+  kv_heads : i32,         // GQA
+  head_dim : i32,
+  dense_inter : i32,
+  experts : i32,
+  topk : i32,
+  shared : i32,
+  moe_inter : i32,
+}
+
+impl Copy for Model {}
+
+pub fn deepseek_v3() -> Model {
+  return Model { name: "DeepSeek-V3", layers: 61, dense_layers: 3, hidden: 7168, vocab: 129280, heads: 128, attn: 0, q_lora: 1536, kv_lora: 512, qk_nope: 128, qk_rope: 64, v_dim: 128, kv_heads: 0, head_dim: 0, dense_inter: 18432, experts: 256, topk: 8, shared: 1, moe_inter: 2048 };
+}
+
+pub fn glm_4_5() -> Model {
+  return Model { name: "GLM-4.5", layers: 92, dense_layers: 3, hidden: 5120, vocab: 151552, heads: 96, attn: 1, q_lora: 0, kv_lora: 0, qk_nope: 0, qk_rope: 0, v_dim: 0, kv_heads: 8, head_dim: 128, dense_inter: 12288, experts: 160, topk: 8, shared: 1, moe_inter: 1536 };
+}
+
+fn fl(x : i32) -> f64 {
+  return f64::from(x);
+}
+
+pub fn moe_layers(m : Model) -> i32 {
+  return m.layers - m.dense_layers;
+}
+
+// The attention weights of one layer.
+pub fn attn_params(m : Model) -> f64 {
+  let h = fl(m.hidden);
+  if m.attn == 0 {
+    // q down, q up, kv down (latent and rope key), kv up (keys and values), output
+    return h * fl(m.q_lora) + fl(m.q_lora) * fl(m.heads) * fl(m.qk_nope + m.qk_rope) + h * fl(m.kv_lora + m.qk_rope) + fl(m.kv_lora) * fl(m.heads) * fl(m.qk_nope + m.v_dim) + fl(m.heads) * fl(m.v_dim) * h;
+  }
+  return h * fl(m.heads) * fl(m.head_dim) + 2.0f64 * h * fl(m.kv_heads) * fl(m.head_dim) + fl(m.heads) * fl(m.head_dim) * h;
+}
+
+// One expert (gate, up and down projections).
+pub fn expert_params(m : Model) -> f64 {
+  return 3.0f64 * fl(m.hidden) * fl(m.moe_inter);
+}
+
+// The routed experts of the whole model: the part that expert parallelism spreads out.
+pub fn routed_params(m : Model) -> f64 {
+  return fl(moe_layers(m)) * fl(m.experts) * expert_params(m);
+}
+
+pub fn total_params(m : Model) -> f64 {
+  let dense_ffn = fl(m.dense_layers) * 3.0f64 * fl(m.hidden) * fl(m.dense_inter);
+  let shared = fl(moe_layers(m)) * fl(m.shared) * expert_params(m);
+  let router = fl(moe_layers(m)) * fl(m.hidden) * fl(m.experts);
+  return fl(m.layers) * attn_params(m) + dense_ffn + routed_params(m) + shared + router + 2.0f64 * fl(m.vocab) * fl(m.hidden);
+}
+
+// What a token uses in the layers, without the output head: the attention weights, the dense
+// layers, the shared experts, the router and the `topk` routed experts of each layer.
+pub fn layer_active_params(m : Model) -> f64 {
+  let dense_ffn = fl(m.dense_layers) * 3.0f64 * fl(m.hidden) * fl(m.dense_inter);
+  let moe = fl(moe_layers(m)) * (fl(m.topk + m.shared) * expert_params(m) + fl(m.hidden) * fl(m.experts));
+  return fl(m.layers) * attn_params(m) + dense_ffn + moe;
+}
+
+// Active parameters of a decoded token, with the output head.
+pub fn active_params(m : Model) -> f64 {
+  return layer_active_params(m) + fl(m.vocab) * fl(m.hidden);
+}
+
+// The weights a decode step reads however many experts it touches: all but the routed experts and
+// the input embedding (a lookup reads only its row).
+pub fn resident_params(m : Model) -> f64 {
+  return total_params(m) - routed_params(m) - fl(m.vocab) * fl(m.hidden);
+}
+
+// All weights except the routed experts, input embedding included: what sits in memory.
+pub fn dense_part(m : Model) -> f64 {
+  return total_params(m) - routed_params(m);
+}
+
+// Numbers in the KV cache for one token, over all layers.
+pub fn kv_elems(m : Model) -> f64 {
+  if m.attn == 0 {
+    return fl(m.layers) * fl(m.kv_lora + m.qk_rope);
+  }
+  return fl(m.layers) * 2.0f64 * fl(m.kv_heads) * fl(m.head_dim);
+}
+
+// FLOPs of attention for one query and one key in one layer. Decode on MLA uses the absorbed form
+// (scores against the latent), prefill the expanded one.
+pub fn pair_flops(m : Model, decode : i32) -> f64 {
+  if m.attn == 0 {
+    if decode == 1 {
+      return 2.0f64 * fl(m.heads) * fl(2 * m.kv_lora + m.qk_rope);
+    }
+    return 2.0f64 * fl(m.heads) * fl(m.qk_nope + m.qk_rope + m.v_dim);
+  }
+  return 4.0f64 * fl(m.heads) * fl(m.head_dim);
+}
+
+// The width of what attention writes for one query in one layer, per head.
+pub fn out_dim(m : Model) -> i32 {
+  if m.attn == 0 {
+    return m.v_dim;
+  }
+  return m.head_dim;
+}

@@ -1,0 +1,185 @@
+// fleet-graph, fleet: a data center as a graph. The vertices are the domains (a node or a rack on
+// its own NVLink fabric), one leaf switch for each group of domains, and one spine. A domain
+// reaches its leaf at `gpus * nic` bytes/s; a leaf reaches the spine at the sum of its domains'
+// uplinks divided by the oversubscription. Domains on one leaf talk at full rate, domains on
+// different leaves through the spine, at the narrower of the leaf links.
+//
+// What a placement asks of a fleet is the bandwidth a group of domains gets between them, and the
+// latency, both read off the graph (widest path, least latency).
+
+import core::convert;
+import core::num;
+import graph;
+import hw;
+import std::vec;
+
+struct Fleet {
+  doms : Vec<Domain>,
+  leaf : Vec<i32>,
+  leaves : i32,
+  wide : Vec<f64>,       // widest path between any two vertices
+  late : Vec<f64>,       // least latency between any two vertices
+  nv : i32,
+}
+
+fn fl(x : i32) -> f64 {
+  return f64::from(x);
+}
+
+pub fn new_fleet() -> Fleet {
+  return Fleet { doms: Vec<Domain>::with_capacity(8), leaf: Vec<i32>::with_capacity(8), leaves: 0, wide: Vec<f64>::with_capacity(1), late: Vec<f64>::with_capacity(1), nv: 0 };
+}
+
+// Adds a domain under leaf switch `leaf` (numbered from 0). Call `wire` when all are added.
+pub fn add_domain(f : &mut Fleet, d : Domain, leaf : i32) -> void {
+  f.doms.push(d);
+  f.leaf.push(leaf);
+  if leaf + 1 > f.leaves {
+    f.leaves = leaf + 1;
+  }
+  return;
+}
+
+pub fn count(f : &Fleet) -> i32 {
+  return f.doms.len();
+}
+
+fn micro() -> f64 {
+  return 0.000001f64;
+}
+
+// Builds the graph and its path tables. Vertex i is domain i, vertex n + l is leaf l, vertex
+// n + leaves is the spine.
+pub fn wire(f : &mut Fleet, oversub : f64) -> void {
+  let n = f.doms.len();
+  let spine = n + f.leaves;
+  f.nv = spine + 1;
+  let mut g = new_graph(f.nv);
+  let mut under = Vec<f64>::with_capacity(f.leaves);
+  for l in 0..f.leaves {
+    under.push(0.0f64);
+  }
+  for i in 0..n {
+    let up = uplink(f.doms.get(i));
+    add_edge(&mut g, i, n + f.leaf.get(i), up, micro());
+    under.set(f.leaf.get(i), under.get(f.leaf.get(i)) + up);
+  }
+  for l in 0..f.leaves {
+    add_edge(&mut g, n + l, spine, under.get(l) / oversub, 2.0f64 * micro());
+  }
+  f.wide = widest(&g);
+  f.late = fastest(&g);
+  return;
+}
+
+pub fn domain(f : &Fleet, i : i32) -> Domain {
+  return f.doms.get(i);
+}
+
+// A class of domains: the same SKU and size.
+pub fn same_class(a : Domain, b : Domain) -> bool {
+  return a.gpus == b.gpus && a.sku.cost == b.sku.cost && a.sku.hbm == b.sku.hbm;
+}
+
+// Bytes/s per GPU between the domains `members`, when all of them send to all the others at
+// once: the narrowest pair, where the leaf link of a pair on different leaves is shared by the
+// members under that leaf. 0 for a single domain.
+pub fn group_bandwidth(f : &Fleet, members : &Vec<i32>) -> f64 {
+  let n = f.doms.len();
+  let m = members.len();
+  let mut best = 1000000000000000.0f64;
+  for x in 0..m {
+    let a = members.get(x);
+    let mut share = 0;
+    for y in 0..m {
+      if f.leaf.get(members.get(y)) == f.leaf.get(a) {
+        share += 1;
+      }
+    }
+    for y in 0..m {
+      let b = members.get(y);
+      if a != b {
+        let mut bw = f.wide.get(a * f.nv + b);
+        if f.leaf.get(a) != f.leaf.get(b) {
+          // The leaf's link to the spine is shared by the members on that leaf.
+          let leaf_up = f.wide.get((n + f.leaf.get(a)) * f.nv + (n + f.leaves));
+          bw = bw.min(leaf_up / fl(share));
+        }
+        let per_gpu = bw / fl(f.doms.get(a).gpus);
+        if per_gpu < best {
+          best = per_gpu;
+        }
+      }
+    }
+  }
+  if m < 2 {
+    return 0.0f64;
+  }
+  return best;
+}
+
+// The largest one-way latency between two of `members`, seconds; 0 for a single domain.
+pub fn group_latency(f : &Fleet, members : &Vec<i32>) -> f64 {
+  let m = members.len();
+  let mut worst = 0.0f64;
+  for x in 0..m {
+    for y in 0..m {
+      let t = f.late.get(members.get(x) * f.nv + members.get(y));
+      if t > worst {
+        worst = t;
+      }
+    }
+  }
+  return worst;
+}
+
+// Chooses `want` free domains of the same class as domain `seed_class`, as close together as
+// the graph allows: for each free domain of the class as a start, add the free domain that keeps
+// the group's bandwidth highest (ties to the lower number), and keep the start that ends best
+// (ties to the lower number). `free[i]` is 1 for a free domain. Returns fewer than `want` if the
+// fleet has not that many.
+pub fn pick_group(f : &Fleet, class_of : i32, want : i32, free : &Vec<i32>) -> Vec<i32> {
+  let n = f.doms.len();
+  let proto = f.doms.get(class_of);
+  let mut best = Vec<i32>::with_capacity(want);
+  let mut best_bw = -1.0f64;
+  for s in 0..n {
+    if free.get(s) == 1 && same_class(f.doms.get(s), proto) {
+      let mut group = Vec<i32>::with_capacity(want);
+      group.push(s);
+      while group.len() < want {
+        let mut pick = -1;
+        let mut pick_bw = -1.0f64;
+        for c in 0..n {
+          let mut taken = false;
+          for k in 0..group.len() {
+            if group.get(k) == c {
+              taken = true;
+            }
+          }
+          if !taken && free.get(c) == 1 && same_class(f.doms.get(c), proto) {
+            group.push(c);
+            let bw = group_bandwidth(f, &group);
+            group.pop();
+            if bw > pick_bw {
+              pick_bw = bw;
+              pick = c;
+            }
+          }
+        }
+        if pick < 0 {
+          break;
+        }
+        group.push(pick);
+      }
+      if group.len() == want {
+        let bw = group_bandwidth(f, &group);
+        if bw > best_bw {
+          best_bw = bw;
+          best = group;
+        }
+      }
+    }
+  }
+  return best;
+}

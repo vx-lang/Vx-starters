@@ -1,0 +1,215 @@
+// fleet-graph, cost: what one model costs on one deployment, by roofline: a step takes as long as
+// the slower of its memory traffic and its arithmetic, plus the communication, plus a fixed
+// overhead for each layer. Nothing here is measured. The efficiency factors below are guesses of
+// the usual size; change them to what you measure.
+//
+// A deployment is a group of whole domains (so `domains * gpus_per_domain` GPUs) that hold one
+// copy of the model:
+//
+//   * the routed experts are spread evenly over all GPUs (expert parallelism);
+//   * attention is either data parallel (`dp` = 1: every GPU holds all the attention weights and
+//     serves its own sequences, as DeepSeek's deployment does) or tensor parallel (`dp` = 0: heads
+//     are split; an MLA latent cannot be, so every GPU keeps the whole cache);
+//   * the KV cache of a sequence may be cut into `cp` pieces over `cp` GPUs (context parallelism),
+//     which is what makes a sequence of a million tokens fit;
+//   * weights are `wb` bytes each (2 = bf16, 1 = fp8, 0.5 = int4) and cache entries `kb` bytes.
+//
+// Routing is taken as uniform: a step of b tokens touches E * (1 - (1 - k/E)^b) of the E experts of
+// a layer, and the tokens are spread evenly over the experts' GPUs. A real router is not uniform,
+// so a real step is slower.
+
+import core::convert;
+import core::num;
+import hw;
+import model;
+
+struct Deploy {
+  sku : Sku,
+  domains : i32,
+  gpd : i32,           // GPUs in each domain
+  dp : i32,
+  cp : i32,
+  wb : f64,
+  kb : f64,
+  cross : f64,         // bytes/s per GPU between domains (unused with one domain)
+  lat : f64,           // one-way latency between domains, seconds
+}
+
+impl Copy for Deploy {}
+
+fn fl(x : i32) -> f64 {
+  return f64::from(x);
+}
+
+// Efficiency factors.
+fn mfu() -> f64 {
+  return 0.4f64;
+}
+
+fn mem_eff() -> f64 {
+  return 0.75f64;
+}
+
+fn comm_eff() -> f64 {
+  return 0.7f64;
+}
+
+fn layer_overhead() -> f64 {
+  return 0.00003f64;
+}
+
+fn usable() -> f64 {
+  return 0.9f64;
+}
+
+pub fn gpus(d : Deploy) -> i32 {
+  return d.domains * d.gpd;
+}
+
+fn peak(d : Deploy) -> f64 {
+  if d.wb <= 1.0f64 && d.sku.fp8 > 0.0f64 {
+    return d.sku.fp8;
+  }
+  return d.sku.bf16;
+}
+
+// Sequences each group of GPUs that shares a cache holds, for b sequences in all.
+fn seqs_per_group(d : Deploy, b : i32) -> f64 {
+  if d.dp == 1 {
+    let groups = gpus(d) / d.cp;
+    return fl((b + groups - 1) / groups);
+  }
+  return fl(b);
+}
+
+// How many pieces a sequence's cache is cut into.
+fn kv_shard(m : Model, d : Deploy) -> f64 {
+  if d.dp == 1 || m.attn == 0 {
+    return fl(d.cp);
+  }
+  return fl(d.cp) * fl(min_i(gpus(d) / d.cp, m.kv_heads));
+}
+
+fn min_i(a : i32, b : i32) -> i32 {
+  if a < b {
+    return a;
+  }
+  return b;
+}
+
+// Weight bytes on each GPU.
+pub fn weight_bytes(m : Model, d : Deploy) -> f64 {
+  let g = fl(gpus(d));
+  let routed = routed_params(m) * d.wb / g;
+  if d.dp == 1 {
+    return routed + dense_part(m) * d.wb;
+  }
+  return routed + dense_part(m) * d.wb / g;
+}
+
+// KV cache bytes on each GPU for b sequences of s tokens.
+pub fn kv_bytes(m : Model, d : Deploy, b : i32, s : i32) -> f64 {
+  return seqs_per_group(d, b) * fl(s) * kv_elems(m) * d.kb / kv_shard(m, d);
+}
+
+// Does it fit: weights plus cache within the usable part of HBM.
+pub fn fits(m : Model, d : Deploy, b : i32, s : i32) -> bool {
+  return weight_bytes(m, d) + kv_bytes(m, d, b, s) <= usable() * d.sku.hbm;
+}
+
+// Experts of one layer touched by b tokens under uniform routing.
+pub fn touched(m : Model, b : f64) -> f64 {
+  let e = fl(m.experts);
+  return e * (1.0f64 - (1.0f64 - fl(m.topk) / e).powf(b));
+}
+
+// The bandwidth a collective over the whole group gets, per GPU.
+fn group_bw(d : Deploy) -> f64 {
+  if d.domains == 1 {
+    return d.sku.nvlink * comm_eff();
+  }
+  return d.sku.nvlink.min(d.cross) * comm_eff();
+}
+
+// Time of the all-to-all (send to the experts' GPUs and back) of one MoE layer for `tokens` tokens
+// spread over the group. Dispatch is one byte per number with fp8 weights, otherwise two; the
+// combine is bf16.
+fn all_to_all(m : Model, d : Deploy, tokens : f64) -> f64 {
+  let g = fl(gpus(d));
+  let per_gpu = tokens / g;
+  let mut dispatch = 2.0f64;
+  if d.wb <= 1.0f64 {
+    dispatch = 1.0f64;
+  }
+  let bytes = per_gpu * fl(m.topk) * fl(m.hidden) * (dispatch + 2.0f64);
+  let local = bytes * fl(d.gpd - 1) / g / (d.sku.nvlink * comm_eff());
+  if d.domains == 1 {
+    return local;
+  }
+  let remote = bytes * fl(gpus(d) - d.gpd) / g / (d.cross * comm_eff());
+  return local.max(remote) + 2.0f64 * d.lat;
+}
+
+// Time of a ring all-reduce of `bytes` bytes over the group.
+fn all_reduce(d : Deploy, bytes : f64) -> f64 {
+  let g = fl(gpus(d));
+  let mut t = 2.0f64 * (g - 1.0f64) / g * bytes / group_bw(d);
+  if d.domains > 1 {
+    t = t + 2.0f64 * d.lat;
+  }
+  return t;
+}
+
+// Seconds for one decode step: every one of b sequences, each with s tokens of context, gets one
+// token.
+pub fn decode_step(m : Model, d : Deploy, b : i32, s : i32) -> f64 {
+  let g = fl(gpus(d));
+  let bf = fl(b);
+  // Memory: the experts touched, the weights always read, the cache.
+  let routed_read = fl(moe_layers(m)) * touched(m, bf) / g * expert_params(m) * d.wb;
+  let mut resident = resident_params(m) * d.wb;
+  if d.dp == 0 {
+    resident = resident / g;
+  }
+  let mem = (routed_read + resident + kv_bytes(m, d, b, s)) / (d.sku.hbm_bw * mem_eff());
+  // Arithmetic: the weights each token uses, and attention over the cache.
+  let mut attn = bf * fl(s) * fl(m.layers) * pair_flops(m, 1) / g;
+  if d.dp == 1 {
+    attn = seqs_per_group(d, b) * fl(s) / fl(d.cp) * fl(m.layers) * pair_flops(m, 1);
+  }
+  let flops = 2.0f64 * active_params(m) * bf / g + attn;
+  let comp = flops / (peak(d) * mfu());
+  // Communication, layer by layer.
+  let mut comm = fl(moe_layers(m)) * all_to_all(m, d, bf);
+  if d.dp == 0 {
+    comm = comm + fl(m.layers) * all_reduce(d, bf * fl(m.hidden) * 2.0f64);
+  }
+  if d.cp > 1 {
+    let partial = seqs_per_group(d, b) * fl(m.heads) * fl(out_dim(m) + 2) * 4.0f64;
+    comm = comm + fl(m.layers) * (fl(d.cp - 1) / fl(d.cp) * partial / group_bw(d) + 2.0f64 * d.lat);
+  }
+  return mem.max(comp) + comm + fl(m.layers) * layer_overhead();
+}
+
+// Seconds to prefill one prompt of n tokens, taking the whole group to be sequence parallel: the
+// tokens are spread over the GPUs, and each layer's cache pieces are gathered to where they are
+// needed.
+pub fn prefill_time(m : Model, d : Deploy, n : i32) -> f64 {
+  let g = fl(gpus(d));
+  let nf = fl(n);
+  let flops = 2.0f64 * layer_active_params(m) * nf + nf * nf / 2.0f64 * fl(m.layers) * pair_flops(m, 0);
+  let comp = flops / (g * peak(d) * mfu());
+  let mut resident = resident_params(m) * d.wb;
+  if d.dp == 0 {
+    resident = resident / g;
+  }
+  let mem = (routed_params(m) * d.wb / g + resident) / (d.sku.hbm_bw * mem_eff());
+  let mut comm = fl(moe_layers(m)) * all_to_all(m, d, nf);
+  if d.dp == 0 {
+    comm = comm + fl(m.layers) * all_reduce(d, nf * fl(m.hidden) * 2.0f64);
+  }
+  // Gathering the cache: each GPU needs the other pieces of every layer.
+  let kv_layer = nf * kv_elems(m) / fl(m.layers) * d.kb;
+  comm = comm + fl(m.layers) * ((g - 1.0f64) / g * kv_layer / group_bw(d) + 2.0f64 * d.lat);
+  return mem.max(comp) + comm + fl(m.layers) * layer_overhead();
+}

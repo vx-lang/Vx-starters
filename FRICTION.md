@@ -247,6 +247,14 @@ fail in another.
 
 ## Language
 
+- **fleet-graph, main d25deea9: four small walls in plain host code.** Float literals with an
+  exponent (`1.5e12`) do not parse ([vx-lang/Vx#1654](https://github.com/vx-lang/Vx/issues/1654)),
+  so `hw.vx` writes `1.5 * tera()` with `tera()` a function. `pub struct` and `pub const` do not
+  parse (only `pub fn`; item visibility is open at
+  [vx-lang/Vx#489](https://github.com/vx-lang/Vx/issues/489)); a plain `struct` is seen by the
+  importer anyway. A struct needs `impl Copy` before a `Vec` of it has `get`, and `v[i] = x` on a
+  `Vec` fails in codegen with `Type::parse failed` and no source line
+  ([vx-lang/Vx#2252](https://github.com/vx-lang/Vx/issues/2252)); `v.set(i, x)` works.
 - **flash-attn, main 39a12e0a: every widening `as` is a warning.** `(d as f64)` with `d : i32`
   is `W1007: this cast only widens ... f64::from(..) says so`. The older projects print many
   of these; new code uses `f64::from` and imports `core::convert`.
