@@ -1099,6 +1099,40 @@ fn test_losses() -> i32 {
   return failed;
 }
 
+// ---------------------------------------------------------------------------------------------
+// 8. Headroom
+
+fn test_headroom() -> i32 {
+  let mut failed = 0;
+  // Two H200 nodes and one service: a replica serves R requests a second (one node), a second node
+  // doubles it. At R / 2 the fleet carries about 4 times the load; at 3 R it carries about 2 / 3.
+  let mut f = new_fleet();
+  add_domain(&mut f, hgx8(h200()), 0);
+  add_domain(&mut f, hgx8(h200()), 0);
+  wire(&mut f, 2.0f64);
+  let mut free = Vec<i32>::with_capacity(2);
+  free.push(1);
+  free.push(1);
+  let s = make_service(deepseek_v3(), 1.0f64, 8192, 512, 0.05f64, 5.0f64, 1.0f64, 1, 1024);
+  let rate = best_for(s, &f, &free).cand.rate;
+  let o = one_order();
+  let mut half = Vec<Service>::with_capacity(1);
+  half.push(with_qps(s, rate / 2.0f64));
+  let h4 = headroom(&f, &half, &o);
+  failed += expect(h4 > 3.9f64 && h4 < 4.05f64, "half a replica's rate on two nodes carries 4 times the load");
+  let mut triple = Vec<Service>::with_capacity(1);
+  triple.push(with_qps(s, rate * 3.0f64));
+  let h3 = headroom(&f, &triple, &o);
+  failed += expect(h3 > 0.65f64 && h3 < 0.67f64, "3 replicas' rate on two nodes carries two thirds of it");
+  failed += expect(met_at(&f, &half, &o, h4) && !met_at(&f, &half, &o, h4 * 1.05f64), "and the boundary is where the first is met and 5% more is not");
+  print!("headroom: ");
+  print_f(h4, 2);
+  print!(" ");
+  print_f(h3, 2);
+  print!("\n");
+  return failed;
+}
+
 fn main() -> i32 {
   let mut failed = 0;
   failed += test_models();
@@ -1108,6 +1142,7 @@ fn main() -> i32 {
   failed += test_plan();
   failed += test_pools();
   failed += test_losses();
+  failed += test_headroom();
   if failed == 0 {
     print!("ok\n");
   }

@@ -116,6 +116,11 @@ pub fn with_name(s : Service, name : *const i8) -> Service {
   return Service { name: name, model: s.model, qps: s.qps, prompt: s.prompt, out: s.out, slo_tpot: s.slo_tpot, slo_ttft: s.slo_ttft, min_wb: s.min_wb, kv_fp8: s.kv_fp8, bmax: s.bmax, mode: s.mode };
 }
 
+// The same service at another rate.
+pub fn with_qps(s : Service, qps : f64) -> Service {
+  return Service { name: s.name, model: s.model, qps: qps, prompt: s.prompt, out: s.out, slo_tpot: s.slo_tpot, slo_ttft: s.slo_ttft, min_wb: s.min_wb, kv_fp8: s.kv_fp8, bmax: s.bmax, mode: s.mode };
+}
+
 // The same service served another way: 0 co-located, 1 disaggregated, 2 whichever is better.
 pub fn with_mode(s : Service, mode : i32) -> Service {
   return Service { name: s.name, model: s.model, qps: s.qps, prompt: s.prompt, out: s.out, slo_tpot: s.slo_tpot, slo_ttft: s.slo_ttft, min_wb: s.min_wb, kv_fp8: s.kv_fp8, bmax: s.bmax, mode: mode };
@@ -632,4 +637,46 @@ pub fn schedule_down(f : &Fleet, svcs : &Vec<Service>, down : &Vec<i32>) -> Plan
     }
   }
   return best;
+}
+
+// The services with every rate multiplied by k.
+pub fn scale_load(svcs : &Vec<Service>, k : f64) -> Vec<Service> {
+  let mut out = Vec<Service>::with_capacity(svcs.len());
+  for i in 0..svcs.len() {
+    out.push(with_qps(svcs.get(i), svcs.get(i).qps * k));
+  }
+  return out;
+}
+
+// Is everything met when every rate is multiplied by k (the services taken in `order`).
+pub fn met_at(f : &Fleet, svcs : &Vec<Service>, order : &Vec<i32>, k : f64) -> bool {
+  let scaled = scale_load(svcs, k);
+  let p = schedule_in_order(f, &scaled, order);
+  return shortfall(&scaled, &p) < 0.000000001f64;
+}
+
+// How much more (or less) load the fleet carries: the largest factor, to about 1%, by which every
+// rate can be multiplied with nothing left unmet. Below 1 when the load as given is not met. Found by
+// doubling and bisection with the services placed in `order`; the greedy is not monotone, so it is
+// the boundary of one search and not a promise for every placement.
+pub fn headroom(f : &Fleet, svcs : &Vec<Service>, order : &Vec<i32>) -> f64 {
+  let mut lo = 0.0f64;
+  let mut hi = 1.0f64;
+  if met_at(f, svcs, order, 1.0f64) {
+    lo = 1.0f64;
+    hi = 2.0f64;
+    while hi < 64.0f64 && met_at(f, svcs, order, hi) {
+      lo = hi;
+      hi = hi * 2.0f64;
+    }
+  }
+  for i in 0..7 {
+    let mid = (lo + hi) / 2.0f64;
+    if met_at(f, svcs, order, mid) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
 }
