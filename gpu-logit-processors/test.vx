@@ -1,0 +1,249 @@
+// Tests for gpu-logit-processors: counts, penalties, bias and mask, temperature, and the four in
+// a row, each against host code that does the same row by row. Values are dyadic, so the device
+// and the host agree exactly. Returns the number of failed checks, and prints "ok" when there
+// are none. It also prints some entries, which check.py computes again in Python.
+//
+//   ./build.sh
+
+import core::convert;
+import core::num;
+import ops;
+
+const ROWS : i32 = 6;
+const VOCAB : i32 = 700;
+const MAXLEN : i32 = 300;
+
+fn neg_inf() -> f32 {
+  return 0.0 - 1.0 / 0.0;
+}
+
+fn base(r : i32, c : i32) -> f32 {
+  return (((c * 29 + r * 13) % 41) as f32) / 8.0 - 2.5;
+}
+
+// The history of row r: lens(r) tokens, many repeated (a token is (p * 7 + r) % 90 * 7).
+fn lens(r : i32) -> i32 {
+  return 20 + r * 55;
+}
+
+fn hist(r : i32, p : i32) -> i32 {
+  return ((p * 7 + r) % 90) * 7 + r % 3;
+}
+
+fn rep(r : i32) -> f32 {
+  return 1.0 + (r as f32) / 4.0;
+}
+
+fn freq(r : i32) -> f32 {
+  return (r as f32) / 8.0;
+}
+
+fn pres(r : i32) -> f32 {
+  return 0.5 - (r as f32) / 16.0;
+}
+
+fn bias(c : i32) -> f32 {
+  return ((c % 5) as f32) / 4.0 - 0.5;
+}
+
+fn allowed(r : i32, c : i32) -> i32 {
+  if (c + r) % 6 == 0 {
+    return 0;
+  }
+  return 1;
+}
+
+fn temp(r : i32) -> f32 {
+  if r == 3 {
+    return 0.0;
+  }
+  return 0.5 + (r as f32) / 2.0;
+}
+
+fn host_count(r : i32, c : i32, extra : i32) -> i32 {
+  let mut n = 0;
+  for p in 0..lens(r) {
+    if hist(r, p) == c { n += 1; }
+  }
+  if extra == c { n += 1; }
+  return n;
+}
+
+fn extra(r : i32) -> i32 {
+  return (r * 101 + 17) % VOCAB;
+}
+
+fn host_penalty(r : i32, c : i32, x : f32, n : i32) -> f32 {
+  if n == 0 { return x; }
+  let mut y = x * rep(r);
+  if x > 0.0 { y = x / rep(r); }
+  return y - freq(r) * (n as f32) - pres(r);
+}
+
+fn show(name : *const i8, a : i32, b : i32, c : i32) -> void {
+  print!(name);
+  print!(": ");
+  print!(a);
+  print!(" ");
+  print!(b);
+  print!(" ");
+  print!(c);
+  print!("\n");
+  return;
+}
+
+fn fill_logits(t : &mut Tensor<f32, [6, 700]>) -> void {
+  for r in 0..ROWS {
+    for c in 0..VOCAB { t[r][c] = base(r, c); }
+  }
+  return;
+}
+
+fn main() -> i32 {
+  let mut failed = 0;
+  let mut hist_h = Tensor<i32, [6, 300]>::new();
+  let mut lens_h = Tensor<i32, [6]>::new();
+  let mut tok_h = Tensor<i32, [6]>::new();
+  let mut rep_h = Tensor<f32, [6]>::new();
+  let mut freq_h = Tensor<f32, [6]>::new();
+  let mut pres_h = Tensor<f32, [6]>::new();
+  let mut temp_h = Tensor<f32, [6]>::new();
+  let mut bias_h = Tensor<f32, [700]>::new();
+  let mut allowed_h = Tensor<i32, [6, 700]>::new();
+  for r in 0..ROWS {
+    lens_h[r] = lens(r);
+    tok_h[r] = extra(r);
+    rep_h[r] = rep(r);
+    freq_h[r] = freq(r);
+    pres_h[r] = pres(r);
+    temp_h[r] = temp(r);
+    for p in 0..MAXLEN { hist_h[r][p] = hist(r, p); }
+    for c in 0..VOCAB { allowed_h[r][c] = allowed(r, c); }
+  }
+  for c in 0..VOCAB { bias_h[c] = bias(c); }
+  let hist_d = transfer(hist_h, Memory::HBM);
+  let lens_d = transfer(lens_h, Memory::HBM);
+  let tok_d = transfer(tok_h, Memory::HBM);
+  let rep_d = transfer(rep_h, Memory::HBM);
+  let freq_d = transfer(freq_h, Memory::HBM);
+  let pres_d = transfer(pres_h, Memory::HBM);
+  let temp_d = transfer(temp_h, Memory::HBM);
+  let bias_d = transfer(bias_h, Memory::HBM);
+  let allowed_d = transfer(allowed_h, Memory::HBM);
+
+  // 1. The counts: the history, then one more token for each row.
+  let mut counts = transfer(Tensor<i32, [4200]>::new(), Memory::HBM);
+  count_history(&counts, &hist_d, &lens_d, ROWS, MAXLEN, VOCAB);
+  count_token(&counts, &tok_d, ROWS, VOCAB);
+  let counts_h = transfer(counts, Memory::CPU_DRAM);
+  let mut wrong = 0;
+  for r in 0..ROWS {
+    for c in 0..VOCAB {
+      if counts_h[r * VOCAB + c] != host_count(r, c, extra(r)) { wrong += 1; }
+    }
+  }
+  show("counts", counts_h[extra(0)], counts_h[VOCAB + hist(1, 3)], counts_h[5 * VOCAB + hist(5, 0)]);
+  if wrong > 0 {
+    print!("  FAIL: ");
+    print!(wrong);
+    print!(" counts differ\n");
+    failed += 1;
+  }
+
+  // 2. Penalties alone.
+  let mut l1_h = Tensor<f32, [6, 700]>::new();
+  fill_logits(&mut l1_h);
+  let mut l1 = transfer(l1_h, Memory::HBM);
+  let counts2 = transfer(counts_h, Memory::HBM);
+  apply_penalties(&mut l1, &counts2, &rep_d, &freq_d, &pres_d, ROWS, VOCAB);
+  let r1 = transfer(l1, Memory::CPU_DRAM);
+  wrong = 0;
+  for r in 0..ROWS {
+    for c in 0..VOCAB {
+      if r1[r][c] != host_penalty(r, c, base(r, c), host_count(r, c, extra(r))) { wrong += 1; }
+    }
+  }
+  show("penalties", (r1[2][hist(2, 0)] * 8.0) as i32, (r1[4][hist(4, 5)] * 8.0) as i32, (r1[5][extra(5)] * 8.0) as i32);
+  if wrong > 0 {
+    print!("  FAIL: ");
+    print!(wrong);
+    print!(" penalized logits differ\n");
+    failed += 1;
+  }
+
+  // 3. Bias and mask alone.
+  let mut l2_h = Tensor<f32, [6, 700]>::new();
+  fill_logits(&mut l2_h);
+  let mut l2 = transfer(l2_h, Memory::HBM);
+  apply_bias_mask(&mut l2, &bias_d, &allowed_d, ROWS, VOCAB);
+  let r2 = transfer(l2, Memory::CPU_DRAM);
+  wrong = 0;
+  let mut masked = 0;
+  for r in 0..ROWS {
+    for c in 0..VOCAB {
+      let mut want = base(r, c) + bias(c);
+      if allowed(r, c) == 0 { want = neg_inf(); masked += 1; }
+      if r2[r][c] != want { wrong += 1; }
+    }
+  }
+  show("bias_mask", (r2[1][2] * 8.0) as i32, (r2[2][3] * 8.0) as i32, masked);
+  if wrong > 0 {
+    print!("  FAIL: ");
+    print!(wrong);
+    print!(" biased or masked logits differ\n");
+    failed += 1;
+  }
+
+  // 4. Temperature alone: row 3 has 0 and must not change.
+  let mut l3_h = Tensor<f32, [6, 700]>::new();
+  fill_logits(&mut l3_h);
+  let mut l3 = transfer(l3_h, Memory::HBM);
+  scale_temperature(&mut l3, &temp_d, ROWS, VOCAB);
+  let r3 = transfer(l3, Memory::CPU_DRAM);
+  wrong = 0;
+  for r in 0..ROWS {
+    for c in 0..VOCAB {
+      let mut want = base(r, c);
+      if temp(r) > 0.0 { want = want / temp(r); }
+      if r3[r][c] != want { wrong += 1; }
+    }
+  }
+  show("temperature", (r3[0][1] * 8.0) as i32, (r3[3][1] * 8.0) as i32, (r3[5][9] * 8.0) as i32);
+  if wrong > 0 {
+    print!("  FAIL: ");
+    print!(wrong);
+    print!(" scaled logits differ\n");
+    failed += 1;
+  }
+
+  // 5. The four in the documented order, against the host doing it in one pass per entry.
+  let mut l4_h = Tensor<f32, [6, 700]>::new();
+  fill_logits(&mut l4_h);
+  let mut l4 = transfer(l4_h, Memory::HBM);
+  let counts3 = transfer(transfer(counts2, Memory::CPU_DRAM), Memory::HBM);
+  apply_penalties(&mut l4, &counts3, &rep_d, &freq_d, &pres_d, ROWS, VOCAB);
+  apply_bias_mask(&mut l4, &bias_d, &allowed_d, ROWS, VOCAB);
+  scale_temperature(&mut l4, &temp_d, ROWS, VOCAB);
+  let r4 = transfer(l4, Memory::CPU_DRAM);
+  wrong = 0;
+  for r in 0..ROWS {
+    for c in 0..VOCAB {
+      let mut want = host_penalty(r, c, base(r, c), host_count(r, c, extra(r))) + bias(c);
+      if allowed(r, c) == 0 { want = neg_inf(); }
+      if temp(r) > 0.0 { want = want / temp(r); }
+      if r4[r][c] != want { wrong += 1; }
+    }
+  }
+  show("pipeline", (r4[1][hist(1, 2)] * 8.0) as i32, (r4[3][hist(3, 4)] * 8.0) as i32, (r4[4][extra(4)] * 8.0) as i32);
+  if wrong > 0 {
+    print!("  FAIL: ");
+    print!(wrong);
+    print!(" logits of the pipeline differ\n");
+    failed += 1;
+  }
+
+  if failed == 0 {
+    print!("ok\n");
+  }
+  return failed;
+}
