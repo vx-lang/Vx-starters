@@ -69,11 +69,14 @@ first such checks ([vx-lang/Vx#1489](https://github.com/vx-lang/Vx/issues/1489))
 | [`ffi-zlib`](ffi-zlib) | Calling a C library: zlib's crc32, adler32, compress2 and uncompress through an `extern` block, checked against known values and a CRC-32 written in Vx | Linking native libraries: `vxc` cannot add `-lz`, so the build compiles to an object and links it by hand |
 | [`will-it-fit`](will-it-fit) | `--machine`: one program admitted or refused per GPU (A100 40 GB, H100); capacity (E6010) and dtype (E6026) errors predicted by a run-time calculation and matched exactly | Machine models as build inputs, per target: the same source, one compile per machine file |
 | [`prefill-decode`](prefill-decode) | `spawn on` GPU and NPU regions, `transfer` / `to_device` of a KV cache, `--verify-seams` proving every hop and refusing a relaxed one | Optional tools (`z3`) in the test step: skipped with a message when missing |
-| [`gpu-norms`](gpu-norms) | LayerNorm, RMSNorm and softmax as `spawn on(Topology::GPU)` kernels: PTX for sm_80 that `ptxas` accepts, a standalone executable, results checked against host code and Python, no GPU needed | Device code as a build output: the PTX is dug out of LLVM IR, the CUDA toolkit is an optional tool, and a CUDA toolchain needs the driver's stub to link |
+| [`gpu-norms`](gpu-norms) | LayerNorm, RMSNorm and softmax as `across` kernels (a block for each row, `lanes::sum`): PTX for sm_80 that `ptxas` accepts, a standalone executable, results checked against host code and Python, no GPU needed | Device code as a build output: the PTX is dug out of LLVM IR, the CUDA toolkit is an optional tool, and a CUDA toolchain needs the driver's stub to link |
 | [`gpu-router`](gpu-router) | A mixture-of-experts router on the GPU: sigmoid scores with a selection bias, top-k over groups, weights from the sigmoid alone; checked pick for pick against a differently written host router, including ties between experts and whole groups | Tests that must hit a tie on purpose: a break of the tie rule passed until the data had ties at the cut |
 | [`gpu-llm-ops`](gpu-llm-ops) | The kernels of a GPT-2 training step (embedding, GELU, matmul, attention layout, causal softmax, cross-entropy, AdamW) as a library of `across` kernels, from llm.c; same checks as `gpu-norms` | A library whose code is device code: the tests import it, and the PTX still has to be dug out of the test program |
+| [`gpu-moe`](gpu-moe) | A mixture-of-experts layer with work grouped by expert: a sort of (token, expert) pairs on the device from atomic adds, then one block for each pair; checked against a host loop and for the sort's own invariants | Atomics as the way to write at a position only the data knows (the race proof refuses a plain write) |
 | [`gpu-blas`](gpu-blas) | A tiled matrix product, 2mm, atax and gemver as `across` kernels, from PolyBench/GPU; edge sizes that are not a multiple of the block | A toolchain newer than the last release, because the machine file needs `levels:` |
+| [`gpu-quant-ops`](gpu-quant-ops) | bf16, fp8, int8 and int4 matvec and matmul as `across` kernels, weights decoded in the lanes with exact macro decoders; each checked against host code and Python | Checker limits as a build input: no calls and no bit-cast in a kernel, so the decoders are macros (vx-lang/Vx#2222) |
 | [`gpu-stencil`](gpu-stencil) | Jacobi and HotSpot grid steps as `across` kernels: a launch for each step, and two steps inside a shared-memory tile | A host loop that launches kernels: the build must count launches, not functions |
+| [`gpu-inference-ops`](gpu-inference-ops) | The kernels of one decode step as `across` kernels: RoPE, SwiGLU, two matvecs (one with `lanes::sum`), a top-2 expert router, attention over a KV cache; each checked against host code and Python | Checker limits as a build input: two forms the race proof refuses (vx-lang/Vx#2220, #2221) |
 
 ## Getting the toolchain
 
@@ -84,7 +87,7 @@ curl -fsSL https://vxlang.org/install.sh | sh
 Every project builds with `./build.sh` against `~/.vx/current`, or the toolchain `VX_HOME` names.
 
 The projects up to `tiny-mlp` were written against v0.0.3. From `flash-attn` on, they use Vx
-built from `main` (39a12e0a or later; d25deea9 for the `gpu-llm-ops`, `gpu-blas` and `gpu-stencil` kernels), which has fixes the release lacks; there is no nightly
+built from `main` (39a12e0a or later; d25deea9 for the `gpu-llm-ops`, `gpu-blas`, `gpu-stencil` and `gpu-inference-ops` kernels), which has fixes the release lacks; there is no nightly
 installer yet, so that means building Vx and packaging it with `scripts/release/package.sh`.
 Every project passes with that build too (rechecked on b31ef3ca, built with and without CUDA),
 except `rational` and `interval`, which no longer

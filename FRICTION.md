@@ -18,11 +18,25 @@ Format: the project, the toolchain version, what happened, and what we did inste
   `libmlir_c_runner_utils` and `libmlir_runner_utils` (each with an rpath), then `-lz -lm`. That
   list was read from Vx's `src/jit.rs`, since nothing documents it (#1499).
 
+- **gpu-moe, main d25deea9: no sort on the device, and a plain scatter is refused.** Grouping
+  pairs by expert is a counting sort, and its last step writes at a position that only the data
+  knows, which the race proof refuses (E6032). The way through is `atomic_fetch_add_i32` for the
+  slot and `atomic_store_i32` / `atomic_store_f32` for the write. A library of sorts, scans and
+  scatters for `across` kernels would be the next thing a serving stack needs.
+
 - **flash-attn, main 39a12e0a: no way to get a toolchain newer than the release.** The bug fixes
   since v0.0.3 are only on `main`. Using them meant building Vx (a full `cargo build --release
   --workspace`) and packaging it with `scripts/release/package.sh`, borrowing
   the LLVM directory from the installed v0.0.3. A package needs a way to say "needs Vx newer than
   v0.0.3", and the installer a way to install a nightly.
+
+- **gpu-quant-ops, main d25deea9: a kernel cannot call a function, so decoders are macros.**
+  The race proof refuses a call it cannot read inside an `across` loop, and
+  `f32::from_bits` is not trusted either
+  ([vx-lang/Vx#2222](https://github.com/vx-lang/Vx/issues/2222)); `libm_f32_from_bits` also needs
+  the CPU. The bf16, fp8 and int4 decoders are `macro_rules` in `ops.vx`, with a macro `pow2` in
+  place of a bit-cast. A library of kernels cannot share its decoders as functions, only as
+  macros, and a macro defined in one file is not a thing a package can export in its API.
 
 - **gpu-norms, main b31ef3ca: a CUDA toolchain needs the GPU driver to build anything.** Built
   where the CUDA toolkit is installed, Vx's dispatch library links `-lcuda`, so every
@@ -62,6 +76,16 @@ Format: the project, the toolchain version, what happened, and what we did inste
   number of regions by hand.
 - **gpu-blas, main d25deea9: tensors are linear, so a test cannot copy an input.** `let cur = a_h;`
   moves `a_h` (E4001), so the host reference refills a second tensor with the same loop.
+
+- **gpu-inference-ops, main d25deea9: the race proof refuses RoPE as usually written.** A lane
+  that writes `out[2j]` and `out[2j + 1]` gets E6032, though no two lanes can collide
+  ([vx-lang/Vx#2220](https://github.com/vx-lang/Vx/issues/2220)). `rope_forward` loops over the 64
+  outputs instead, one write for each lane. A build tool that runs the checker would want to say
+  which rule it is allowed to ignore, or have the checker's limits listed with each version.
+- **gpu-inference-ops, main d25deea9: `lanes::sum` into a store gives the wrong first error.**
+  `y[r] = lanes::sum(..)` reports E4005 (a stack reference escapes) before the real E6032 (the
+  call must be the whole value of a `let`)
+  ([vx-lang/Vx#2221](https://github.com/vx-lang/Vx/issues/2221)).
 
 - **wordcount, v0.0.3: no way to build an executable.** `vxc` can run a program (`run-jit`) or
   emit an object file (`emit-obj`), but not link one. `build.sh` links the object against

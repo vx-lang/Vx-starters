@@ -1,0 +1,274 @@
+// gpu-quant-ops: matrix-vector and matrix-matrix products with weights stored as bf16, fp8
+// (e4m3), int8 or int4, for the GPU. The weights stay in their small type in memory and are
+// decoded in the lanes, which is the point of quantization: the read is the cost.
+//
+// y = W x and out[m][r] = sum over c of x[m][c] * W[r][c]. One block for each output (each row,
+// or each batch row and weight row), with 256 lanes that each sum a strided slice of the
+// columns, and `lanes::sum` to add the lanes' parts. The sum order is stated, so a host
+// reference can follow it.
+//
+// Formats:
+//   bf16  u16 bits, exact decode.
+//   fp8   u8 e4m3fn bits (bias 7, no infinity, 0x7f and 0xff are NaN), a scale for each row.
+//   int8  i8 values, a scale for each row.
+//   int4  two signed 4-bit values in a u8 (the low nibble first), a scale for each group of 64
+//         columns of a row. Columns must be even, and a multiple of 64 for the groups.
+//
+// Decoding is in macros, because the race proof refuses a call to a function in an `across`
+// loop and a bit-cast to f32 (`libm_f32_from_bits`) cannot run on the device. Each decode is
+// exact in f32.
+
+import core::num;
+
+// 2^k for k in [-126, 127], by squaring: the product of the bits of |k| set in the base.
+macro_rules pow2 {
+  ($k : expr) => {
+    unsafe {
+      let mut dv_k : i32 = $k;
+      let mut dv_base : f32 = 2.0;
+      if dv_k < 0 {
+        dv_k = 0 - dv_k;
+        dv_base = 0.5;
+      }
+      let mut dv_p : f32 = 1.0;
+      for dv_i in 0..8 {
+        if ((dv_k >> dv_i) & 1) != 0 {
+          dv_p = dv_p * dv_base;
+        }
+        dv_base = dv_base * dv_base;
+      }
+      dv_p
+    }
+  };
+}
+
+// bf16 bits (0..65535) to f32: sign, 8 exponent bits, 7 mantissa bits. No infinity or NaN.
+macro_rules bf16_decode {
+  ($bits : expr) => {
+    unsafe {
+      let dv_b : i32 = $bits;
+      let dv_e : i32 = (dv_b >> 7) & 255;
+      let dv_m : i32 = dv_b & 127;
+      let mut dv_v : f32 = (dv_m as f32) / 128.0 * pow2!(0 - 126);
+      if dv_e > 0 {
+        dv_v = (128 + dv_m) as f32 / 128.0 * pow2!(dv_e - 127);
+      }
+      if (dv_b >> 15) != 0 {
+        dv_v = 0.0 - dv_v;
+      }
+      dv_v
+    }
+  };
+}
+
+// e4m3fn byte to f32: (8 + m) * 2^(e - 10), or m / 512 when e = 0.
+macro_rules fp8_decode {
+  ($bits : expr) => {
+    unsafe {
+      let dv_b : i32 = $bits;
+      let dv_e : i32 = (dv_b >> 3) & 15;
+      let dv_m : i32 = dv_b & 7;
+      let mut dv_v : f32 = (dv_m as f32) / 512.0;
+      if dv_e > 0 {
+        dv_v = (8 + dv_m) as f32 * pow2!(dv_e - 10);
+      }
+      if (dv_b >> 7) != 0 {
+        dv_v = 0.0 - dv_v;
+      }
+      dv_v
+    }
+  };
+}
+
+// One signed 4-bit value of a byte: high is 0 for the low nibble, 1 for the high one.
+macro_rules int4_decode {
+  ($byte : expr, $high : expr) => {
+    unsafe {
+      let dv_b : i32 = $byte;
+      let mut dv_n : i32 = dv_b & 15;
+      if $high != 0 {
+        dv_n = (dv_b >> 4) & 15;
+      }
+      if dv_n >= 8 {
+        dv_n = dv_n - 16;
+      }
+      dv_n as f32
+    }
+  };
+}
+
+// y = W x, bf16 weights, [rows][cols] of u16 bits.
+pub fn bf16_matvec(y : &mut Tensor<f32, [?], Memory::HBM>, w : &Tensor<u16, [?, ?], Memory::HBM>, x : &Tensor<f32, [?], Memory::HBM>, rows : i32, cols : i32) -> void {
+  spawn on(Topology::Device) {
+    for r in 0..rows across blocks {
+      let mut part = unsafe { Tensor<f32, [256], Memory::SMEM>::uninit() };
+      for l in 0..256 across lanes {
+        let mut s : f32 = 0.0;
+        let mut c = l;
+        while c < cols {
+          s = s + bf16_decode!(w[r][c] as i32) * x[c];
+          c = c + 256;
+        }
+        part[l] = s;
+      }
+      let total = lanes::sum(&part, 256);
+      y[r] = total;
+    }
+  }
+  return;
+}
+
+// out[m][r] = sum over c of x[m][c] * W[r][c], for `batch` rows of x. Same weights as `bf16_matvec`.
+pub fn bf16_matmul(out : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<u16, [?, ?], Memory::HBM>, x : &Tensor<f32, [?, ?], Memory::HBM>, batch : i32, rows : i32, cols : i32) -> void {
+  spawn on(Topology::Device) {
+    for m in 0..batch across blocks {
+      for r in 0..rows across blocks {
+        let mut part = unsafe { Tensor<f32, [256], Memory::SMEM>::uninit() };
+        for l in 0..256 across lanes {
+          let mut s : f32 = 0.0;
+          let mut c = l;
+          while c < cols {
+            s = s + bf16_decode!(w[r][c] as i32) * x[m][c];
+            c = c + 256;
+          }
+          part[l] = s;
+        }
+        let total = lanes::sum(&part, 256);
+        out[m][r] = total;
+      }
+    }
+  }
+  return;
+}
+
+// y = W x, fp8 e4m3 weights, [rows][cols] of u8, `scale[r]` for each row.
+pub fn fp8_matvec(y : &mut Tensor<f32, [?], Memory::HBM>, w : &Tensor<u8, [?, ?], Memory::HBM>, scale : &Tensor<f32, [?], Memory::HBM>, x : &Tensor<f32, [?], Memory::HBM>, rows : i32, cols : i32) -> void {
+  spawn on(Topology::Device) {
+    for r in 0..rows across blocks {
+      let mut part = unsafe { Tensor<f32, [256], Memory::SMEM>::uninit() };
+      for l in 0..256 across lanes {
+        let mut s : f32 = 0.0;
+        let mut c = l;
+        while c < cols {
+          s = s + fp8_decode!(w[r][c] as i32) * x[c];
+          c = c + 256;
+        }
+        part[l] = s;
+      }
+      let total = lanes::sum(&part, 256);
+      y[r] = total * scale[r];
+    }
+  }
+  return;
+}
+
+// out[m][r] = sum over c of x[m][c] * W[r][c], for `batch` rows of x. Same weights as `fp8_matvec`.
+pub fn fp8_matmul(out : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<u8, [?, ?], Memory::HBM>, scale : &Tensor<f32, [?], Memory::HBM>, x : &Tensor<f32, [?, ?], Memory::HBM>, batch : i32, rows : i32, cols : i32) -> void {
+  spawn on(Topology::Device) {
+    for m in 0..batch across blocks {
+      for r in 0..rows across blocks {
+        let mut part = unsafe { Tensor<f32, [256], Memory::SMEM>::uninit() };
+        for l in 0..256 across lanes {
+          let mut s : f32 = 0.0;
+          let mut c = l;
+          while c < cols {
+            s = s + fp8_decode!(w[r][c] as i32) * x[m][c];
+            c = c + 256;
+          }
+          part[l] = s;
+        }
+        let total = lanes::sum(&part, 256);
+        out[m][r] = total * scale[r];
+      }
+    }
+  }
+  return;
+}
+
+// y = W x, int8 weights, [rows][cols], `scale[r]` for each row.
+pub fn int8_matvec(y : &mut Tensor<f32, [?], Memory::HBM>, w : &Tensor<i8, [?, ?], Memory::HBM>, scale : &Tensor<f32, [?], Memory::HBM>, x : &Tensor<f32, [?], Memory::HBM>, rows : i32, cols : i32) -> void {
+  spawn on(Topology::Device) {
+    for r in 0..rows across blocks {
+      let mut part = unsafe { Tensor<f32, [256], Memory::SMEM>::uninit() };
+      for l in 0..256 across lanes {
+        let mut s : f32 = 0.0;
+        let mut c = l;
+        while c < cols {
+          s = s + (w[r][c] as f32) * x[c];
+          c = c + 256;
+        }
+        part[l] = s;
+      }
+      let total = lanes::sum(&part, 256);
+      y[r] = total * scale[r];
+    }
+  }
+  return;
+}
+
+// out[m][r] = sum over c of x[m][c] * W[r][c], for `batch` rows of x. Same weights as `int8_matvec`.
+pub fn int8_matmul(out : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<i8, [?, ?], Memory::HBM>, scale : &Tensor<f32, [?], Memory::HBM>, x : &Tensor<f32, [?, ?], Memory::HBM>, batch : i32, rows : i32, cols : i32) -> void {
+  spawn on(Topology::Device) {
+    for m in 0..batch across blocks {
+      for r in 0..rows across blocks {
+        let mut part = unsafe { Tensor<f32, [256], Memory::SMEM>::uninit() };
+        for l in 0..256 across lanes {
+          let mut s : f32 = 0.0;
+          let mut c = l;
+          while c < cols {
+            s = s + (w[r][c] as f32) * x[m][c];
+            c = c + 256;
+          }
+          part[l] = s;
+        }
+        let total = lanes::sum(&part, 256);
+        out[m][r] = total * scale[r];
+      }
+    }
+  }
+  return;
+}
+
+// y = W x, int4 weights, [rows][cols / 2] of u8 pairs, `scale[r][g]` for each group g of 64 columns.
+pub fn int4_matvec(y : &mut Tensor<f32, [?], Memory::HBM>, w : &Tensor<u8, [?, ?], Memory::HBM>, scale : &Tensor<f32, [?, ?], Memory::HBM>, x : &Tensor<f32, [?], Memory::HBM>, rows : i32, cols : i32) -> void {
+  spawn on(Topology::Device) {
+    for r in 0..rows across blocks {
+      let mut part = unsafe { Tensor<f32, [256], Memory::SMEM>::uninit() };
+      for l in 0..256 across lanes {
+        let mut s : f32 = 0.0;
+        let mut c = l;
+        while c < cols {
+          s = s + int4_decode!(w[r][c / 2] as i32, c % 2) * scale[r][c / 64] * x[c];
+          c = c + 256;
+        }
+        part[l] = s;
+      }
+      let total = lanes::sum(&part, 256);
+      y[r] = total;
+    }
+  }
+  return;
+}
+
+// out[m][r] = sum over c of x[m][c] * W[r][c], for `batch` rows of x. Same weights as `int4_matvec`.
+pub fn int4_matmul(out : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<u8, [?, ?], Memory::HBM>, scale : &Tensor<f32, [?, ?], Memory::HBM>, x : &Tensor<f32, [?, ?], Memory::HBM>, batch : i32, rows : i32, cols : i32) -> void {
+  spawn on(Topology::Device) {
+    for m in 0..batch across blocks {
+      for r in 0..rows across blocks {
+        let mut part = unsafe { Tensor<f32, [256], Memory::SMEM>::uninit() };
+        for l in 0..256 across lanes {
+          let mut s : f32 = 0.0;
+          let mut c = l;
+          while c < cols {
+            s = s + int4_decode!(w[r][c / 2] as i32, c % 2) * scale[r][c / 64] * x[m][c];
+            c = c + 256;
+          }
+          part[l] = s;
+        }
+        let total = lanes::sum(&part, 256);
+        out[m][r] = total;
+      }
+    }
+  }
+  return;
+}

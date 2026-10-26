@@ -1,0 +1,276 @@
+// Tests for gpu-inference-ops: every kernel in ops.vx against the same formula as plain host code.
+// Returns the number of failed checks, and prints "ok" when there are none. It also prints three
+// entries of each result, which check.py computes again in Python.
+//
+//   ./build.sh
+
+import core::convert;
+import core::num;
+import ops;
+
+// Inputs: whole numbers scaled by 1/8, so every value is exact in f32 and Python sees the same.
+macro_rules x { ($i : expr) => { (((($i) * 37) % 101) as f32) / 8.0 - 6.0 }; }
+
+fn abs64(v : f64) -> f64 {
+  if v < 0.0 {
+    return 0.0 - v;
+  }
+  return v;
+}
+
+fn verdict(name : *const i8, worst : f64, tol : f64, e0 : f32, e1 : f32, e2 : f32) -> i32 {
+  print!(name);
+  print!(": ");
+  print!(f64::from(e0));
+  print!(" ");
+  print!(f64::from(e1));
+  print!(" ");
+  print!(f64::from(e2));
+  print!("\n");
+  if worst > tol {
+    print!("  FAIL: differs from the host code by ");
+    print!(worst);
+    print!("\n");
+    return 1;
+  }
+  return 0;
+}
+
+fn diff1(a : &Tensor<f32, [?]>, b : &Tensor<f32, [?]>, n : i32) -> f64 {
+  let mut worst : f64 = 0.0;
+  for i in 0..n {
+    let d = abs64(f64::from(a[i] - b[i]));
+    if d > worst { worst = d; }
+  }
+  return worst;
+}
+
+fn diff2(a : &Tensor<f32, [?, ?]>, b : &Tensor<f32, [?, ?]>, n : i32, m : i32) -> f64 {
+  let mut worst : f64 = 0.0;
+  for i in 0..n {
+    for j in 0..m {
+      let d = abs64(f64::from(a[i][j] - b[i][j]));
+      if d > worst { worst = d; }
+    }
+  }
+  return worst;
+}
+
+// A table of cos and sin for positions 0 to 15 and 32 pairs, from angles that are exact in f32
+// (multiples of 1/64), so Python reads the same tables.
+macro_rules angle { ($p : expr, $j : expr) => { (($p * 3 + $j * 5) % 64) as f32 / 64.0 }; }
+
+// rope_forward: 5 tokens at positions 4 to 8, 3 heads.
+fn test_rope() -> i32 {
+  let mut x_h = unsafe { Tensor<f32, [5, 3, 64]>::uninit() };
+  let mut cos_h = unsafe { Tensor<f32, [16, 32]>::uninit() };
+  let mut sin_h = unsafe { Tensor<f32, [16, 32]>::uninit() };
+  let mut want = unsafe { Tensor<f32, [5, 3, 64]>::uninit() };
+  for p in 0..16 {
+    for j in 0..32 {
+      cos_h[p][j] = angle!(p, j).cos();
+      sin_h[p][j] = angle!(p, j).sin();
+    }
+  }
+  for t in 0..5 {
+    for h in 0..3 {
+      for d in 0..64 { x_h[t][h][d] = x!((t * 3 + h) * 64 + d) / 4.0; }
+    }
+  }
+  for t in 0..5 {
+    for h in 0..3 {
+      for j in 0..32 {
+        let a = x_h[t][h][2 * j];
+        let b = x_h[t][h][2 * j + 1];
+        want[t][h][2 * j] = a * cos_h[4 + t][j] - b * sin_h[4 + t][j];
+        want[t][h][2 * j + 1] = a * sin_h[4 + t][j] + b * cos_h[4 + t][j];
+      }
+    }
+  }
+  let x = transfer(x_h, Memory::HBM);
+  let cos_t = transfer(cos_h, Memory::HBM);
+  let sin_t = transfer(sin_h, Memory::HBM);
+  let mut out = transfer(unsafe { Tensor<f32, [5, 3, 64]>::uninit() }, Memory::HBM);
+  rope_forward(&mut out, &x, &cos_t, &sin_t, 4, 5, 3);
+  let out_o = transfer(out, Memory::CPU_DRAM);
+  let mut worst : f64 = 0.0;
+  for t in 0..5 {
+    for h in 0..3 {
+      for d in 0..64 {
+        let e = abs64(f64::from(out_o[t][h][d] - want[t][h][d]));
+        if e > worst { worst = e; }
+      }
+    }
+  }
+  return verdict("rope_forward", worst, 0.00001, out_o[0][0][0], out_o[2][1][33], out_o[4][2][63]);
+}
+
+fn test_swiglu() -> i32 {
+  let mut g_h = unsafe { Tensor<f32, [700]>::uninit() };
+  let mut u_h = unsafe { Tensor<f32, [700]>::uninit() };
+  let mut want = unsafe { Tensor<f32, [700]>::uninit() };
+  for i in 0..700 {
+    g_h[i] = x!(i) / 4.0;
+    u_h[i] = x!(i + 3) / 8.0;
+    want[i] = g_h[i] / (1.0 + (0.0 - g_h[i]).exp()) * u_h[i];
+  }
+  let g = transfer(g_h, Memory::HBM);
+  let u = transfer(u_h, Memory::HBM);
+  let mut out = transfer(unsafe { Tensor<f32, [700]>::uninit() }, Memory::HBM);
+  swiglu(&mut out, &g, &u, 700);
+  let out_o = transfer(out, Memory::CPU_DRAM);
+  return verdict("swiglu", diff1(&out_o, &want, 700), 0.00001, out_o[0], out_o[350], out_o[699]);
+}
+
+// matvec on 300 x 70, and matvec_by_block on 20 x 512.
+fn test_matvec() -> i32 {
+  let mut failed = 0;
+  let mut w_h = unsafe { Tensor<f32, [300, 70]>::uninit() };
+  let mut v_h = unsafe { Tensor<f32, [70]>::uninit() };
+  let mut y_h = unsafe { Tensor<f32, [300]>::uninit() };
+  for r in 0..300 {
+    for c in 0..70 { w_h[r][c] = x!(r * 70 + c) / 8.0; }
+  }
+  for c in 0..70 { v_h[c] = x!(c + 9) / 4.0; }
+  for r in 0..300 {
+    let mut s : f32 = 0.0;
+    for c in 0..70 { s += w_h[r][c] * v_h[c]; }
+    y_h[r] = s;
+  }
+  let w = transfer(w_h, Memory::HBM);
+  let v = transfer(v_h, Memory::HBM);
+  let mut y = transfer(unsafe { Tensor<f32, [300]>::uninit() }, Memory::HBM);
+  matvec(&mut y, &w, &v, 300, 70);
+  let y_o = transfer(y, Memory::CPU_DRAM);
+  failed += verdict("matvec", diff1(&y_o, &y_h, 300), 0.001, y_o[0], y_o[150], y_o[299]);
+
+  let mut w2_h = unsafe { Tensor<f32, [20, 512]>::uninit() };
+  let mut v2_h = unsafe { Tensor<f32, [512]>::uninit() };
+  let mut y2_h = unsafe { Tensor<f32, [20]>::uninit() };
+  for r in 0..20 {
+    for c in 0..512 { w2_h[r][c] = x!(r * 512 + c) / 8.0; }
+  }
+  for c in 0..512 { v2_h[c] = x!(c + 9) / 4.0; }
+  for r in 0..20 {
+    let mut s : f32 = 0.0;
+    for c in 0..512 { s += w2_h[r][c] * v2_h[c]; }
+    y2_h[r] = s;
+  }
+  let w2 = transfer(w2_h, Memory::HBM);
+  let v2 = transfer(v2_h, Memory::HBM);
+  let mut y2 = transfer(unsafe { Tensor<f32, [20]>::uninit() }, Memory::HBM);
+  matvec_by_block(&mut y2, &w2, &v2, 20);
+  let y2_o = transfer(y2, Memory::CPU_DRAM);
+  failed += verdict("matvec_by_block", diff1(&y2_o, &y2_h, 20), 0.01, y2_o[0], y2_o[10], y2_o[19]);
+  return failed;
+}
+
+// router_top2: 200 tokens, 8 experts. Scores are distinct in each row, so the top two are unique.
+fn test_router() -> i32 {
+  let mut failed = 0;
+  let mut s_h = unsafe { Tensor<f32, [200, 8]>::uninit() };
+  let mut ids_want = unsafe { Tensor<i32, [200, 2]>::uninit() };
+  let mut g_want = unsafe { Tensor<f32, [200, 2]>::uninit() };
+  for t in 0..200 {
+    for e in 0..8 { s_h[t][e] = ((((t * 5 + e * 3) % 8) * 8 + (t % 7)) as f32) / 16.0; }
+    let mut b1 : f32 = s_h[t][0];
+    let mut i1 : i32 = 0;
+    let mut b2 : f32 = -1000000000.0;
+    let mut i2 : i32 = 1;
+    for e in 1..8 {
+      if s_h[t][e] > b1 {
+        b2 = b1; i2 = i1; b1 = s_h[t][e]; i1 = e;
+      } else if s_h[t][e] > b2 {
+        b2 = s_h[t][e]; i2 = e;
+      }
+    }
+    ids_want[t][0] = i1;
+    ids_want[t][1] = i2;
+    g_want[t][0] = 1.0 / (1.0 + (b2 - b1).exp());
+    g_want[t][1] = 1.0 - g_want[t][0];
+  }
+  let s = transfer(s_h, Memory::HBM);
+  let mut ids = transfer(unsafe { Tensor<i32, [200, 2]>::uninit() }, Memory::HBM);
+  let mut gates = transfer(unsafe { Tensor<f32, [200, 2]>::uninit() }, Memory::HBM);
+  router_top2(&mut ids, &mut gates, &s, 200, 8);
+  let ids_o = transfer(ids, Memory::CPU_DRAM);
+  let g_o = transfer(gates, Memory::CPU_DRAM);
+  let mut wrong = 0;
+  let mut worst : f64 = 0.0;
+  for t in 0..200 {
+    if ids_o[t][0] != ids_want[t][0] || ids_o[t][1] != ids_want[t][1] { wrong += 1; }
+    for k in 0..2 {
+      let e = abs64(f64::from(g_o[t][k] - g_want[t][k]));
+      if e > worst { worst = e; }
+    }
+  }
+  failed += verdict("router_gates", worst, 0.000001, g_o[0][0], g_o[99][1], g_o[199][0]);
+  print!("router_ids: ");
+  print!(ids_o[0][0]);
+  print!(" ");
+  print!(ids_o[99][1]);
+  print!(" ");
+  print!(ids_o[199][0]);
+  print!("\n");
+  if wrong > 0 {
+    print!("  FAIL: wrong experts for ");
+    print!(wrong);
+    print!(" tokens\n");
+    failed += 1;
+  }
+  return failed;
+}
+
+// attention_decode: 4 heads, a cache of 128 slots of which 77 are filled.
+fn test_attention_decode() -> i32 {
+  let mut q_h = unsafe { Tensor<f32, [4, 64]>::uninit() };
+  let mut k_h = unsafe { Tensor<f32, [4, 128, 64]>::uninit() };
+  let mut v_h = unsafe { Tensor<f32, [4, 128, 64]>::uninit() };
+  let mut want = unsafe { Tensor<f32, [4, 64]>::uninit() };
+  for h in 0..4 {
+    for d in 0..64 { q_h[h][d] = x!(h * 64 + d) / 16.0; }
+    for t in 0..128 {
+      for d in 0..64 {
+        k_h[h][t][d] = x!((h * 128 + t) * 64 + d + 1) / 16.0;
+        v_h[h][t][d] = x!((h * 128 + t) * 64 + d + 2) / 4.0;
+      }
+    }
+  }
+  for h in 0..4 {
+    let mut m : f32 = -1000000000.0;
+    let mut sc = unsafe { Tensor<f32, [128]>::uninit() };
+    for t in 0..77 {
+      let mut dot : f32 = 0.0;
+      for d in 0..64 { dot += q_h[h][d] * k_h[h][t][d]; }
+      sc[t] = dot * 0.125;
+      m = m.max(sc[t]);
+    }
+    let mut z : f32 = 0.0;
+    for t in 0..77 { z += (sc[t] - m).exp(); }
+    for d in 0..64 {
+      let mut acc : f32 = 0.0;
+      for t in 0..77 { acc += (sc[t] - m).exp() * v_h[h][t][d]; }
+      want[h][d] = acc / z;
+    }
+  }
+  let q = transfer(q_h, Memory::HBM);
+  let kc = transfer(k_h, Memory::HBM);
+  let vc = transfer(v_h, Memory::HBM);
+  let mut out = transfer(unsafe { Tensor<f32, [4, 64]>::uninit() }, Memory::HBM);
+  attention_decode(&mut out, &q, &kc, &vc, 4, 77, 0.125);
+  let out_o = transfer(out, Memory::CPU_DRAM);
+  return verdict("attention_decode", diff2(&out_o, &want, 4, 64), 0.0001, out_o[0][0], out_o[2][31], out_o[3][63]);
+}
+
+fn main() -> i32 {
+  let mut failed = 0;
+  failed += test_rope();
+  failed += test_swiglu();
+  failed += test_matvec();
+  failed += test_router();
+  failed += test_attention_decode();
+  if failed == 0 {
+    print!("ok\n");
+  }
+  return failed;
+}

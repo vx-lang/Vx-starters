@@ -6,7 +6,8 @@
 #   ./build.sh                 run it
 #   VX_HOME=<dir> ./build.sh   use a toolchain other than ~/.vx/current
 #
-# Works with v0.0.3 and with main, and needs python3. Assembling the kernels needs ptxas (CUDA);
+# Needs a Vx main from 2026-10-25 or later (machine files with `levels:`), and python3.
+# Assembling the kernels needs ptxas (CUDA);
 # without it that step is skipped. No GPU is needed: without one, the kernels run on the host.
 
 set -euo pipefail
@@ -14,6 +15,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 VX_HOME="${VX_HOME:-$HOME/.vx/current}"
 VXC="$VX_HOME/bin/vxc"
+MACHINE="$VX_HOME/fleet/a100-40.vx"
 CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 export CUDA_HOME
 tmp="$(mktemp -d)"
@@ -32,7 +34,7 @@ fi
 
 # 1. Run it. The program returns the number of failed checks, and prints "ok" when there are
 #    none.
-out="$("$VXC" -a run-jit src/main.vx 2> "$tmp/err" | grep -v '^\[' || true)"
+out="$("$VXC" -a run-jit src/main.vx --host default --machine "$MACHINE" 2> "$tmp/err" | grep -v '^\[' || true)"
 echo "$out"
 if ! echo "$out" | grep -qx 'ok'; then
   cat "$tmp/err" >&2
@@ -44,7 +46,7 @@ fi
 echo "$out" | python3 -I check.py
 
 # 3. The kernels: one per GPU region, in one sm_80 module, which NVIDIA's assembler accepts.
-"$VXC" -a emit-llvm src/main.vx > "$tmp/main.ll" 2> "$tmp/err" || { cat "$tmp/err" >&2; exit 1; }
+"$VXC" -a emit-llvm src/main.vx --host default --machine "$MACHINE" > "$tmp/main.ll" 2> "$tmp/err" || { cat "$tmp/err" >&2; exit 1; }
 python3 -I kernels.py "$tmp/main.ll" "$tmp" 3
 PTXAS="$(command -v ptxas || echo "$CUDA_HOME/bin/ptxas")"
 if [ -x "$PTXAS" ]; then
@@ -57,7 +59,7 @@ fi
 # 4. A standalone executable. vxc writes an object file; linking it needs the libraries that
 #    `vxc --run` links by itself (vx-lang/Vx#1499). -rdynamic lets the dispatch library find
 #    the host copy of each kernel when there is no GPU.
-"$VXC" -a emit-obj src/main.vx -o "$tmp/main.o" > /dev/null 2> "$tmp/err" || { cat "$tmp/err" >&2; exit 1; }
+"$VXC" -a emit-obj src/main.vx --host default --machine "$MACHINE" -o "$tmp/main.o" > /dev/null 2> "$tmp/err" || { cat "$tmp/err" >&2; exit 1; }
 CLANG="$VX_HOME/llvm/bin/clang"
 [ -x "$CLANG" ] || CLANG=clang
 dispatch="$(ls "$VX_HOME"/lib/*dispatch.so | head -1)"

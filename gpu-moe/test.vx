@@ -1,0 +1,184 @@
+// Tests for gpu-moe: every kernel in ops.vx against the same formula as plain host code.
+// Returns the number of failed checks, and prints "ok" when there are none. It also prints three
+// entries of each result, which check.py computes again in Python.
+//
+//   ./build.sh
+
+import core::convert;
+import core::num;
+import ops;
+
+// Inputs: whole numbers scaled by 1/8, so every value is exact in f32 and Python sees the same.
+macro_rules x { ($i : expr) => { (((($i) * 37) % 101) as f32) / 8.0 - 6.0 }; }
+
+fn abs64(v : f64) -> f64 {
+  if v < 0.0 {
+    return 0.0 - v;
+  }
+  return v;
+}
+
+fn verdict(name : *const i8, worst : f64, tol : f64, e0 : f32, e1 : f32, e2 : f32) -> i32 {
+  print!(name);
+  print!(": ");
+  print!(f64::from(e0));
+  print!(" ");
+  print!(f64::from(e1));
+  print!(" ");
+  print!(f64::from(e2));
+  print!("\n");
+  if worst > tol {
+    print!("  FAIL: differs from the host code by ");
+    print!(worst);
+    print!("\n");
+    return 1;
+  }
+  return 0;
+}
+
+const T : i32 = 20;
+const E : i32 = 6;
+const K : i32 = 2;
+const H : i32 = 48;
+const F : i32 = 64;
+
+// The router's choice: slot 0 is (5 t + 1) mod 6 and slot 1 is 1 to 4 experts after it, so a
+// token never picks one expert twice. Gates are 0.4, 0.5 and 0.6 for slot 0.
+fn pick(t : i32, s : i32) -> i32 {
+  let first = (t * 5 + 1) % 6;
+  if s == 0 { return first; }
+  return (first + 1 + t % 4) % 6;
+}
+
+fn gate(t : i32, s : i32) -> f32 {
+  let g0 = ((4 + t % 3) as f32) / 10.0;
+  if s == 0 { return g0; }
+  return 1.0 - g0;
+}
+
+fn silu_up(sg : f32, su : f32) -> f32 {
+  return sg / (1.0 + (0.0 - sg).exp()) * su;
+}
+
+fn main() -> i32 {
+  let mut failed = 0;
+  let mut x_h = unsafe { Tensor<f32, [20, 48]>::uninit() };
+  let mut ids_h = unsafe { Tensor<i32, [20, 2]>::uninit() };
+  let mut gates_h = unsafe { Tensor<f32, [20, 2]>::uninit() };
+  let mut wg_h = unsafe { Tensor<f32, [6, 64, 48]>::uninit() };
+  let mut wu_h = unsafe { Tensor<f32, [6, 64, 48]>::uninit() };
+  let mut wd_h = unsafe { Tensor<f32, [6, 48, 64]>::uninit() };
+  for t in 0..T {
+    for c in 0..H { x_h[t][c] = x!(t * H + c) / 4.0; }
+    for s in 0..K {
+      ids_h[t][s] = pick(t, s);
+      gates_h[t][s] = gate(t, s);
+    }
+  }
+  for e in 0..E {
+    for f in 0..F {
+      for c in 0..H {
+        wg_h[e][f][c] = x!((e * F + f) * H + c) / 64.0;
+        wu_h[e][f][c] = x!((e * F + f) * H + c + 11) / 64.0;
+        wd_h[e][c][f] = x!((e * H + c) * F + f + 23) / 64.0;
+      }
+    }
+  }
+
+  // The host layer: for each token, for each of its experts, the expert's network.
+  let mut want = Tensor<f32, [20, 48]>::new();
+  let mut h = Tensor<f32, [64]>::new();
+  for t in 0..T {
+    for s in 0..K {
+      let e = ids_h[t][s];
+      for f in 0..F {
+        let mut sg : f32 = 0.0;
+        let mut su : f32 = 0.0;
+        for c in 0..H {
+          sg += wg_h[e][f][c] * x_h[t][c];
+          su += wu_h[e][f][c] * x_h[t][c];
+        }
+        h[f] = silu_up(sg, su);
+      }
+      for c in 0..H {
+        let mut acc : f32 = 0.0;
+        for f in 0..F { acc += wd_h[e][c][f] * h[f]; }
+        want[t][c] += gates_h[t][s] * acc;
+      }
+    }
+  }
+
+  let x = transfer(x_h, Memory::HBM);
+  let ids = transfer(ids_h, Memory::HBM);
+  let gates = transfer(gates_h, Memory::HBM);
+  let wg = transfer(wg_h, Memory::HBM);
+  let wu = transfer(wu_h, Memory::HBM);
+  let wd = transfer(wd_h, Memory::HBM);
+  let mut out = transfer(Tensor<f32, [20, 48]>::new(), Memory::HBM);
+  let mut counts = transfer(Tensor<i32, [6]>::new(), Memory::HBM);
+  let mut cursor = transfer(Tensor<i32, [6]>::new(), Memory::HBM);
+  let mut offsets = transfer(Tensor<i32, [7]>::new(), Memory::HBM);
+  let mut pos_of = transfer(Tensor<i32, [40]>::new(), Memory::HBM);
+  let pair_at = transfer(Tensor<i32, [40]>::new(), Memory::HBM);
+  let ysorted = transfer(Tensor<f32, [1920]>::new(), Memory::HBM);
+  moe_forward(&mut out, &x, &ids, &gates, &wg, &wu, &wd, &mut counts, &mut cursor, &mut offsets, &mut pos_of, &pair_at, &ysorted, T, E, K, H, F);
+  let out_o = transfer(out, Memory::CPU_DRAM);
+  let counts_o = transfer(counts, Memory::CPU_DRAM);
+  let offsets_o = transfer(offsets, Memory::CPU_DRAM);
+  let pos_o = transfer(pos_of, Memory::CPU_DRAM);
+  let pair_o = transfer(pair_at, Memory::CPU_DRAM);
+
+  // The sort: the counts and offsets are right, every pair has its own position, the position
+  // is in its expert's range, and pair_at is the inverse of pos_of.
+  let mut bad = 0;
+  let mut seen = Tensor<i32, [40]>::new();
+  let mut start : i32 = 0;
+  for e in 0..E {
+    let mut n = 0;
+    for t in 0..T {
+      for s in 0..K {
+        if pick(t, s) == e { n += 1; }
+      }
+    }
+    if counts_o[e] != n { bad += 1; }
+    if offsets_o[e] != start { bad += 1; }
+    start += n;
+  }
+  if offsets_o[E] != T * K { bad += 1; }
+  for p in 0..T * K {
+    let e = pick(p / K, p % K);
+    let pos = pos_o[p];
+    if pos < offsets_o[e] || pos >= offsets_o[e + 1] { bad += 1; }
+    if pair_o[pos] != p { bad += 1; }
+    seen[pos] += 1;
+  }
+  for q in 0..T * K {
+    if seen[q] != 1 { bad += 1; }
+  }
+  print!("sort: ");
+  print!(counts_o[0]);
+  print!(" ");
+  print!(counts_o[3]);
+  print!(" ");
+  print!(offsets_o[E]);
+  print!("\n");
+  if bad > 0 {
+    print!("  FAIL: ");
+    print!(bad);
+    print!(" wrong entries in the sort\n");
+    failed += 1;
+  }
+
+  let mut worst : f64 = 0.0;
+  for t in 0..T {
+    for c in 0..H {
+      let d = abs64(f64::from(out_o[t][c] - want[t][c])) / (1.0 + abs64(f64::from(want[t][c])));
+      if d > worst { worst = d; }
+    }
+  }
+  failed += verdict("moe", worst, 0.00001, out_o[0][0], out_o[7][20], out_o[19][47]);
+  if failed == 0 {
+    print!("ok\n");
+  }
+  return failed;
+}
