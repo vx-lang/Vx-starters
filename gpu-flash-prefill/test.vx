@@ -1,0 +1,113 @@
+// Tests for gpu-flash-prefill: causal attention of 2 heads over 50 positions (three full tiles and
+// a masked one of 2), against naive attention on the host that builds every row of scores.
+// Returns the number of failed checks, and prints "ok" when there are none. It also prints some
+// entries, which check.py computes again in Python.
+//
+//   ./build.sh
+
+import core::convert;
+import core::num;
+import ops;
+
+// Inputs: whole numbers scaled by 1/8, so every value is exact in f32 and Python sees the same.
+macro_rules x { ($i : expr) => { (((($i) * 37) % 101) as f32) / 8.0 - 6.0 }; }
+
+fn abs64(v : f64) -> f64 {
+  if v < 0.0 {
+    return 0.0 - v;
+  }
+  return v;
+}
+
+fn verdict(name : *const i8, worst : f64, tol : f64, e0 : f32, e1 : f32, e2 : f32) -> i32 {
+  print!(name);
+  print!(": ");
+  print!(f64::from(e0));
+  print!(" ");
+  print!(f64::from(e1));
+  print!(" ");
+  print!(f64::from(e2));
+  print!("\n");
+  if worst > tol {
+    print!("  FAIL: differs from the host code by ");
+    print!(worst);
+    print!("\n");
+    return 1;
+  }
+  return 0;
+}
+
+const HEADS : i32 = 2;
+const SEQ : i32 = 50;
+
+macro_rules qv { ($h : expr, $i : expr, $d : expr) => { x!(((($h) * 50 + ($i)) * 64 + ($d)) + 3) / 16.0 }; }
+// Keys grow with position, so a later tile raises a query's maximum and the old state is rescaled.
+macro_rules kv { ($h : expr, $i : expr, $d : expr) => { x!(((($h) * 50 + ($i)) * 64 + ($d)) + 7) / 16.0 * (1.0 + (($i) as f32) / 32.0) }; }
+macro_rules vv { ($h : expr, $i : expr, $d : expr) => { x!(((($h) * 50 + ($i)) * 64 + ($d)) + 11) / 4.0 }; }
+
+fn main() -> i32 {
+  let mut failed = 0;
+  let mut q_h = Tensor<f32, [2, 50, 64]>::new();
+  let mut k_h = Tensor<f32, [2, 50, 64]>::new();
+  let mut v_h = Tensor<f32, [2, 50, 64]>::new();
+  let mut want = Tensor<f32, [2, 50, 64]>::new();
+  for h in 0..HEADS {
+    for i in 0..SEQ {
+      for d in 0..64 {
+        q_h[h][i][d] = qv!(h, i, d);
+        k_h[h][i][d] = kv!(h, i, d);
+        v_h[h][i][d] = vv!(h, i, d);
+      }
+    }
+  }
+  // Naive: the whole row of scores for position i, then its softmax, then the weighted sum.
+  let mut sc = Tensor<f32, [50]>::new();
+  for h in 0..HEADS {
+    for i in 0..SEQ {
+      let mut m : f32 = -1000000000.0;
+      for j in 0..i + 1 {
+        let mut dot : f32 = 0.0;
+        for d in 0..64 { dot += q_h[h][i][d] * k_h[h][j][d]; }
+        sc[j] = dot * 0.125;
+        m = m.max(sc[j]);
+      }
+      let mut z : f32 = 0.0;
+      for j in 0..i + 1 { z += (sc[j] - m).exp(); }
+      for d in 0..64 {
+        let mut acc : f32 = 0.0;
+        for j in 0..i + 1 { acc += (sc[j] - m).exp() * v_h[h][j][d]; }
+        want[h][i][d] = acc / z;
+      }
+    }
+  }
+  let q = transfer(q_h, Memory::HBM);
+  let k = transfer(k_h, Memory::HBM);
+  let v = transfer(v_h, Memory::HBM);
+  let mut out = transfer(Tensor<f32, [2, 50, 64]>::new(), Memory::HBM);
+  flash_prefill(&mut out, &q, &k, &v, HEADS, SEQ, 0.125);
+  let out_o = transfer(out, Memory::CPU_DRAM);
+  let mut worst : f64 = 0.0;
+  let mut first_row : f64 = 0.0;
+  for h in 0..HEADS {
+    for i in 0..SEQ {
+      for d in 0..64 {
+        let e = abs64(f64::from(out_o[h][i][d] - want[h][i][d]));
+        if e > worst { worst = e; }
+      }
+    }
+    // Position 0 attends to itself only, so its output is exactly its value.
+    for d in 0..64 {
+      let e = abs64(f64::from(out_o[h][0][d] - vv!(h, 0, d)));
+      if e > first_row { first_row = e; }
+    }
+  }
+  failed += verdict("prefill", worst, 0.0001, out_o[0][0][0], out_o[1][33][17], out_o[1][49][63]);
+  if first_row > 0.000001 {
+    print!("  FAIL: position 0 is not its own value\n");
+    failed += 1;
+  }
+  if failed == 0 {
+    print!("ok\n");
+  }
+  return failed;
+}
