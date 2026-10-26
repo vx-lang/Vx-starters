@@ -7,6 +7,7 @@ import cost;
 import fleet;
 import hw;
 import model;
+import network;
 import plan;
 import std::vec;
 
@@ -312,6 +313,39 @@ pub fn print_headroom(f : &Fleet, svcs : &Vec<Service>) -> void {
     print!(" times this load before something goes unmet\n");
   } else {
     print!(" of this load is met; above that something goes unmet\n");
+  }
+  return;
+}
+
+// The traffic of the leaf switches to the spine, against the capacity of each link.
+pub fn print_network(f : &Fleet, svcs : &Vec<Service>, p : &Plan) -> void {
+  let mut eg = Vec<f64>::with_capacity(f.leaves);
+  let mut ing = Vec<f64>::with_capacity(f.leaves);
+  leaf_traffic(f, svcs, p, &mut eg, &mut ing);
+  print!("network (GB a second between a leaf switch and the spine)\n");
+  let mut busiest = 0.0f64;
+  for l in 0..f.leaves {
+    let cap = leaf_capacity(f, l);
+    let load = eg.get(l).max(ing.get(l));
+    if load > 0.0f64 {
+      print!("  leaf ");
+      print!(l);
+      print!(": ");
+      print_f(eg.get(l) / 1000000000.0f64, 2);
+      print!(" out, ");
+      print_f(ing.get(l) / 1000000000.0f64, 2);
+      print!(" in, of ");
+      print_f(cap / 1000000000.0f64, 0);
+      print!(" (");
+      print_f(100.0f64 * load / cap, 0);
+      print!("%)\n");
+    }
+    if load / cap > busiest {
+      busiest = load / cap;
+    }
+  }
+  if busiest == 0.0f64 {
+    print!("  nothing crosses to the spine\n");
   }
   return;
 }

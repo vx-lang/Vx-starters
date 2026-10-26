@@ -80,6 +80,18 @@ for m in re.finditer(r"^  (\S+) x(\d+): (\d+) domains \((\d+) GPUs\), (\d+) in u
 if in_use != len(domains):
     fail(f"the fleet says {in_use} domains are in use, the placements list {len(domains)}")
 
+net = re.findall(r"^  leaf (\d+): ([\d.]+) out, ([\d.]+) in, of (\d+) \((\d+)%\)$", text, re.M)
+tol = 0.011 * max(1, len(net))
+out_sum = sum(float(o) for _, o, _, _, _ in net)
+in_sum = sum(float(i) for _, _, i, _, _ in net)
+if abs(out_sum - in_sum) > tol:
+    fail(f"the leaves send {out_sum} GB a second to the spine and receive {in_sum}")
+for leaf, o, i, cap, util in net:
+    want = 100.0 * max(float(o), float(i)) / float(cap)
+    if abs(want - int(util)) > 0.6:
+        fail(f"leaf {leaf}: {util}% but {o} out, {i} in of {cap}")
+if "network (GB a second" not in text:
+    fail("no network section")
 if not re.search(r"^headroom: [\d.]+ (times this load|of this load)", text, re.M):
     fail("no headroom line")
 if "losses" not in text or "the worst leaf switch" not in text:

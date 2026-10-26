@@ -131,17 +131,23 @@ fn group_bw(d : Deploy) -> f64 {
   return d.sku.nvlink.min(d.cross) * comm_eff();
 }
 
+// Bytes each GPU sends and receives in the all-to-all of one MoE layer for `tokens` tokens spread over
+// the group (dispatch and combine).
+pub fn all_to_all_bytes(m : Model, d : Deploy, tokens : f64) -> f64 {
+  let per_gpu = tokens / fl(gpus(d));
+  let mut dispatch = 2.0f64;
+  if d.wb <= 1.0f64 {
+    dispatch = 1.0f64;
+  }
+  return per_gpu * fl(m.topk) * fl(m.hidden) * (dispatch + 2.0f64);
+}
+
 // Time of the all-to-all (send to the experts' GPUs and back) of one MoE layer for `tokens` tokens
 // spread over the group. Dispatch is one byte per number with fp8 weights, otherwise two; the
 // combine is bf16.
 fn all_to_all(m : Model, d : Deploy, tokens : f64) -> f64 {
   let g = fl(gpus(d));
-  let per_gpu = tokens / g;
-  let mut dispatch = 2.0f64;
-  if d.wb <= 1.0f64 {
-    dispatch = 1.0f64;
-  }
-  let bytes = per_gpu * fl(m.topk) * fl(m.hidden) * (dispatch + 2.0f64);
+  let bytes = all_to_all_bytes(m, d, tokens);
   let local = bytes * fl(d.gpd - 1) / g / (d.sku.nvlink * comm_eff());
   if d.domains == 1 {
     return local;

@@ -28,6 +28,7 @@ Plain host code: no GPU and no CUDA. Every figure is an estimate (see *What it i
 | `fleet.vx` | A fleet: a vertex for each domain, one leaf switch for each group of domains, one spine, with the leaf-to-spine links cut by an oversubscription factor. `group_bandwidth` and `group_latency` of a set of domains read off the graph, with a leaf link shared by the members under it; `pick_group` chooses domains of one class that are as close as the graph allows |
 | `model.vx` | `Model`: layers, dense layers, hidden size, MLA or GQA attention, experts. Parameter counts, KV size of a token, and the attention FLOPs of a query-key pair all follow from those fields. `deepseek_v3()` and `glm_4_5()` |
 | `cost.vx` | `Deploy`: a group of whole domains, attention data or tensor parallel, a context-parallel degree, number formats. `fits`, `decode_step` and `prefill_time` |
+| `network.vx` | The traffic a plan puts on the links between the leaf switches and the spine, which all services share: the all-to-all, the cache gather and the cache handoff, against each leaf link's capacity |
 | `report.vx`, `examples/datacenter.vx`, `examples/procure.vx` | A plan as text (services, placements, fleet use) and what losing a domain or a leaf switch does to it, and the headroom; a whole datacenter in one program, and the cheapest fleet that carries a load (below) |
 | `emit.vx`, `admit.py` | The bridge to the compiler (below): what the planner believes, printed as lines, and a Vx program for each, compiled against the machine files of the toolchain |
 | `plan.vx` | `Service` (model, request rate, prompt, output, targets for time per token and time to first token, and whether it is served co-located or on separate prefill and decode pools); `evaluate`, `evaluate_prefill`, `evaluate_decode`, `best_role`, `schedule` |
@@ -160,6 +161,9 @@ fleet
   H200 x8: 12 domains (96 GPUs), 12 in use, 0 free
   A100-80 x8: 24 domains (192 GPUs), 10 in use, 14 free
   spend 896 an hour
+network (GB a second between a leaf switch and the spine)
+  leaf 3: 23.46 out, 0.00 in, of 1200 (2%)
+  leaf 4: 0.00 out, 23.46 in, of 800 (3%)
 headroom: 1.05 times this load before something goes unmet
 losses (the services placed again, in the same order)
   a domain in use (24 tried): 14 leave something unmet
@@ -180,6 +184,27 @@ The build checks that the report adds up (`check_example.py`): every domain is i
 placement, the GPUs of a service are those of its placements, the domains in use are the ones listed,
 the spend is the sum of the services' costs, what a service is served is what its replicas serve, and
 the unmet share follows from the asked and served.
+
+### The network
+
+The planner prices a group's own traffic with the links the group has to itself. The spine is shared:
+every placement that spans two leaves, and every cache handed from a prefill pool to a decode pool on
+another leaf, puts bytes on the same leaf links. `network.vx` adds them up. Per request a decode or
+co-located replica moves the all-to-all of every MoE layer for each output token, a co-located or
+prefill replica the all-to-all of the prompt's new tokens and the gather of their cache between the GPUs
+of the group, and a prefill replica the cache of the whole prompt to the decode pool (split by what each
+decode replica serves). Bytes in a group are taken to be spread evenly over the pairs of GPUs, so the
+flow from one domain to another is the total times the share of GPUs each has; a flow between leaves
+goes up the sender's link and down the receiver's; and the flows are scaled by the requests a second
+each placement serves.
+
+In the example the only traffic over the spine is the cache of the GLM chat prompts, 15.2 requests a
+second from the H200 prefill node on leaf 3 to the A100 decode nodes on leaf 4, 23.5 GB a second, 2% of
+the 1200 GB a second of leaf 3's link. The tests work the numbers out by hand: two H200 nodes on two
+leaves serving one request a second move 91.2 GB between their GPUs per request, a quarter of it each
+way across; a cache handoff of 32768-token prompts at 2.4 a second is 2.76 GB a second; three nodes,
+two on a leaf, send 2/9 of the bytes out of each leaf. It is a report, not a constraint: the planner
+does not yet move a placement because a link is full.
 
 ### Headroom
 
@@ -238,7 +263,10 @@ placed in one order; it is a way to see where the money goes, not an optimizer.
    tokens takes twice as long, a memory-bound one reads the extra experts only; a prefill with half
    cached is the work of the new tokens over the old; the batch grows and the rate doubles at 30 ms a
    token; plans with both, in both modes, priced again in Python.
-10. **Python.** `check.py` prices the same layouts again from the architectures and the formulas,
+10. **The network.** Bytes a request moves between the GPUs of a group, by hand; the shares of the
+    flows between leaves for two and for three nodes; the cache handoff split over two decode
+    replicas; no flow for nodes on one leaf; what leaves the leaves enters them.
+11. **Python.** `check.py` prices the same layouts again from the architectures and the formulas,
    written out a second time, and every placement of the schedule too; they agree to 1e-9.
 
 ## The compiler checks the planner
@@ -277,6 +305,21 @@ counts only the wire, as the transfer is pipelined, so the compiler's sum is an 
 
 I broke the bridge five ways (a wrong HBM size, the cache split over one NIC instead of all, `fits`
 without the weights, with the wrong comparison, with the whole of HBM as the limit); each fails.
+
+## How far to trust the numbers
+
+A rough check, from memory of the figures DeepSeek published for its own deployment (about 14.8 thousand
+output tokens a second per H800 node at about 50 ms a token and an average context of 4989 tokens, and
+about 73.7 thousand input tokens a second per node for prefill, 56% of them cache hits; I have not
+re-checked these). The model gives one H200 node 33.9 thousand output tokens a second at 50 ms a token
+and a context of 4989, and 58 thousand prompt tokens a second of prefill. An H200 has 1.43 times the
+memory bandwidth of an H800 (4.8 against 3.35 TB/s), which would put the decode figure near 21 thousand,
+so the model is about 1.6 times too fast there; on prefill, with the same arithmetic rate and 44% of the
+prompt computed, the published figure is about 32 thousand computed tokens a second, and the model is
+about 1.8 times too fast. That is the direction the README says to expect (uniform routing, efficiency
+factors that are guesses, no queueing), and under a factor of two. Before trusting an absolute number,
+set the factors in `cost.vx` from a measured run; the comparison between two fleets or two layouts is
+less sensitive to them than the throughput of either.
 
 ## What it is not
 
