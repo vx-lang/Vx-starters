@@ -63,6 +63,16 @@ Format: the project, the toolchain version, what happened, and what we did inste
 - **gpu-blas, main d25deea9: tensors are linear, so a test cannot copy an input.** `let cur = a_h;`
   moves `a_h` (E4001), so the host reference refills a second tensor with the same loop.
 
+- **gpu-inference-ops, main d25deea9: the race proof refuses RoPE as usually written.** A lane
+  that writes `out[2j]` and `out[2j + 1]` gets E6032, though no two lanes can collide
+  ([vx-lang/Vx#2220](https://github.com/vx-lang/Vx/issues/2220)). `rope_forward` loops over the 64
+  outputs instead, one write for each lane. A build tool that runs the checker would want to say
+  which rule it is allowed to ignore, or have the checker's limits listed with each version.
+- **gpu-inference-ops, main d25deea9: `lanes::sum` into a store gives the wrong first error.**
+  `y[r] = lanes::sum(..)` reports E4005 (a stack reference escapes) before the real E6032 (the
+  call must be the whole value of a `let`)
+  ([vx-lang/Vx#2221](https://github.com/vx-lang/Vx/issues/2221)).
+
 - **wordcount, v0.0.3: no way to build an executable.** `vxc` can run a program (`run-jit`) or
   emit an object file (`emit-obj`), but not link one. `build.sh` links the object against
   `$VX_HOME/lib/libvx_std_core.so` with the bundled clang, and sets an rpath so the binary finds
