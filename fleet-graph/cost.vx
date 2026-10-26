@@ -163,29 +163,37 @@ fn all_reduce(d : Deploy, bytes : f64) -> f64 {
 // Seconds for one decode step: every one of b sequences, each with s tokens of context, gets one
 // token.
 pub fn decode_step(m : Model, d : Deploy, b : i32, s : i32) -> f64 {
+  return decode_step_spec(m, d, b, s, 1.0f64);
+}
+
+// A decode step that works on t tokens of each sequence at once (speculative decoding: the token
+// the sequence has and t - 1 drafts to check). The weights, the cache and the layers are read once
+// for all of them; the arithmetic, the attention and the traffic between GPUs grow with t.
+pub fn decode_step_spec(m : Model, d : Deploy, b : i32, s : i32, t : f64) -> f64 {
   let g = fl(gpus(d));
   let bf = fl(b);
+  let tok = bf * t;
   // Memory: the experts touched, the weights always read, the cache.
-  let routed_read = fl(moe_layers(m)) * touched(m, bf) / g * expert_params(m) * d.wb;
+  let routed_read = fl(moe_layers(m)) * touched(m, tok) / g * expert_params(m) * d.wb;
   let mut resident = resident_params(m) * d.wb;
   if d.dp == 0 {
     resident = resident / g;
   }
   let mem = (routed_read + resident + kv_bytes(m, d, b, s)) / (d.sku.hbm_bw * mem_eff());
   // Arithmetic: the weights each token uses, and attention over the cache.
-  let mut attn = bf * fl(s) * fl(m.layers) * pair_flops(m, 1) / g;
+  let mut attn = tok * fl(s) * fl(m.layers) * pair_flops(m, 1) / g;
   if d.dp == 1 {
-    attn = seqs_per_group(d, b) * fl(s) / fl(d.cp) * fl(m.layers) * pair_flops(m, 1);
+    attn = seqs_per_group(d, b) * t * fl(s) / fl(d.cp) * fl(m.layers) * pair_flops(m, 1);
   }
-  let flops = 2.0f64 * active_params(m) * bf / g + attn;
+  let flops = 2.0f64 * active_params(m) * tok / g + attn;
   let comp = flops / (peak(d) * mfu());
   // Communication, layer by layer.
-  let mut comm = fl(moe_layers(m)) * all_to_all(m, d, bf);
+  let mut comm = fl(moe_layers(m)) * all_to_all(m, d, tok);
   if d.dp == 0 {
-    comm = comm + fl(m.layers) * all_reduce(d, bf * fl(m.hidden) * 2.0f64);
+    comm = comm + fl(m.layers) * all_reduce(d, tok * fl(m.hidden) * 2.0f64);
   }
   if d.cp > 1 {
-    let partial = seqs_per_group(d, b) * fl(m.heads) * fl(out_dim(m) + 2) * 4.0f64;
+    let partial = seqs_per_group(d, b) * t * fl(m.heads) * fl(out_dim(m) + 2) * 4.0f64;
     comm = comm + fl(m.layers) * (fl(d.cp - 1) / fl(d.cp) * partial / group_bw(d) + 2.0f64 * d.lat);
   }
   return mem.max(comp) + comm + fl(m.layers) * layer_overhead();
@@ -195,21 +203,29 @@ pub fn decode_step(m : Model, d : Deploy, b : i32, s : i32) -> f64 {
 // tokens are spread over the GPUs, and each layer's cache pieces are gathered to where they are
 // needed.
 pub fn prefill_time(m : Model, d : Deploy, n : i32) -> f64 {
+  return prefill_time_hit(m, d, n, 0.0f64);
+}
+
+// The same when a share `hit` of the prompt is already in the cache (a prefix some request had
+// before): only the rest is computed, but it attends to all of it. The weights are read once either way.
+pub fn prefill_time_hit(m : Model, d : Deploy, n : i32, hit : f64) -> f64 {
   let g = fl(gpus(d));
   let nf = fl(n);
-  let flops = 2.0f64 * layer_active_params(m) * nf + nf * nf / 2.0f64 * fl(m.layers) * pair_flops(m, 0);
+  let fresh = nf * (1.0f64 - hit);
+  let old = nf - fresh;
+  let flops = 2.0f64 * layer_active_params(m) * fresh + (fresh * old + fresh * fresh / 2.0f64) * fl(m.layers) * pair_flops(m, 0);
   let comp = flops / (g * peak(d) * mfu());
   let mut resident = resident_params(m) * d.wb;
   if d.dp == 0 {
     resident = resident / g;
   }
   let mem = (routed_params(m) * d.wb / g + resident) / (d.sku.hbm_bw * mem_eff());
-  let mut comm = fl(moe_layers(m)) * all_to_all(m, d, nf);
+  let mut comm = fl(moe_layers(m)) * all_to_all(m, d, fresh);
   if d.dp == 0 {
-    comm = comm + fl(m.layers) * all_reduce(d, nf * fl(m.hidden) * 2.0f64);
+    comm = comm + fl(m.layers) * all_reduce(d, fresh * fl(m.hidden) * 2.0f64);
   }
-  // Gathering the cache: each GPU needs the other pieces of every layer.
-  let kv_layer = nf * kv_elems(m) / fl(m.layers) * d.kb;
+  // Gathering the cache of the new tokens: each GPU needs the other pieces of every layer.
+  let kv_layer = fresh * kv_elems(m) / fl(m.layers) * d.kb;
   comm = comm + fl(m.layers) * ((g - 1.0f64) / g * kv_layer / group_bw(d) + 2.0f64 * d.lat);
   return mem.max(comp) + comm + fl(m.layers) * layer_overhead();
 }

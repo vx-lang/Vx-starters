@@ -57,7 +57,10 @@ struct Service {
   min_wb : f64,        // the smallest bytes per weight the service accepts: 2 = bf16 only, 1 = fp8 too
   kv_fp8 : i32,        // 1 if an fp8 cache is acceptable
   bmax : i32,
-  mode : i32,          // 0 = co-located, 1 = disaggregated, 2 = whichever leaves less unmet and costs less
+  mode : i32,
+  spec_t : f64,        // tokens of each sequence a decode step works on (1 = no speculation)
+  spec_acc : f64,      // tokens each step gives a sequence, on average (1 = no speculation)
+  hit : f64,           // the share of a prompt found in the prefix cache          // 0 = co-located, 1 = disaggregated, 2 = whichever leaves less unmet and costs less
 }
 
 impl Copy for Service {}
@@ -108,33 +111,48 @@ fn fl(x : i32) -> f64 {
 }
 
 pub fn make_service(m : Model, qps : f64, prompt : i32, out : i32, slo_tpot : f64, slo_ttft : f64, min_wb : f64, kv_fp8 : i32, bmax : i32) -> Service {
-  return Service { name: "service", model: m, qps: qps, prompt: prompt, out: out, slo_tpot: slo_tpot, slo_ttft: slo_ttft, min_wb: min_wb, kv_fp8: kv_fp8, bmax: bmax, mode: 0 };
+  return Service { name: "service", model: m, qps: qps, prompt: prompt, out: out, slo_tpot: slo_tpot, slo_ttft: slo_ttft, min_wb: min_wb, kv_fp8: kv_fp8, bmax: bmax, mode: 0, spec_t: 1.0f64, spec_acc: 1.0f64, hit: 0.0f64 };
 }
 
 // The same service with a name, for reports.
 pub fn with_name(s : Service, name : *const i8) -> Service {
-  return Service { name: name, model: s.model, qps: s.qps, prompt: s.prompt, out: s.out, slo_tpot: s.slo_tpot, slo_ttft: s.slo_ttft, min_wb: s.min_wb, kv_fp8: s.kv_fp8, bmax: s.bmax, mode: s.mode };
+  return Service { name: name, model: s.model, qps: s.qps, prompt: s.prompt, out: s.out, slo_tpot: s.slo_tpot, slo_ttft: s.slo_ttft, min_wb: s.min_wb, kv_fp8: s.kv_fp8, bmax: s.bmax, mode: s.mode, spec_t: s.spec_t, spec_acc: s.spec_acc, hit: s.hit };
+}
+
+// The same service with speculative decoding: a step works on `t` tokens of each sequence (the
+// token it has and drafts to check) and gives it `acc` tokens on average.
+pub fn with_spec(s : Service, t : f64, acc : f64) -> Service {
+  return Service { name: s.name, model: s.model, qps: s.qps, prompt: s.prompt, out: s.out, slo_tpot: s.slo_tpot, slo_ttft: s.slo_ttft, min_wb: s.min_wb, kv_fp8: s.kv_fp8, bmax: s.bmax, mode: s.mode, spec_t: t, spec_acc: acc, hit: s.hit };
+}
+
+// The same service with a share `hit` of each prompt found in the prefix cache.
+pub fn with_hit(s : Service, hit : f64) -> Service {
+  return Service { name: s.name, model: s.model, qps: s.qps, prompt: s.prompt, out: s.out, slo_tpot: s.slo_tpot, slo_ttft: s.slo_ttft, min_wb: s.min_wb, kv_fp8: s.kv_fp8, bmax: s.bmax, mode: s.mode, spec_t: s.spec_t, spec_acc: s.spec_acc, hit: hit };
 }
 
 // The same service at another rate.
 pub fn with_qps(s : Service, qps : f64) -> Service {
-  return Service { name: s.name, model: s.model, qps: qps, prompt: s.prompt, out: s.out, slo_tpot: s.slo_tpot, slo_ttft: s.slo_ttft, min_wb: s.min_wb, kv_fp8: s.kv_fp8, bmax: s.bmax, mode: s.mode };
+  return Service { name: s.name, model: s.model, qps: qps, prompt: s.prompt, out: s.out, slo_tpot: s.slo_tpot, slo_ttft: s.slo_ttft, min_wb: s.min_wb, kv_fp8: s.kv_fp8, bmax: s.bmax, mode: s.mode, spec_t: s.spec_t, spec_acc: s.spec_acc, hit: s.hit };
 }
 
 // The same service served another way: 0 co-located, 1 disaggregated, 2 whichever is better.
 pub fn with_mode(s : Service, mode : i32) -> Service {
-  return Service { name: s.name, model: s.model, qps: s.qps, prompt: s.prompt, out: s.out, slo_tpot: s.slo_tpot, slo_ttft: s.slo_ttft, min_wb: s.min_wb, kv_fp8: s.kv_fp8, bmax: s.bmax, mode: mode };
+  return Service { name: s.name, model: s.model, qps: s.qps, prompt: s.prompt, out: s.out, slo_tpot: s.slo_tpot, slo_ttft: s.slo_ttft, min_wb: s.min_wb, kv_fp8: s.kv_fp8, bmax: s.bmax, mode: mode, spec_t: s.spec_t, spec_acc: s.spec_acc, hit: s.hit };
 }
 
 fn no_candidate(dep : Deploy) -> Candidate {
   return Candidate { ok: 0, dep: dep, batch: 0, step: 0.0f64, ttft: 0.0f64, rate: 0.0f64, cost_hr: 0.0f64, per_req: 0.0f64, xfer: 0.0f64, xnic: 0.0f64, xs: 0, xlat: 0.0f64 };
 }
 
-// Can the deployment run the service at batch b: it fits, and a step meets the TPOT target.
-fn batch_ok(s : Service, dep : Deploy, b : i32) -> bool {
-  let ctx = s.prompt + s.out;
-  let avg = s.prompt + s.out / 2;
-  return fits(s.model, dep, b, ctx) && decode_step(s.model, dep, b, avg) <= s.slo_tpot;
+// The time between the tokens of a sequence at batch b, at the average context: a step over the
+// number of tokens it gives.
+pub fn tpot(s : Service, dep : Deploy, b : i32) -> f64 {
+  return decode_step_spec(s.model, dep, b, s.prompt + s.out / 2, s.spec_t) / s.spec_acc;
+}
+
+// Can the deployment run the service at batch b: it fits, and the time between tokens meets the target.
+pub fn batch_ok(s : Service, dep : Deploy, b : i32) -> bool {
+  return fits(s.model, dep, b, s.prompt + s.out) && tpot(s, dep, b) <= s.slo_tpot;
 }
 
 // The largest batch that is ok (it is ok for the smaller ones: memory and step time only grow with
@@ -162,12 +180,11 @@ pub fn evaluate(s : Service, dep : Deploy) -> Candidate {
   if lo == 0 {
     return no_candidate(dep);
   }
-  let ttft = prefill_time(s.model, dep, s.prompt);
+  let ttft = prefill_time_hit(s.model, dep, s.prompt, s.hit);
   if ttft > s.slo_ttft {
     return no_candidate(dep);
   }
-  let avg = s.prompt + s.out / 2;
-  let step = decode_step(s.model, dep, lo, avg);
+  let step = tpot(s, dep, lo);
   let rate = 1.0f64 / (ttft + fl(s.out) * step / fl(lo));
   let cost_hr = fl(gpus(dep)) * dep.sku.cost;
   return Candidate { ok: 1, dep: dep, batch: lo, step: step, ttft: ttft, rate: rate, cost_hr: cost_hr, per_req: cost_hr / 3600.0f64 / rate, xfer: 0.0f64, xnic: 0.0f64, xs: 0, xlat: 0.0f64 };
@@ -180,8 +197,7 @@ pub fn evaluate_decode(s : Service, dep : Deploy) -> Candidate {
   if lo == 0 {
     return no_candidate(dep);
   }
-  let avg = s.prompt + s.out / 2;
-  let step = decode_step(s.model, dep, lo, avg);
+  let step = tpot(s, dep, lo);
   let rate = fl(lo) / (fl(s.out) * step);
   let cost_hr = fl(gpus(dep)) * dep.sku.cost;
   return Candidate { ok: 1, dep: dep, batch: lo, step: step, ttft: 0.0f64, rate: rate, cost_hr: cost_hr, per_req: cost_hr / 3600.0f64 / rate, xfer: 0.0f64, xnic: 0.0f64, xs: 0, xlat: 0.0f64 };
@@ -200,7 +216,7 @@ pub fn evaluate_prefill(s : Service, dep : Deploy, xnic : f64, xs : i32, xlat : 
   if !fits(s.model, dep, 1, s.prompt) {
     return no_candidate(dep);
   }
-  let tp = prefill_time(s.model, dep, s.prompt);
+  let tp = prefill_time_hit(s.model, dep, s.prompt, s.hit);
   let streams = min_i(gpus(dep), xs);
   let nic = dep.sku.nic.min(xnic);
   let xfer = kv_transfer(s, dep.kb, nic, streams, xlat);
