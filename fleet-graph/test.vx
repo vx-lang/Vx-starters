@@ -10,6 +10,8 @@
 //      fleet, and the choice of a group.
 //   4. The cost model: a decode step and a prefill on a machine that has only one limit, worked
 //      out by hand; what must grow, shrink or stay when one thing changes; what fits where.
+//   6. Prefill and decode on separate pools: a first token that waits for the transfer, whole replicas
+//      as the unit of cost, and when the pools beat co-located replicas.
 //   5. The planner: no better candidate than the one chosen, and the schedule of a mixed fleet:
 //      no domain twice, every placement meets its targets, the rates add up, the same answer
 //      twice, less fleet never meets more.
@@ -23,7 +25,9 @@ import fleet;
 import graph;
 import hw;
 import model;
+import network;
 import plan;
+import report;
 import std::vec;
 
 fn fl(x : i32) -> f64 {
@@ -419,6 +423,16 @@ fn test_cost() -> i32 {
 // ---------------------------------------------------------------------------------------------
 // 5. The planner
 
+// One NVL72 rack, four H200 nodes and eight A100-80 nodes, on three leaves.
+fn mixed_fleet() -> Fleet {
+  let mut f = new_fleet();
+  add_domain(&mut f, nvl72(b200()), 0);
+  for i in 0..4 { add_domain(&mut f, hgx8(h200()), 1); }
+  for i in 0..8 { add_domain(&mut f, hgx8(a100_80()), 2); }
+  wire(&mut f, 2.0f64);
+  return f;
+}
+
 fn test_plan() -> i32 {
   let mut failed = 0;
   let d = deepseek_v3();
@@ -462,7 +476,7 @@ fn test_plan() -> i32 {
                 if (m * proto.gpus) % (1 << cpi) == 0 {
                   let c = evaluate(s1, dep);
                   tried += 1;
-                  if c.ok == 1 && c.per_req < p1.cand.per_req { cheaper += 1; }
+                  if better(c, p1.cand, s1.qps) { cheaper += 1; }
                 }
               }
             }
@@ -522,16 +536,16 @@ fn test_plan() -> i32 {
 
   // Four services, where the best order is neither the given one nor the one with the most
   // demanding first. Needs: DeepSeek-V3 at 8k 8 GPUs, GLM at 16k 72, DeepSeek-V3 at 32k 72, GLM at 4k
-  // 8. Given order 0, 1, 2, 3 leaves 124% of a service's rate unmet (summed over the services),
-  // the most demanding first (1, 2, 0, 3) 109%, and the order 1, 3, 0, 2 79%.
+  // 8. Given order 0, 1, 2, 3 leaves two services whole unmet (a shortfall of 2.0), the most
+  // demanding first (1, 2, 0, 3) the same, and the order 0, 2, 3, 1 none.
   let mut sv4 = Vec<Service>::with_capacity(4);
-  sv4.push(make_service(d, 12.0f64, 8192, 1024, 0.05f64, 5.0f64, 1.0f64, 1, 1024));
-  sv4.push(make_service(g, 6.0f64, 16384, 512, 0.05f64, 10.0f64, 2.0f64, 0, 1024));
-  sv4.push(make_service(d, 3.0f64, 32768, 256, 0.06f64, 20.0f64, 1.0f64, 1, 512));
-  sv4.push(make_service(g, 6.0f64, 4096, 256, 0.04f64, 5.0f64, 2.0f64, 0, 512));
+  sv4.push(make_service(d, 8.0f64, 8192, 1024, 0.05f64, 5.0f64, 1.0f64, 1, 1024));
+  sv4.push(make_service(g, 4.0f64, 16384, 512, 0.05f64, 10.0f64, 2.0f64, 0, 1024));
+  sv4.push(make_service(d, 2.0f64, 32768, 256, 0.06f64, 20.0f64, 1.0f64, 1, 512));
+  sv4.push(make_service(g, 4.0f64, 4096, 256, 0.04f64, 5.0f64, 2.0f64, 0, 512));
   let pl4s = schedule(&f, &sv4);
   failed += check_plan(&f, &sv4, &pl4s);
-  failed += expect(shortfall(&sv4, &pl4s) < 0.8f64, "the best of 24 orders of four services leaves under 80% unmet");
+  failed += expect(shortfall(&sv4, &pl4s) < 0.01f64, "the best of 24 orders of four services leaves none unmet");
   show("four", shortfall(&sv4, &pl4s), spend(&pl4s), fl(pl4s.places.len()));
   // Less fleet never meets more: without the NVL72 rack, and with a third of the A100 nodes.
   let mut f2 = new_fleet();
@@ -587,31 +601,51 @@ fn test_plan() -> i32 {
   failed += expect(seen == 6, "next_order gives all 6 orders of 3");
   failed += expect(perm.get(0) == 2 && perm.get(1) == 1 && perm.get(2) == 0, "and ends at the last");
   show("orders", shortfall(&sv, &q01), shortfall(&sv, &q10), shortfall(&sv, &pl));
-  print_plan(&pl);
+  print_plan("placed", &pl);
   show("plan", pl.unmet.get(0), pl.unmet.get(1), fl(pl.places.len()));
   return failed;
 }
 
 fn batch_ok_for(s : Service, dep : Deploy, b : i32) -> bool {
-  return fits(s.model, dep, b, s.prompt + s.out) && decode_step(s.model, dep, b, s.prompt + s.out / 2) <= s.slo_tpot;
+  return fits(s.model, dep, b, s.prompt + s.out) && tpot(s, dep, b) <= s.slo_tpot;
 }
 
 // The invariants of a plan.
 fn check_plan(f : &Fleet, sv : &Vec<Service>, p : &Plan) -> i32 {
+  let none = Vec<i32>::with_capacity(1);
+  return check_plan_down(f, sv, p, &none);
+}
+
+// The same for a plan made with the domains in `down` out of service: they are not used, and not free.
+fn check_plan_down(f : &Fleet, sv : &Vec<Service>, p : &Plan, down : &Vec<i32>) -> i32 {
   let mut failed = 0;
   let n = count(f);
   let mut used = Vec<i32>::with_capacity(n);
   for i in 0..n { used.push(0); }
-  let mut served = Vec<f64>::with_capacity(sv.len());
-  for k in 0..sv.len() { served.push(0.0f64); }
+  let ns = sv.len();
+  let mut served0 = Vec<f64>::with_capacity(ns);
+  let mut cap_p = Vec<f64>::with_capacity(ns);
+  let mut cap_d = Vec<f64>::with_capacity(ns);
+  let mut first_d = Vec<i32>::with_capacity(ns);
+  let mut roles = Vec<i32>::with_capacity(ns);
+  for k in 0..ns {
+    served0.push(0.0f64);
+    cap_p.push(0.0f64);
+    cap_d.push(0.0f64);
+    first_d.push(0 - 1);
+    roles.push(0);
+  }
   let mut twice = 0;
   let mut bad_group = 0;
   let mut missed = 0;
   let mut over_rate = 0;
   let mut bad_free = 0;
+  let mut bad_peer = 0;
+  let mut mixed = 0;
   for i in 0..p.places.len() {
     let pl = p.places.get(i);
     let s = sv.get(pl.svc);
+    let c = pl.cand;
     let proto = domain(f, p.members.get(pl.mstart));
     for x in 0..pl.mcount {
       let dom = p.members.get(pl.mstart + x);
@@ -619,23 +653,71 @@ fn check_plan(f : &Fleet, sv : &Vec<Service>, p : &Plan) -> i32 {
       used.set(dom, 1);
       if !same_class(domain(f, dom), proto) { bad_group += 1; }
     }
-    if pl.mcount != pl.cand.dep.domains || pl.cand.dep.gpd != proto.gpus { bad_group += 1; }
-    if !batch_ok_for(s, pl.cand.dep, pl.cand.batch) || pl.cand.ttft > s.slo_ttft { missed += 1; }
-    if pl.served > pl.cand.rate * 1.000000001f64 || pl.served <= 0.0f64 { over_rate += 1; }
-    served.set(pl.svc, served.get(pl.svc) + pl.served);
+    if pl.mcount != c.dep.domains || c.dep.gpd != proto.gpus { bad_group += 1; }
+    if pl.served > c.rate * 1.000000001f64 || pl.served <= 0.0f64 { over_rate += 1; }
+    if pl.role == 0 {
+      if !batch_ok_for(s, c.dep, c.batch) || c.ttft > s.slo_ttft { missed += 1; }
+      served0.set(pl.svc, served0.get(pl.svc) + pl.served);
+    }
+    if pl.role == 2 {
+      // A decode replica: ok at its batch, serving batch / (out * step).
+      if !batch_ok_for(s, c.dep, c.batch) { missed += 1; }
+      if !close(c.rate, fl(c.batch) / (fl(s.out) * c.step), 0.000000001f64) { over_rate += 1; }
+      cap_d.set(pl.svc, cap_d.get(pl.svc) + pl.served);
+      if first_d.get(pl.svc) < 0 { first_d.set(pl.svc, i); }
+    }
+    if pl.role == 1 {
+      // A prefill replica: the prompt fits, the first token (prefill plus sending the cache) is in time, and it serves 1 / prefill.
+      let tp = prefill_time_hit(s.model, c.dep, s.prompt, s.hit);
+      let xs = if gpus(c.dep) < c.xs { gpus(c.dep) } else { c.xs };
+      let nic = if c.dep.sku.nic < c.xnic { c.dep.sku.nic } else { c.xnic };
+      if !fits(s.model, c.dep, 1, s.prompt) || c.ttft > s.slo_ttft { missed += 1; }
+      if !close(c.ttft, tp + c.xfer, 0.000000001f64) { missed += 1; }
+      if !close(c.xfer, kv_transfer(s, c.dep.kb, nic, xs, c.xlat), 0.000000001f64) { missed += 1; }
+      if !close(c.rate, 1.0f64 / tp, 0.000000001f64) { over_rate += 1; }
+      cap_p.set(pl.svc, cap_p.get(pl.svc) + pl.served);
+    }
+    if roles.get(pl.svc) != 0 && ((roles.get(pl.svc) == 1) != (pl.role == 0)) { mixed += 1; }
+    if pl.role == 0 { roles.set(pl.svc, 1); } else { roles.set(pl.svc, 2); }
   }
+  // A disaggregated service: one cache format; every decode replica at least as good for the
+  // transfer as the first; every prefill replica priced against the first.
+  for i in 0..p.places.len() {
+    let pl = p.places.get(i);
+    if pl.role != 0 {
+      let d0 = p.places.get(first_d.get(pl.svc)).cand;
+      if pl.cand.dep.kb != d0.dep.kb { bad_peer += 1; }
+      if pl.role == 2 && (pl.cand.dep.sku.nic < d0.dep.sku.nic || gpus(pl.cand.dep) < gpus(d0.dep)) { bad_peer += 1; }
+      if pl.role == 1 && (pl.cand.xnic != d0.dep.sku.nic || pl.cand.xs != gpus(d0.dep)) { bad_peer += 1; }
+    }
+  }
+  let mut is_down = Vec<i32>::with_capacity(n);
+  for i in 0..n { is_down.push(0); }
+  for x in 0..down.len() { is_down.set(down.get(x), 1); }
   for i in 0..n {
-    if (used.get(i) == 1) == (p.free.get(i) == 1) { bad_free += 1; }
+    if is_down.get(i) == 1 {
+      if used.get(i) == 1 || p.free.get(i) == 1 { bad_free += 1; }
+    } else {
+      if (used.get(i) == 1) == (p.free.get(i) == 1) { bad_free += 1; }
+    }
   }
   let mut sums = 0;
-  for k in 0..sv.len() {
-    if !close(served.get(k) + p.unmet.get(k), sv.get(k).qps, 0.000000001f64) { sums += 1; }
+  for k in 0..ns {
+    let mut met = served0.get(k);
+    if roles.get(k) == 2 {
+      met = if cap_d.get(k) < cap_p.get(k) { cap_d.get(k) } else { cap_p.get(k) };
+    }
+    if !close(met + p.unmet.get(k), sv.get(k).qps, 0.000000001f64) { sums += 1; }
+    // Prefill is only counted up to what the decode pool can take.
+    if roles.get(k) == 2 && cap_p.get(k) > cap_d.get(k) + 0.000000001f64 { sums += 1; }
   }
   failed += expect(twice == 0, "no domain is used twice");
   failed += expect(bad_group == 0, "every placement is a group of one class, as the deployment says");
   failed += expect(missed == 0, "every placement meets its targets");
-  failed += expect(over_rate == 0, "no placement serves more than its replica can");
+  failed += expect(over_rate == 0, "no placement serves more than its replica can, and rates are what the formulas say");
   failed += expect(bad_free == 0, "the free list is the complement of the used domains");
+  failed += expect(bad_peer == 0, "a disaggregated service has one cache format and its prefill is priced against its decode pool");
+  failed += expect(mixed == 0, "a service is co-located or disaggregated, not both");
   failed += expect(sums == 0, "served plus unmet is the rate of each service");
   return failed;
 }
@@ -660,12 +742,15 @@ fn same_plan(a : &Plan, b : &Plan) -> bool {
 }
 
 // One line for each placement, for the Python port to price again: the layout and what was found.
-fn print_plan(p : &Plan) -> void {
+fn print_plan(tag : *const i8, p : &Plan) -> void {
   for i in 0..p.places.len() {
     let pl = p.places.get(i);
     let c = pl.cand;
-    print!("placed: ");
+    print!(tag);
+    print!(": ");
     print!(pl.svc);
+    print!(" ");
+    print!(pl.role);
     print!(" ");
     print!(c.dep.sku.name);
     print!(" ");
@@ -690,9 +775,595 @@ fn print_plan(p : &Plan) -> void {
     print!(c.step);
     print!(" ");
     print!(c.ttft);
+    print!(" ");
+    print!(c.xfer);
+    print!(" ");
+    print!(c.xnic);
+    print!(" ");
+    print!(c.xs);
+    print!(" ");
+    print!(c.xlat);
     print!("\n");
   }
   return;
+}
+
+// ---------------------------------------------------------------------------------------------
+// 6. Prefill and decode on separate pools
+
+// One B200 node and four H200 nodes.
+fn pool_fleet() -> Fleet {
+  let mut f = new_fleet();
+  add_domain(&mut f, hgx8(b200()), 0);
+  for i in 0..4 { add_domain(&mut f, hgx8(h200()), 1); }
+  wire(&mut f, 2.0f64);
+  return f;
+}
+
+// DeepSeek-V3, 32k prompt and 512 output at 2.4 requests a second, a token in 60 ms, and the first
+// one in half a second.
+fn pool_service(mode : i32) -> Service {
+  return with_mode(make_service(deepseek_v3(), 2.4f64, 32768, 512, 0.06f64, 0.5f64, 1.0f64, 1, 1024), mode);
+}
+
+fn one_order() -> Vec<i32> {
+  let mut o = Vec<i32>::with_capacity(1);
+  o.push(0);
+  return o;
+}
+
+fn test_pools() -> i32 {
+  let mut failed = 0;
+  let s = pool_service(1);
+
+  // By hand: the cache of 32768 tokens of DeepSeek-V3 in fp8 is 32768 * 35136 = 1151336448 bytes;
+  // over 8 GPUs of 50 GB/s that is 2.87834112 ms, and the latency is added.
+  failed += expect(close(kv_transfer(s, 1.0f64, 50000000000.0f64, 8, 0.0f64), 0.00287834112f64, 0.000000001f64), "the cache of a 32k prompt over 8 NICs of 50 GB/s takes 2.878 ms");
+  failed += expect(close(kv_transfer(s, 2.0f64, 25000000000.0f64, 16, 0.000001f64), 1151336448.0f64 * 2.0f64 / 400000000000.0f64 + 0.000001f64, 0.000000001f64), "bf16 doubles it, 16 NICs of 25 GB/s, plus the latency");
+
+  // What a replica costs for a need: whole replicas.
+  let dummy = deploy(h200(), 1, 8, 1, 1, 1.0f64, 1.0f64, 0.0f64, 0.0f64);
+  let big = Candidate { ok: 1, dep: dummy, batch: 1, step: 0.01f64, ttft: 0.1f64, rate: 10.0f64, cost_hr: 32.0f64, per_req: 32.0f64 / 3600.0f64 / 10.0f64, xfer: 0.0f64, xnic: 0.0f64, xs: 0, xlat: 0.0f64 };
+  let small = Candidate { ok: 1, dep: dummy, batch: 1, step: 0.01f64, ttft: 0.1f64, rate: 2.0f64, cost_hr: 8.0f64, per_req: 8.0f64 / 3600.0f64 / 2.0f64, xfer: 0.0f64, xnic: 0.0f64, xs: 0, xlat: 0.0f64 };
+  failed += expect(price(big, 5.0f64) == 32.0f64 && price(small, 5.0f64) == 24.0f64, "5 requests a second cost 32 on the big replica and 3 x 8 on the small");
+  failed += expect(better(small, big, 5.0f64) && !better(big, small, 5.0f64), "so the small is the better buy for 5");
+  failed += expect(price(big, 20.0f64) == 64.0f64 && price(small, 20.0f64) == 80.0f64, "20 requests a second cost 2 x 32 on the big replica and 10 x 8 on the small");
+  failed += expect(better(big, small, 20.0f64) && !better(small, big, 20.0f64), "so the big is the better buy for 20");
+
+  // The two ways to price a replica.
+  let dec = deploy(h200(), 1, 8, 0, 8, 1.0f64, 1.0f64, 0.0f64, 0.0f64);
+  let cd = evaluate_decode(s, dec);
+  failed += expect(cd.ok == 1 && cd.ttft == 0.0f64 && close(cd.rate, fl(cd.batch) / (fl(s.out) * cd.step), 0.000000001f64), "a decode replica serves batch / (out * step) and has no first token");
+  let co = evaluate(s, deploy(b200(), 1, 8, 1, 1, 1.0f64, 1.0f64, 0.0f64, 0.0f64));
+  failed += expect(co.ok == 1 && co.rate < 1.0f64 / co.ttft, "a co-located replica serves less than 1 / prefill: it decodes too");
+  let pre = deploy(b200(), 1, 8, 1, 1, 1.0f64, 1.0f64, 0.0f64, 0.0f64);
+  let cp = evaluate_prefill(s, pre, 50000000000.0f64, 8, 0.000001f64);
+  let tp = prefill_time(s.model, pre, s.prompt);
+  failed += expect(cp.ok == 1 && close(cp.rate, 1.0f64 / tp, 0.000000001f64) && close(cp.ttft, tp + kv_transfer(s, 1.0f64, 50000000000.0f64, 8, 0.000001f64), 0.000000001f64), "a prefill replica serves 1 / prefill and the first token waits for the transfer");
+  failed += expect(cp.rate > co.rate, "so one B200 node serves more prompts than co-located requests");
+  // A slow link makes the first token late; a prefill the first token cannot wait for has no candidate.
+  failed += expect(evaluate_prefill(s, pre, 1000000.0f64, 8, 0.0f64).ok == 0, "a 1 MB/s link cannot send the cache in time");
+  failed += expect(evaluate_prefill(make_service(deepseek_v3(), 2.4f64, 32768, 512, 0.06f64, 0.001f64, 1.0f64, 1, 1024), pre, 50000000000.0f64, 8, 0.0f64).ok == 0, "a first token in 1 ms is out of reach");
+
+  // The plans: co-located needs all four H200 nodes beside the B200 node to meet the 0.5 s target at
+  // the rate; disaggregated puts the prefill on the B200 node and the decode on one H200 node.
+  let f = pool_fleet();
+  let o = one_order();
+  let mut v0 = Vec<Service>::with_capacity(1);
+  v0.push(pool_service(0));
+  let mut v1 = Vec<Service>::with_capacity(1);
+  v1.push(pool_service(1));
+  let mut v2 = Vec<Service>::with_capacity(1);
+  v2.push(pool_service(2));
+  let p0 = schedule_in_order(&f, &v0, &o);
+  let p1 = schedule_in_order(&f, &v1, &o);
+  let p2 = schedule_in_order(&f, &v2, &o);
+  failed += check_plan(&f, &v0, &p0);
+  failed += check_plan(&f, &v1, &p1);
+  failed += check_plan(&f, &v2, &p2);
+  failed += expect(p0.unmet.get(0) == 0.0f64 && p1.unmet.get(0) == 0.0f64, "both ways meet 2.4 requests a second");
+  failed += expect(spend(&p1) < spend(&p0), "the pools cost less than the co-located replicas");
+  failed += expect(p1.places.len() == 2 && p1.places.get(0).role == 2 && p1.places.get(1).role == 1, "one decode replica and one prefill replica");
+  failed += expect(p1.places.get(0).cand.dep.sku.cost == h200().cost && p1.places.get(1).cand.dep.sku.cost == b200().cost, "decode on H200, prefill on B200");
+  failed += expect(same_plan(&p1, &p2) && spend(&p2) == spend(&p1), "left to choose, the scheduler takes the pools");
+  show("pools", spend(&p0), spend(&p1), p1.places.get(1).cand.xfer);
+
+  // Equal price, a cheaper request wins.
+  let twin = Candidate { ok: 1, dep: dummy, batch: 1, step: 0.01f64, ttft: 0.1f64, rate: 4.0f64, cost_hr: 8.0f64, per_req: 8.0f64 / 3600.0f64 / 4.0f64, xfer: 0.0f64, xnic: 0.0f64, xs: 0, xlat: 0.0f64 };
+  failed += expect(price(twin, 2.0f64) == price(small, 2.0f64) && better(twin, small, 2.0f64) && !better(small, twin, 2.0f64), "at the same price the cheaper request is the better buy");
+
+  // The cache goes over as many GPUs as the smaller side has; a prompt that does not fit is refused.
+  let narrow = evaluate_prefill(s, pre, 50000000000.0f64, 2, 0.0f64);
+  failed += expect(narrow.ok == 1 && close(narrow.xfer, kv_transfer(s, 1.0f64, 50000000000.0f64, 2, 0.0f64), 0.000000001f64) && narrow.xfer > cp.xfer * 3.0f64, "a decode side of 2 GPUs sends the cache over 2 NICs, not 8");
+  let a8 = deploy(a100_80(), 1, 8, 1, 1, 2.0f64, 2.0f64, 0.0f64, 0.0f64);
+  failed += expect(evaluate_prefill(s, a8, 50000000000.0f64, 8, 0.0f64).ok == 0, "DeepSeek-V3 in bf16 does not fit 8 A100-80 for a prefill either");
+
+  // A pool agrees with the one it works with: the cache format, a NIC at least as fast, as many GPUs.
+  let pf = pool_fleet();
+  let mut pf_free = Vec<i32>::with_capacity(5);
+  for i in 0..5 { pf_free.push(1); }
+  let mut want_bf16 = no_peer();
+  want_bf16.kb = 2.0f64;
+  want_bf16.xnic = 50000000000.0f64;
+  want_bf16.xs = 8;
+  want_bf16.dref = 1;
+  let bf = best_role(s, &pf, &pf_free, 1, want_bf16, 2.4f64);
+  failed += expect(bf.cand.ok == 1 && bf.cand.dep.kb == 2.0f64, "a prefill pool sending a bf16 cache works in bf16");
+  let mut want_fp8 = want_bf16;
+  want_fp8.kb = 1.0f64;
+  failed += expect(best_role(s, &pf, &pf_free, 1, want_fp8, 2.4f64).cand.dep.kb == 1.0f64, "and one sending fp8 works in fp8");
+  failed += expect(close(best_role(s, &pf, &pf_free, 1, want_fp8, 2.4f64).cand.xlat, 0.000006f64, 0.000001f64), "the prefill on leaf 0 is 6 us from a decode domain on leaf 1: 1 + 2 + 2 + 1");
+  let mut a100_peer = no_peer();
+  a100_peer.xnic = 50000000000.0f64;
+  a100_peer.xs = 8;
+  a100_peer.dref = 0;
+  let mut ones_a100 = Vec<i32>::with_capacity(4);
+  for i in 0..4 { ones_a100.push(1); }
+  let mut a100_fleet = new_fleet();
+  for i in 0..4 { add_domain(&mut a100_fleet, hgx8(a100_80()), 0); }
+  wire(&mut a100_fleet, 2.0f64);
+  failed += expect(best_role(s, &a100_fleet, &ones_a100, 2, a100_peer, 2.4f64).cand.ok == 0, "a decode replica on a 25 GB/s NIC cannot join a pool priced for 50 GB/s");
+  a100_peer.xnic = 25000000000.0f64;
+  failed += expect(best_role(s, &a100_fleet, &ones_a100, 2, a100_peer, 2.4f64).cand.ok == 1, "but it can join one priced for 25");
+  let mut one_h200 = new_fleet();
+  add_domain(&mut one_h200, hgx8(h200()), 0);
+  wire(&mut one_h200, 2.0f64);
+  let mut one_free = Vec<i32>::with_capacity(1);
+  one_free.push(1);
+  let mut wide = no_peer();
+  wide.xnic = 50000000000.0f64;
+  wide.xs = 16;
+  wide.dref = 0;
+  failed += expect(best_role(s, &one_h200, &one_free, 2, wide, 2.4f64).cand.ok == 0, "a decode replica of 8 GPUs cannot join a pool priced for replicas of 16");
+  wide.xs = 8;
+  failed += expect(best_role(s, &one_h200, &one_free, 2, wide, 2.4f64).cand.ok == 1, "but it can join one priced for 8");
+  failed += expect(close(p1.places.get(1).cand.xlat, 0.000006f64, 0.000001f64), "the plan prices the transfer with the latency of the graph");
+
+  // A need that a bigger replica covers in one: 7 requests a second of DeepSeek-V3 at 8k take a B200
+  // node (10.4 a second, 32 an hour), not an H200 node (5.1, 20 an hour) and then more.
+  let mut hb = new_fleet();
+  add_domain(&mut hb, hgx8(h200()), 0);
+  add_domain(&mut hb, hgx8(b200()), 0);
+  wire(&mut hb, 2.0f64);
+  let mut seven = Vec<Service>::with_capacity(1);
+  seven.push(make_service(deepseek_v3(), 7.0f64, 8192, 1024, 0.05f64, 5.0f64, 1.0f64, 1, 1024));
+  let p7 = schedule_in_order(&hb, &seven, &o);
+  failed += check_plan(&hb, &seven, &p7);
+  failed += expect(p7.places.len() == 1 && p7.places.get(0).cand.dep.sku.cost == b200().cost && spend(&p7) == 32.0f64 && p7.unmet.get(0) == 0.0f64, "the replica is chosen for the rate still needed: 7 a second go to the B200 node");
+
+  // Prefill is only added up to what the decode pool can take. One H200 node and eight A100 nodes:
+  // the H200 node decodes 4.2 requests a second of a 4096-token output; a later decode replica
+  // would need a NIC as fast as the first's (50 GB/s), which no A100 node has (25), so decode stops
+  // there; three pairs of A100 nodes prefill that much (1.85 each, 3 pairs) and the last two nodes stay free.
+  let mut cap = new_fleet();
+  add_domain(&mut cap, hgx8(h200()), 0);
+  for i in 0..8 { add_domain(&mut cap, hgx8(a100_80()), 1); }
+  wire(&mut cap, 2.0f64);
+  let mut vcap = Vec<Service>::with_capacity(1);
+  vcap.push(with_mode(make_service(deepseek_v3(), 20.0f64, 8192, 4096, 0.05f64, 5.0f64, 1.0f64, 1, 1024), 1));
+  let pcap = schedule_in_order(&cap, &vcap, &o);
+  failed += check_plan(&cap, &vcap, &pcap);
+  let mut cap_free = 0;
+  for i in 0..9 { cap_free += pcap.free.get(i); }
+  failed += expect(pcap.places.len() == 4 && cap_free == 2 && pcap.unmet.get(0) > 15.7f64 && pcap.unmet.get(0) < 15.9f64, "prefill stops where the decode pool's capacity does");
+
+  // Growing the pools together beats filling one first: on eight H200 nodes, 60 requests a second
+  // leave 25.3 unmet this way (decode, four prefill, decode, two prefill); decode until it could take
+  // all 60 (three nodes) and prefill on the other five leaves 26.6.
+  let mut eight = new_fleet();
+  for i in 0..8 { add_domain(&mut eight, hgx8(h200()), 0); }
+  wire(&mut eight, 2.0f64);
+  let mut v8 = Vec<Service>::with_capacity(1);
+  v8.push(with_mode(make_service(deepseek_v3(), 60.0f64, 8192, 1024, 0.05f64, 5.0f64, 1.0f64, 1, 1024), 1));
+  let p8 = schedule_in_order(&eight, &v8, &o);
+  failed += check_plan(&eight, &v8, &p8);
+  failed += expect(p8.unmet.get(0) < 26.0f64, "growing the pools together serves more than decode first");
+
+  // The pools are grown together: on a rack and eight A100 nodes, 30 requests a second of a short
+  // prompt are partly served; decode first until the domains ran out would leave no prefill at all.
+  let mut rack = new_fleet();
+  add_domain(&mut rack, nvl72(b200()), 0);
+  for i in 0..8 { add_domain(&mut rack, hgx8(a100_80()), 1); }
+  wire(&mut rack, 2.0f64);
+  let mut busy = Vec<Service>::with_capacity(1);
+  busy.push(with_mode(make_service(deepseek_v3(), 30.0f64, 8192, 1024, 0.06f64, 5.0f64, 1.0f64, 1, 1024), 1));
+  let pb = schedule_in_order(&rack, &busy, &o);
+  failed += check_plan(&rack, &busy, &pb);
+  failed += expect(pb.unmet.get(0) < 29.0f64 && pb.places.len() >= 2, "both pools get domains, so some of the 30 requests a second are served");
+
+  // Left to choose, it is no worse than either way, in four settings.
+  let mut worse = 0;
+  let mut cases = 0;
+  let main_fleet = mixed_fleet();
+  let mut all_f = Vec<Service>::with_capacity(4);
+  all_f.push(make_service(deepseek_v3(), 20.0f64, 8192, 1024, 0.05f64, 5.0f64, 1.0f64, 1, 1024));
+  all_f.push(make_service(glm_4_5(), 6.0f64, 32768, 512, 0.05f64, 10.0f64, 2.0f64, 0, 1024));
+  all_f.push(make_service(deepseek_v3(), 3.0f64, 65536, 256, 0.08f64, 20.0f64, 1.0f64, 1, 512));
+  all_f.push(make_service(deepseek_v3(), 1.0f64, 131072, 512, 0.08f64, 60.0f64, 1.0f64, 1, 256));
+  for k in 0..4 {
+    let mut a = Vec<Service>::with_capacity(1);
+    let mut b = Vec<Service>::with_capacity(1);
+    let mut c = Vec<Service>::with_capacity(1);
+    a.push(with_mode(all_f.get(k), 0));
+    b.push(with_mode(all_f.get(k), 1));
+    c.push(with_mode(all_f.get(k), 2));
+    let qa = schedule_in_order(&main_fleet, &a, &o);
+    let qb = schedule_in_order(&main_fleet, &b, &o);
+    let qc = schedule_in_order(&main_fleet, &c, &o);
+    failed += check_plan(&main_fleet, &a, &qa);
+    failed += check_plan(&main_fleet, &b, &qb);
+    failed += check_plan(&main_fleet, &c, &qc);
+    let best_unmet = if qa.unmet.get(0) < qb.unmet.get(0) { qa.unmet.get(0) } else { qb.unmet.get(0) };
+    if qc.unmet.get(0) > best_unmet + 0.000000001f64 { worse += 1; }
+    if close(qc.unmet.get(0), best_unmet, 0.000000001f64) || (qc.unmet.get(0) == 0.0f64 && best_unmet == 0.0f64) {
+      let best_spend = if qa.unmet.get(0) <= best_unmet + 0.000000001f64 && (qb.unmet.get(0) > best_unmet + 0.000000001f64 || spend(&qa) <= spend(&qb)) { spend(&qa) } else { spend(&qb) };
+      if spend(&qc) > best_spend + 0.000000001f64 { worse += 1; }
+    }
+    cases += 1;
+  }
+  failed += expect(worse == 0 && cases == 4, "mode 2 leaves no more unmet than either way, and then costs no more");
+
+  // Decode replicas with no prefill to feed them are given back: on A100 nodes alone a decode pool
+  // fits, but a first token in 1 ms is out of reach.
+  let mut a100s = new_fleet();
+  for i in 0..4 { add_domain(&mut a100s, hgx8(a100_80()), 0); }
+  wire(&mut a100s, 2.0f64);
+  let mut a100_free = Vec<i32>::with_capacity(4);
+  for i in 0..4 { a100_free.push(1); }
+  let doomed = with_mode(make_service(deepseek_v3(), 1.0f64, 8192, 512, 0.2f64, 0.001f64, 1.0f64, 1, 64), 1);
+  failed += expect(best_role(doomed, &a100s, &a100_free, 2, no_peer(), 1.0f64).cand.ok == 1, "a decode pool would fit on the A100 nodes");
+  let mut vd = Vec<Service>::with_capacity(1);
+  vd.push(doomed);
+  let pd = schedule_in_order(&a100s, &vd, &o);
+  let mut all_free = 0;
+  for i in 0..4 { all_free += pd.free.get(i); }
+  failed += expect(pd.places.len() == 0 && pd.unmet.get(0) == 1.0f64 && all_free == 4, "with no prefill possible the decode replicas are given back");
+  // The give-back restores what earlier services had: the first service keeps its placements.
+  let mut vd2 = Vec<Service>::with_capacity(2);
+  vd2.push(make_service(deepseek_v3(), 0.2f64, 8192, 512, 0.2f64, 30.0f64, 1.0f64, 1, 64));
+  vd2.push(doomed);
+  let mut two_order = Vec<i32>::with_capacity(2);
+  two_order.push(0);
+  two_order.push(1);
+  let pd2 = schedule_in_order(&a100s, &vd2, &two_order);
+  failed += check_plan(&a100s, &vd2, &pd2);
+  failed += expect(pd2.places.len() >= 1 && pd2.unmet.get(0) == 0.0f64 && pd2.unmet.get(1) == 1.0f64, "the service placed before the doomed one keeps its placement");
+  print_plan("pooled", &p1);
+  return failed;
+}
+
+// ---------------------------------------------------------------------------------------------
+// 7. Losses and the report
+
+fn test_losses() -> i32 {
+  let mut failed = 0;
+  let f = mixed_fleet();
+  let mut sv = Vec<Service>::with_capacity(2);
+  sv.push(make_service(deepseek_v3(), 20.0f64, 8192, 1024, 0.05f64, 5.0f64, 1.0f64, 1, 1024));
+  sv.push(make_service(glm_4_5(), 10.0f64, 32768, 512, 0.05f64, 10.0f64, 2.0f64, 0, 1024));
+  let order = demand_order(&f, &sv);
+  failed += expect(order.len() == 2 && order.get(0) == 0 && order.get(1) == 1, "both services are best on one H200 node (8 GPUs), so a tie goes to the lower number");
+  let mut big = Vec<Service>::with_capacity(3);
+  big.push(sv.get(0));
+  big.push(sv.get(1));
+  big.push(make_service(glm_4_5(), 0.004f64, 1000000, 256, 0.15f64, 600.0f64, 2.0f64, 0, 32));
+  let big_order = demand_order(&f, &big);
+  failed += expect(big_order.get(0) == 2 && big_order.get(1) == 0 && big_order.get(2) == 1, "a million tokens of GLM need the most GPUs: it comes first");
+  let none = Vec<i32>::with_capacity(1);
+  let base = schedule_in_order(&f, &sv, &order);
+  failed += expect(same_plan(&base, &schedule_down_in_order(&f, &sv, &order, &none)), "with nothing down the plan is the same");
+  // The rack and two of the H200 nodes down: nobody uses them, and they are not free.
+  let mut down = Vec<i32>::with_capacity(3);
+  down.push(0);
+  down.push(1);
+  down.push(2);
+  let hurt = schedule_down_in_order(&f, &sv, &order, &down);
+  failed += check_plan_down(&f, &sv, &hurt, &down);
+  failed += expect(shortfall(&sv, &hurt) >= shortfall(&sv, &base) - 0.000000001f64, "without the rack and two H200 nodes at least as much is unmet");
+  // The search over orders keeps to the same fleet.
+  let searched = schedule_down(&f, &sv, &down);
+  failed += check_plan_down(&f, &sv, &searched, &down);
+  failed += expect(shortfall(&sv, &searched) <= shortfall(&sv, &hurt) + 0.000000001f64, "the best of the orders is no worse than the first, with domains down");
+  // Everything that can host a service down: it is left whole.
+  let mut h2 = new_fleet();
+  add_domain(&mut h2, hgx8(h200()), 0);
+  add_domain(&mut h2, hgx8(h200()), 0);
+  wire(&mut h2, 2.0f64);
+  let mut one = Vec<Service>::with_capacity(1);
+  one.push(make_service(deepseek_v3(), 1.0f64, 8192, 512, 0.05f64, 5.0f64, 1.0f64, 1, 1024));
+  let mut both = Vec<i32>::with_capacity(2);
+  both.push(0);
+  both.push(1);
+  let gone = schedule_down(&h2, &one, &both);
+  failed += expect(gone.places.len() == 0 && gone.unmet.get(0) == 1.0f64, "with both nodes down the service is left whole");
+  failed += check_plan_down(&h2, &one, &gone, &both);
+  let mut first = Vec<i32>::with_capacity(1);
+  first.push(0);
+  let left = schedule_down(&h2, &one, &first);
+  failed += expect(left.unmet.get(0) == 0.0f64 && left.places.get(0).mcount == 1 && left.members.get(0) == 1, "with node 0 down the service runs on node 1");
+  // The number formatter of the report: lines that check.py compares with Python's.
+  print!("fmt: ");
+  print_f(3.14159f64, 2);
+  print!(" ");
+  print_f(2.5f64, 1);
+  print!(" ");
+  print_f(0.0004f64, 2);
+  print!(" ");
+  print_f(123456.789f64, 2);
+  print!(" ");
+  print_f(7.0f64, 0);
+  print!(" ");
+  print_f(0.0f64 - 1.234f64, 1);
+  print!(" ");
+  print_f(99.6f64, 0);
+  print!("\n");
+  return failed;
+}
+
+// ---------------------------------------------------------------------------------------------
+// 8. Headroom
+
+fn test_headroom() -> i32 {
+  let mut failed = 0;
+  // Two H200 nodes and one service: a replica serves R requests a second (one node), a second node
+  // doubles it. At R / 2 the fleet carries about 4 times the load; at 3 R it carries about 2 / 3.
+  let mut f = new_fleet();
+  add_domain(&mut f, hgx8(h200()), 0);
+  add_domain(&mut f, hgx8(h200()), 0);
+  wire(&mut f, 2.0f64);
+  let mut free = Vec<i32>::with_capacity(2);
+  free.push(1);
+  free.push(1);
+  let s = make_service(deepseek_v3(), 1.0f64, 8192, 512, 0.05f64, 5.0f64, 1.0f64, 1, 1024);
+  let rate = best_for(s, &f, &free).cand.rate;
+  let o = one_order();
+  let mut half = Vec<Service>::with_capacity(1);
+  half.push(with_qps(s, rate / 2.0f64));
+  let h4 = headroom(&f, &half, &o);
+  failed += expect(h4 > 3.9f64 && h4 < 4.05f64, "half a replica's rate on two nodes carries 4 times the load");
+  let mut triple = Vec<Service>::with_capacity(1);
+  triple.push(with_qps(s, rate * 3.0f64));
+  let h3 = headroom(&f, &triple, &o);
+  failed += expect(h3 > 0.65f64 && h3 < 0.67f64, "3 replicas' rate on two nodes carries two thirds of it");
+  failed += expect(met_at(&f, &half, &o, h4) && !met_at(&f, &half, &o, h4 * 1.05f64), "and the boundary is where the first is met and 5% more is not");
+  print!("headroom: ");
+  print_f(h4, 2);
+  print!(" ");
+  print_f(h3, 2);
+  print!("\n");
+  return failed;
+}
+
+// ---------------------------------------------------------------------------------------------
+// 9. Speculative decoding and the prefix cache
+
+fn spec_service(mode : i32) -> Service {
+  return with_mode(with_hit(with_spec(make_service(deepseek_v3(), 10.0f64, 8192, 1024, 0.03f64, 5.0f64, 1.0f64, 1, 2048), 2.0f64, 1.8f64), 0.5f64), mode);
+}
+
+fn test_spec() -> i32 {
+  let mut failed = 0;
+  let d = deepseek_v3();
+  let s0 = make_service(d, 10.0f64, 8192, 1024, 0.03f64, 5.0f64, 1.0f64, 1, 2048);
+  // A step on one token of each sequence is the plain step, and the plain prefill is the one with
+  // nothing cached.
+  let n72 = deploy(b200(), 1, 72, 1, 1, 1.0f64, 1.0f64, 0.0f64, 0.0f64);
+  failed += expect(decode_step_spec(d, n72, 512, 8192, 1.0f64) == decode_step(d, n72, 512, 8192), "a step on one token of each sequence is the plain step");
+  failed += expect(prefill_time_hit(d, n72, 8192, 0.0f64) == prefill_time(d, n72, 8192), "a prefill with nothing cached is the plain prefill");
+
+  // On a machine limited by arithmetic, a step on two tokens takes twice as long (less the overhead of
+  // the layers, which a step pays once).
+  let tfn = deploy(toy_flops(), 1, 8, 1, 1, 2.0f64, 2.0f64, 0.0f64, 0.0f64);
+  let over = 61.0f64 * 0.00003f64;
+  let one = decode_step_spec(d, tfn, 8, 100000, 1.0f64) - over;
+  let two = decode_step_spec(d, tfn, 8, 100000, 2.0f64) - over;
+  failed += expect(close(two, 2.0f64 * one, 0.000000001f64), "a compute-bound step on two tokens takes twice as long");
+  // On a machine limited by memory, two tokens only touch more experts: for one sequence, 8 experts of
+  // a layer become 256 * (1 - (31/32)^2) = 15.75, and the rest of the traffic is the same.
+  let t8 = deploy(toy(), 1, 8, 1, 1, 1.0f64, 1.0f64, 0.0f64, 0.0f64);
+  let extra = 58.0f64 * (15.75f64 - 8.0f64) / 8.0f64 * 44040192.0f64 / 750000000000.0f64;
+  failed += expect(close(decode_step_spec(d, t8, 1, 1000, 2.0f64) - decode_step(d, t8, 1, 1000), extra, 0.000001f64), "a memory-bound step on two tokens reads the extra experts and nothing else");
+  let mut up = 0;
+  let mut prev = 0.0f64;
+  for k in 0..8 {
+    let st = decode_step_spec(d, n72, 256, 8192, 1.0f64 + fl(k));
+    if st < prev { up += 1; }
+    prev = st;
+  }
+  failed += expect(up == 0, "a step never gets shorter with more tokens to check");
+
+  // A prefill with half the prompt cached: 500 new tokens that attend to 500 old ones, by hand, on the
+  // machine limited by arithmetic.
+  let la = 61.0f64 * 187105280.0f64 + 9.0f64 * 7168.0f64 * 18432.0f64 + 58.0f64 * (9.0f64 * 44040192.0f64 + 7168.0f64 * 256.0f64);
+  let flops = 2.0f64 * la * 500.0f64 + (500.0f64 * 500.0f64 + 500.0f64 * 500.0f64 / 2.0f64) * 61.0f64 * 81920.0f64;
+  let tf = deploy(toy_flops(), 1, 8, 1, 1, 2.0f64, 2.0f64, 0.0f64, 0.0f64);
+  failed += expect(close(prefill_time_hit(d, tf, 1000, 0.5f64), flops / (8.0f64 * 1000000000000000.0f64 * 0.4f64) + over, 0.000000001f64), "a prefill with half cached is the work of 500 new tokens over 500 old ones");
+  let mut down = 0;
+  let mut before = prefill_time_hit(d, n72, 32768, 0.0f64);
+  for k in 1..9 {
+    let ti = prefill_time_hit(d, n72, 32768, fl(k) / 10.0f64);
+    if ti > before { down += 1; }
+    before = ti;
+  }
+  failed += expect(down == 0 && prefill_time_hit(d, n72, 32768, 0.9f64) < prefill_time_hit(d, n72, 32768, 0.0f64) / 2.0f64, "the more of a prompt is cached, the shorter the prefill");
+
+  // The service: the time between tokens is the step over the tokens a step gives.
+  let sp = with_spec(s0, 2.0f64, 1.8f64);
+  let h200_node = deploy(h200(), 1, 8, 1, 1, 1.0f64, 1.0f64, 0.0f64, 0.0f64);
+  failed += expect(close(tpot(sp, h200_node, 300), decode_step_spec(d, h200_node, 300, 8192 + 512, 2.0f64) / 1.8f64, 0.000000001f64), "the time between tokens is the step over 1.8 tokens");
+  let plain_c = evaluate(s0, h200_node);
+  let spec_c = evaluate(sp, h200_node);
+  failed += expect(plain_c.ok == 1 && spec_c.ok == 1 && spec_c.batch > 4 * plain_c.batch && spec_c.rate > 2.0f64 * plain_c.rate, "at 30 ms a token speculation lets the batch grow and doubles the rate");
+  failed += expect(spec_c.step <= s0.slo_tpot && close(spec_c.step, tpot(sp, h200_node, spec_c.batch), 0.000000001f64), "the candidate's time between tokens is the speculative one");
+  let cached = evaluate(with_hit(s0, 0.5f64), h200_node);
+  failed += expect(cached.ttft < plain_c.ttft * 0.6f64 && close(cached.ttft, prefill_time_hit(d, h200_node, 8192, 0.5f64), 0.000000001f64), "a half-cached prompt gets its first token in well under the time of a whole one");
+
+  // Layouts with tensor parallel attention and with the cache cut, on two tokens a step, priced again in Python.
+  let tgl = deploy(h200(), 1, 8, 0, 1, 2.0f64, 2.0f64, 0.0f64, 0.0f64);
+  let cut8 = deploy(b200(), 1, 72, 1, 8, 1.0f64, 1.0f64, 0.0f64, 0.0f64);
+  show("cost_spec", decode_step_spec(glm_4_5(), tgl, 32, 8192, 2.0f64), decode_step_spec(d, cut8, 18, 200000, 2.0f64), prefill_time_hit(glm_4_5(), tgl, 8192, 0.25f64));
+
+  // Plans, priced again in Python.
+  let f = mixed_fleet();
+  let o = one_order();
+  let mut v0 = Vec<Service>::with_capacity(1);
+  v0.push(spec_service(0));
+  let mut v1 = Vec<Service>::with_capacity(1);
+  v1.push(spec_service(1));
+  let q0 = schedule_in_order(&f, &v0, &o);
+  let q1 = schedule_in_order(&f, &v1, &o);
+  failed += check_plan(&f, &v0, &q0);
+  failed += check_plan(&f, &v1, &q1);
+  failed += expect(q0.unmet.get(0) == 0.0f64 && q1.unmet.get(0) == 0.0f64, "10 requests a second with speculation and a prefix cache are met, either way");
+  print_plan("spec0", &q0);
+  print_plan("spec1", &q1);
+  show("spec", spec_c.rate / plain_c.rate, cached.ttft / plain_c.ttft, fl(spec_c.batch));
+  return failed;
+}
+
+// ---------------------------------------------------------------------------------------------
+// 10. Traffic to the spine
+
+// A plan with one placement by hand: service 0 on the given domains, serving `served` requests a second.
+fn hand_plan(f : &Fleet, svcs : &Vec<Service>, role : i32, dep : Deploy, batch : i32, a : i32, b : i32, served : f64) -> Plan {
+  let mut p = new_plan(f, svcs);
+  let c = Candidate { ok: 1, dep: dep, batch: batch, step: 0.04f64, ttft: 0.1f64, rate: 100.0f64, cost_hr: 1.0f64, per_req: 0.0f64, xfer: 0.0f64, xnic: 0.0f64, xs: 0, xlat: 0.0f64 };
+  p.members.push(a);
+  if b >= 0 {
+    p.members.push(b);
+  }
+  let mut n = 1;
+  if b >= 0 {
+    n = 2;
+  }
+  p.places.push(Placement { svc: 0, role: role, cand: c, mstart: p.members.len() - n, mcount: n, served: served });
+  return p;
+}
+
+fn test_network() -> i32 {
+  let mut failed = 0;
+  let mut f = new_fleet();
+  add_domain(&mut f, hgx8(h200()), 0);
+  add_domain(&mut f, hgx8(h200()), 1);
+  add_domain(&mut f, hgx8(b200()), 0);
+  wire(&mut f, 2.0f64);
+  let mut svcs = Vec<Service>::with_capacity(1);
+  svcs.push(make_service(deepseek_v3(), 1.0f64, 8192, 512, 0.05f64, 5.0f64, 1.0f64, 1, 1024));
+  let two = Deploy { sku: h200(), domains: 2, gpd: 8, dp: 1, cp: 1, wb: 1.0f64, kb: 1.0f64, cross: 25000000000.0f64, lat: 0.000006f64 };
+
+  // Two H200 nodes on two leaves, one request a second at batch 100. Per request: the all-to-all of
+  // 512 decoded tokens (each token 8 experts x 7168 x 3 bytes x 58 layers = 9977856 bytes), the
+  // all-to-all of the 8192 prompt tokens (the same per token), and the gather of the prompt's cache to 15
+  // other GPUs (8192 x 35136 x 15). A quarter of that crosses each way: half the GPUs send, half receive.
+  let p = hand_plan(&f, &svcs, 0, two, 100, 0, 1, 1.0f64);
+  let mut eg = Vec<f64>::with_capacity(2);
+  let mut ing = Vec<f64>::with_capacity(2);
+  leaf_traffic(&f, &svcs, &p, &mut eg, &mut ing);
+  let per_token = 8.0f64 * 7168.0f64 * 3.0f64 * 58.0f64;
+  let total = 512.0f64 * per_token + 8192.0f64 * per_token + 8192.0f64 * 35136.0f64 * 15.0f64;
+  failed += expect(close(request_bytes(svcs.get(0), p.places.get(0)), total, 0.000000001f64), "a request moves 91164770304 bytes between the GPUs of 16");
+  failed += expect(close(eg.get(0), total / 4.0f64, 0.000000001f64) && close(eg.get(1), total / 4.0f64, 0.000000001f64), "a quarter of it leaves each leaf");
+  failed += expect(close(ing.get(0), total / 4.0f64, 0.000000001f64) && close(ing.get(1), total / 4.0f64, 0.000000001f64), "and a quarter enters each");
+  failed += expect(leaf_capacity(&f, 0) == 400000000000.0f64 && leaf_capacity(&f, 1) == 200000000000.0f64, "a leaf link is its domains' uplinks over the oversubscription: 800 / 2 and 400 / 2 GB/s");
+
+  // At half the rate, half the flow.
+  let ph = hand_plan(&f, &svcs, 0, two, 100, 0, 1, 0.5f64);
+  let mut eg1 = Vec<f64>::with_capacity(2);
+  let mut ing1 = Vec<f64>::with_capacity(2);
+  leaf_traffic(&f, &svcs, &ph, &mut eg1, &mut ing1);
+  failed += expect(close(eg1.get(0), total / 8.0f64, 0.000000001f64), "serving half as many requests a second, half the flow");
+  // A leaf with two nodes and the spine link at full rate (oversubscription 1) has a link of 800 GB/s,
+  // more than either node's uplink of 400.
+  let mut full = new_fleet();
+  add_domain(&mut full, hgx8(h200()), 0);
+  add_domain(&mut full, hgx8(h200()), 0);
+  wire(&mut full, 1.0f64);
+  failed += expect(leaf_capacity(&full, 0) == 800000000000.0f64, "two nodes on a leaf at oversubscription 1: a link of 800 GB/s");
+
+  // The same two nodes on one leaf: nothing goes up to the spine.
+  let mut g = new_fleet();
+  add_domain(&mut g, hgx8(h200()), 0);
+  add_domain(&mut g, hgx8(h200()), 0);
+  wire(&mut g, 2.0f64);
+  let pg = hand_plan(&g, &svcs, 0, two, 100, 0, 1, 1.0f64);
+  let mut eg2 = Vec<f64>::with_capacity(1);
+  let mut ing2 = Vec<f64>::with_capacity(1);
+  leaf_traffic(&g, &svcs, &pg, &mut eg2, &mut ing2);
+  failed += expect(eg2.get(0) == 0.0f64 && ing2.get(0) == 0.0f64, "two nodes on one leaf send nothing to the spine");
+
+  // A decode replica on node 1 (leaf 1) served by a prefill replica on the B200 node (leaf 0): the
+  // cache of each prompt, 32768 x 35136 bytes, crosses at 2.4 requests a second.
+  let long = with_mode(make_service(deepseek_v3(), 2.4f64, 32768, 512, 0.06f64, 0.5f64, 1.0f64, 1, 1024), 1);
+  let mut sv2 = Vec<Service>::with_capacity(1);
+  sv2.push(long);
+  let one_node = Deploy { sku: h200(), domains: 1, gpd: 8, dp: 1, cp: 1, wb: 1.0f64, kb: 1.0f64, cross: 0.0f64, lat: 0.0f64 };
+  let b_node = Deploy { sku: b200(), domains: 1, gpd: 8, dp: 1, cp: 1, wb: 1.0f64, kb: 1.0f64, cross: 0.0f64, lat: 0.0f64 };
+  let mut pp = hand_plan(&f, &sv2, 2, one_node, 100, 1, 0 - 1, 2.4f64);
+  let c1 = Candidate { ok: 1, dep: b_node, batch: 0, step: 0.0f64, ttft: 0.1f64, rate: 100.0f64, cost_hr: 1.0f64, per_req: 0.0f64, xfer: 0.0f64, xnic: 0.0f64, xs: 0, xlat: 0.0f64 };
+  pp.members.push(2);
+  pp.places.push(Placement { svc: 0, role: 1, cand: c1, mstart: pp.members.len() - 1, mcount: 1, served: 2.4f64 });
+  let mut eg3 = Vec<f64>::with_capacity(2);
+  let mut ing3 = Vec<f64>::with_capacity(2);
+  leaf_traffic(&f, &sv2, &pp, &mut eg3, &mut ing3);
+  let cache = 32768.0f64 * 35136.0f64 * 2.4f64;
+  failed += expect(close(eg3.get(0), cache + 0.0f64, 0.000000001f64) && eg3.get(1) == 0.0f64, "the cache of the prompts leaves leaf 0 and nothing leaves leaf 1");
+  failed += expect(close(ing3.get(1), cache, 0.000000001f64) && ing3.get(0) == 0.0f64, "and enters leaf 1");
+
+  // Speculation (2 tokens a step, 1.8 given) and half of each prompt cached change the bytes: the decode
+  // tokens move 2 / 1.8 of their share, the prompt has 4096 new tokens.
+  let sp = with_hit(with_spec(svcs.get(0), 2.0f64, 1.8f64), 0.5f64);
+  let spec_total = 512.0f64 * per_token * 2.0f64 / 1.8f64 + 4096.0f64 * per_token + 4096.0f64 * 35136.0f64 * 15.0f64;
+  failed += expect(close(request_bytes(sp, p.places.get(0)), spec_total, 0.000000001f64), "with speculation and a half-cached prompt a request moves fewer prompt bytes and more decode bytes per token");
+
+  // Two decode replicas, one on each leaf, serving 1.2 requests a second each behind the prefill replica
+  // on leaf 0: half of the cache stays on the leaf and half crosses.
+  let mut pq = new_plan(&f, &sv2);
+  let dc = Candidate { ok: 1, dep: one_node, batch: 100, step: 0.04f64, ttft: 0.0f64, rate: 100.0f64, cost_hr: 1.0f64, per_req: 0.0f64, xfer: 0.0f64, xnic: 0.0f64, xs: 0, xlat: 0.0f64 };
+  pq.members.push(0);
+  pq.places.push(Placement { svc: 0, role: 2, cand: dc, mstart: 0, mcount: 1, served: 1.2f64 });
+  pq.members.push(1);
+  pq.places.push(Placement { svc: 0, role: 2, cand: dc, mstart: 1, mcount: 1, served: 1.2f64 });
+  pq.members.push(2);
+  pq.places.push(Placement { svc: 0, role: 1, cand: c1, mstart: 2, mcount: 1, served: 2.4f64 });
+  let mut e5 = Vec<f64>::with_capacity(2);
+  let mut i5 = Vec<f64>::with_capacity(2);
+  leaf_traffic(&f, &sv2, &pq, &mut e5, &mut i5);
+  failed += expect(close(e5.get(0), cache / 2.0f64, 0.000000001f64) && close(i5.get(1), cache / 2.0f64, 0.000000001f64) && e5.get(1) == 0.0f64, "behind two decode replicas the cache is split by what each serves: half crosses");
+
+  // Three nodes, two on leaf 0 and one on leaf 1, serving as one group: 3 pairs of 9 cross each way, in
+  // the shares of their GPUs.
+  let mut h3 = new_fleet();
+  add_domain(&mut h3, hgx8(h200()), 0);
+  add_domain(&mut h3, hgx8(h200()), 0);
+  add_domain(&mut h3, hgx8(h200()), 1);
+  wire(&mut h3, 2.0f64);
+  let three = Deploy { sku: h200(), domains: 3, gpd: 8, dp: 1, cp: 1, wb: 1.0f64, kb: 1.0f64, cross: 25000000000.0f64, lat: 0.000006f64 };
+  let mut p3 = new_plan(&h3, &svcs);
+  let c3 = Candidate { ok: 1, dep: three, batch: 100, step: 0.04f64, ttft: 0.1f64, rate: 100.0f64, cost_hr: 1.0f64, per_req: 0.0f64, xfer: 0.0f64, xnic: 0.0f64, xs: 0, xlat: 0.0f64 };
+  p3.members.push(0);
+  p3.members.push(1);
+  p3.members.push(2);
+  p3.places.push(Placement { svc: 0, role: 0, cand: c3, mstart: 0, mcount: 3, served: 1.0f64 });
+  let mut e6 = Vec<f64>::with_capacity(2);
+  let mut i6 = Vec<f64>::with_capacity(2);
+  leaf_traffic(&h3, &svcs, &p3, &mut e6, &mut i6);
+  let t3 = request_bytes(svcs.get(0), p3.places.get(0));
+  failed += expect(close(e6.get(0), t3 * 2.0f64 / 9.0f64, 0.000000001f64) && close(e6.get(1), t3 * 2.0f64 / 9.0f64, 0.000000001f64) && close(i6.get(0), t3 * 2.0f64 / 9.0f64, 0.000000001f64), "of three equal nodes, two on a leaf: 2 of 9 of the bytes leave each leaf");
+
+  // The plan the scheduler makes for the pools (prefill on the B200 node, decode on an H200 node): the
+  // same flow, whatever leaves one leaf enters another.
+  let pf = pool_fleet();
+  let mut vp = Vec<Service>::with_capacity(1);
+  vp.push(pool_service(1));
+  let pl = schedule_in_order(&pf, &vp, &one_order());
+  let mut e4 = Vec<f64>::with_capacity(2);
+  let mut i4 = Vec<f64>::with_capacity(2);
+  leaf_traffic(&pf, &vp, &pl, &mut e4, &mut i4);
+  let se = e4.get(0) + e4.get(1);
+  let si = i4.get(0) + i4.get(1);
+  failed += expect(se > 0.0f64 && close(se, si, 0.000000001f64) && close(e4.get(0), cache, 0.000000001f64), "the scheduled pools send the cache of 2.4 prompts a second across, and it all arrives");
+  show("network", eg.get(0), cache, se);
+  return failed;
 }
 
 fn main() -> i32 {
@@ -702,6 +1373,11 @@ fn main() -> i32 {
   failed += test_fleet();
   failed += test_cost();
   failed += test_plan();
+  failed += test_pools();
+  failed += test_losses();
+  failed += test_headroom();
+  failed += test_spec();
+  failed += test_network();
   if failed == 0 {
     print!("ok\n");
   }

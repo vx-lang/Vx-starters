@@ -1,0 +1,112 @@
+// fleet-graph, network: the traffic a plan puts on the links between the leaf switches and the
+// spine, which every service shares. The planner prices a group's own traffic with the links it has
+// to itself (`group_bandwidth`); this adds up what all the placements send at once and compares it
+// with the capacity of each leaf's link to the spine.
+//
+// Per request, a placement moves:
+//   * a decode or co-located replica: the all-to-all of every MoE layer for each output token (a
+//     step moves the bytes of its `batch * t` tokens, and gives `batch * acc`);
+//   * a co-located or prefill replica: the all-to-all of the prompt's new tokens, and the gather of
+//     their cache between the GPUs of the group;
+//   * a prefill replica: the cache of the whole prompt, sent to the decode pool.
+// Bytes between the GPUs of a group are taken to be spread evenly over the pairs, so the flow from
+// one domain to another is the group's total times the share of GPUs each has. A flow between
+// domains on different leaves goes up through the sender's leaf link and down the receiver's. The
+// flows are scaled by the requests a second the placement serves.
+
+import core::convert;
+import core::num;
+import cost;
+import fleet;
+import graph;
+import hw;
+import model;
+import plan;
+import std::vec;
+
+fn fl(x : i32) -> f64 {
+  return f64::from(x);
+}
+
+// Adds a flow of `total` bytes a second from the domains `from` to the domains `to` (spread over
+// the pairs by their shares of GPUs) to the traffic of the leaves.
+fn add_flow(f : &Fleet, p : &Plan, from_start : i32, from_n : i32, to_start : i32, to_n : i32, total : f64, eg : &mut Vec<f64>, ing : &mut Vec<f64>) -> void {
+  let mut gf = 0;
+  for x in 0..from_n {
+    gf += f.ngpu.get(p.members.get(from_start + x));
+  }
+  let mut gt = 0;
+  for y in 0..to_n {
+    gt += f.ngpu.get(p.members.get(to_start + y));
+  }
+  for x in 0..from_n {
+    let a = p.members.get(from_start + x);
+    for y in 0..to_n {
+      let b = p.members.get(to_start + y);
+      if a != b && f.leaf.get(a) != f.leaf.get(b) {
+        let flow = total * fl(f.ngpu.get(a)) / fl(gf) * fl(f.ngpu.get(b)) / fl(gt);
+        eg.set(f.leaf.get(a), eg.get(f.leaf.get(a)) + flow);
+        ing.set(f.leaf.get(b), ing.get(f.leaf.get(b)) + flow);
+      }
+    }
+  }
+  return;
+}
+
+// Bytes between the GPUs of the placement's group for one request, in all, by the all-to-all and the
+// gather. Decode is for the `out` tokens at the placement's batch.
+pub fn request_bytes(s : Service, pl : Placement) -> f64 {
+  let c = pl.cand;
+  let d = c.dep;
+  let m = s.model;
+  let g = fl(gpus(d));
+  let mut total = 0.0f64;
+  if pl.role != 1 {
+    // decode: bytes of a step, over the tokens it gives
+    let step_bytes = fl(moe_layers(m)) * all_to_all_bytes(m, d, fl(c.batch) * s.spec_t) * g;
+    total = total + fl(s.out) * step_bytes / (fl(c.batch) * s.spec_acc);
+  }
+  if pl.role != 2 {
+    // prefill: the all-to-all of the new tokens and the gather of their cache
+    let fresh = fl(s.prompt) * (1.0f64 - s.hit);
+    total = total + fl(moe_layers(m)) * all_to_all_bytes(m, d, fresh) * g;
+    total = total + fresh * kv_elems(m) * d.kb * (g - 1.0f64);
+  }
+  return total;
+}
+
+// The traffic of each leaf to the spine and from it, bytes a second, under the plan.
+pub fn leaf_traffic(f : &Fleet, svcs : &Vec<Service>, p : &Plan, eg : &mut Vec<f64>, ing : &mut Vec<f64>) -> void {
+  for l in 0..f.leaves {
+    eg.push(0.0f64);
+    ing.push(0.0f64);
+  }
+  for i in 0..p.places.len() {
+    let pl = p.places.get(i);
+    let s = svcs.get(pl.svc);
+    // inside the group
+    add_flow(f, p, pl.mstart, pl.mcount, pl.mstart, pl.mcount, request_bytes(s, pl) * pl.served, eg, ing);
+    // the cache of a prefill replica to the decode pool, split by what each decode replica serves
+    if pl.role == 1 {
+      let mut pool = 0.0f64;
+      for j in 0..p.places.len() {
+        if p.places.get(j).svc == pl.svc && p.places.get(j).role == 2 {
+          pool = pool + p.places.get(j).served;
+        }
+      }
+      for j in 0..p.places.len() {
+        let q = p.places.get(j);
+        if q.svc == pl.svc && q.role == 2 {
+          let bytes = fl(s.prompt) * kv_elems(s.model) * pl.cand.dep.kb * pl.served * q.served / pool;
+          add_flow(f, p, pl.mstart, pl.mcount, q.mstart, q.mcount, bytes, eg, ing);
+        }
+      }
+    }
+  }
+  return;
+}
+
+// The capacity of a leaf's link to the spine, bytes a second in each direction.
+pub fn leaf_capacity(f : &Fleet, l : i32) -> f64 {
+  return f.wide.get((count(f) + l) * f.nv + (count(f) + f.leaves));
+}

@@ -1,0 +1,248 @@
+// fleet-graph, emit: what the planner believes, as lines for the compiler to check. Run by
+// build.sh and read by admit.py, which writes a Vx program for each line, compiles it against the
+// machine file of the SKU, and compares the compiler's verdict and byte counts with these.
+//
+//   policy <fraction>
+//        the part of HBM a deployment may use (cost.vx), which admit.py reserves in each program.
+//   hw <name> <hbm bytes> <nic bytes/s> <nvlink bytes/s> <gpus in a node> <fp8 cores 0/1>
+//        the hardware table of hw.vx; admit.py writes a machine file for a node from it.
+//   fit <tag> <sku> <weights bytes> <weight format bytes> <cache bytes> <cache format bytes> <expect>
+//        the resident set of one GPU for a layout and a batch: `expect` is `admitted` if
+//        cost.vx's `fits` says it fits (weights and cache within 90% of HBM), `rejected` if not.
+//   wire <tag> <sender sku> <receiver sku> <bytes per stream> <seconds>
+//        the cache of a prompt sent from one GPU to a GPU of another node: the planner's time
+//        for the wire (`kv_transfer` without latency).
+//
+// The cells are a sweep over layouts (SKU, domains, attention, context parallelism, formats,
+// context) taking the largest batch that fits and the next one, and the placements of the pools
+// scenario of test.vx.
+
+import core::convert;
+import core::num;
+import cost;
+import fleet;
+import hw;
+import model;
+import plan;
+import std::vec;
+
+fn print_hw(s : Sku, gpus : i32) -> void {
+  print!("hw ");
+  print!(s.name);
+  print!(" ");
+  print!(s.hbm);
+  print!(" ");
+  print!(s.nic);
+  print!(" ");
+  print!(s.nvlink);
+  print!(" ");
+  print!(gpus);
+  print!(" ");
+  let mut has8 = 0;
+  if s.fp8 > 0.0f64 {
+    has8 = 1;
+  }
+  print!(has8);
+  print!("\n");
+  return;
+}
+
+// The largest batch up to 4096 that fits; 0 if not even one.
+fn largest_fit(m : Model, d : Deploy, s : i32) -> i32 {
+  if !fits(m, d, 1, s) {
+    return 0;
+  }
+  let mut lo = 1;
+  let mut hi = 4097;
+  while hi - lo > 1 {
+    let mid = (lo + hi) / 2;
+    if fits(m, d, mid, s) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
+fn print_fit(tag : i32, m : Model, d : Deploy, b : i32, s : i32) -> void {
+  print!("fit ");
+  print!(tag);
+  print!(" ");
+  print!(d.sku.name);
+  print!(" ");
+  print!(weight_bytes(m, d));
+  print!(" ");
+  print!(d.wb);
+  print!(" ");
+  print!(kv_bytes(m, d, b, s));
+  print!(" ");
+  print!(d.kb);
+  print!(" ");
+  if fits(m, d, b, s) {
+    print!("admitted");
+  } else {
+    print!("rejected");
+  }
+  print!("\n");
+  return;
+}
+
+// The placements of a plan: the resident set of a GPU of each, at the batch it was priced at (a
+// prefill replica holds one prompt), and for a prefill replica the wire of its cache transfer.
+fn emit_plan(base : i32, svcs : &Vec<Service>, p : &Plan) -> void {
+  for i in 0..p.places.len() {
+    let pl = p.places.get(i);
+    let c = pl.cand;
+    let s = svcs.get(pl.svc);
+    let mut b = c.batch;
+    let mut ctx = s.prompt + s.out;
+    if pl.role == 1 {
+      b = 1;
+      ctx = s.prompt;
+    }
+    print_fit(base + i, s.model, c.dep, b, ctx);
+    if pl.role == 1 {
+      // the receiving side: the first decode replica of the service
+      let mut recv = c.dep.sku;
+      for j in 0..p.places.len() {
+        if p.places.get(j).role == 2 && p.places.get(j).svc == pl.svc {
+          recv = p.places.get(j).cand.dep.sku;
+        }
+      }
+      let streams = if gpus(c.dep) < c.xs { gpus(c.dep) } else { c.xs };
+      let nic = if c.dep.sku.nic < c.xnic { c.dep.sku.nic } else { c.xnic };
+      print!("wire ");
+      print!(base + i);
+      print!(" ");
+      print!(c.dep.sku.name);
+      print!(" ");
+      print!(recv.name);
+      print!(" ");
+      print!(f64::from(s.prompt) * kv_elems(s.model) * c.dep.kb / f64::from(streams));
+      print!(" ");
+      print!(c.xfer - c.xlat);
+      print!("\n");
+    }
+  }
+  return;
+}
+
+fn main() -> i32 {
+  // The serving policy: the part of HBM a deployment may use. The machine files describe the
+  // hardware and leave this to the admission program.
+  print!("policy ");
+  print!(usable());
+  print!("\n");
+  print_hw(a100_80(), 8);
+  print_hw(h200(), 8);
+  print_hw(b200(), 8);
+  print_hw(b200(), 72);
+  let skus = 3;
+  let mut tag = 0;
+  let mut seq = 0;
+  for k in 0..skus {
+    let mut sku = a100_80();
+    if k == 1 { sku = h200(); }
+    if k == 2 { sku = b200(); }
+    for mi in 0..2 {
+      let m = if mi == 0 { deepseek_v3() } else { glm_4_5() };
+      for shape in 0..4 {
+        let mut domains = 1 + shape;
+        let mut gpd = 8;
+        if shape == 3 {
+          // the rack, for B200 only
+          domains = 1;
+          gpd = 72;
+        }
+        if shape < 3 || k == 2 {
+          for dp in 0..2 {
+            for cpi in 0..2 {
+              for wi in 0..2 {
+                for ki in 0..2 {
+                  for ci in 0..2 {
+                    seq += 1;
+                    // every 5th combination, so the sweep takes a minute and not an hour
+                    if seq % 5 == 0 {
+                      let cp = if cpi == 0 { 1 } else { 4 };
+                      let wb = if wi == 0 { 2.0f64 } else { 1.0f64 };
+                      let kb = if ki == 0 { 2.0f64 } else { 1.0f64 };
+                      let s = if ci == 0 { 8192 } else { 262144 };
+                      let dep = Deploy { sku: sku, domains: domains, gpd: gpd, dp: dp, cp: cp, wb: wb, kb: kb, cross: 0.0f64, lat: 0.0f64 };
+                      let b = largest_fit(m, dep, s);
+                      if b == 0 {
+                        tag += 1;
+                        print_fit(tag, m, dep, 1, s);
+                      } else {
+                        tag += 1;
+                        print_fit(tag, m, dep, b, s);
+                        if b < 4096 {
+                          tag += 1;
+                          print_fit(tag, m, dep, b + 1, s);
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  // The cache of a prompt sent from a GPU of one node to a GPU of another, over `streams` GPUs in
+  // parallel. The planner's time is for the wire: the slower NIC of the two sides. admit.py has
+  // the compiler price the same bytes over the NIC hop of a node machine file.
+  for p in 0..6 {
+    let mut a = b200();
+    let mut b = h200();
+    let mut ga = 8;
+    let mut gb = 8;
+    if p == 1 { a = h200(); b = b200(); }
+    if p == 2 { a = a100_80(); b = h200(); }
+    if p == 3 { a = b200(); b = a100_80(); }
+    if p == 4 { a = b200(); b = b200(); ga = 72; gb = 8; }
+    if p == 5 { a = h200(); b = h200(); }
+    let mut streams = ga;
+    if gb < ga { streams = gb; }
+    let nic = if a.nic < b.nic { a.nic } else { b.nic };
+    for q in 0..3 {
+      let prompt = 8192 << (2 * q);
+      let mut kb = 1.0f64;
+      if q == 1 { kb = 2.0f64; }
+      let s2 = make_service(deepseek_v3(), 1.0f64, prompt, 512, 0.05f64, 5.0f64, 1.0f64, 1, 1024);
+      print!("wire ");
+      print!(p * 3 + q);
+      print!(" ");
+      print!(a.name);
+      print!(" ");
+      print!(b.name);
+      print!(" ");
+      print!(f64::from(prompt) * kv_elems(deepseek_v3()) * kb / f64::from(streams));
+      print!(" ");
+      print!(kv_transfer(s2, kb, nic, streams, 0.0f64));
+      print!("\n");
+    }
+  }
+  // The plans of the scenarios: the mixed fleet and the pools.
+  let mut mixed = new_fleet();
+  add_domain(&mut mixed, nvl72(b200()), 0);
+  for i in 0..4 { add_domain(&mut mixed, hgx8(h200()), 1); }
+  for i in 0..8 { add_domain(&mut mixed, hgx8(a100_80()), 2); }
+  wire(&mut mixed, 2.0f64);
+  let mut two = Vec<Service>::with_capacity(2);
+  two.push(make_service(deepseek_v3(), 20.0f64, 8192, 1024, 0.05f64, 5.0f64, 1.0f64, 1, 1024));
+  two.push(make_service(glm_4_5(), 10.0f64, 32768, 512, 0.05f64, 10.0f64, 2.0f64, 0, 1024));
+  emit_plan(1000, &two, &schedule(&mixed, &two));
+  let mut pools = new_fleet();
+  add_domain(&mut pools, hgx8(b200()), 0);
+  for i in 0..4 { add_domain(&mut pools, hgx8(h200()), 1); }
+  wire(&mut pools, 2.0f64);
+  let mut one = Vec<Service>::with_capacity(1);
+  one.push(with_mode(make_service(deepseek_v3(), 2.4f64, 32768, 512, 0.06f64, 0.5f64, 1.0f64, 1, 1024), 1));
+  let mut order = Vec<i32>::with_capacity(1);
+  order.push(0);
+  emit_plan(2000, &one, &schedule_in_order(&pools, &one, &order));
+  return 0;
+}

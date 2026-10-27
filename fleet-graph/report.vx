@@ -1,0 +1,351 @@
+// fleet-graph, report: a plan as text a person can read, and what happens to it when a part of the
+// fleet goes down.
+
+import core::convert;
+import core::num;
+import cost;
+import fleet;
+import hw;
+import model;
+import network;
+import plan;
+import std::vec;
+
+fn fl(x : i32) -> f64 {
+  return f64::from(x);
+}
+
+// Prints x with d decimals (x rounded, not cut).
+pub fn print_f(x : f64, d : i32) -> void {
+  let mut scale = 1;
+  for i in 0..d {
+    scale = scale * 10;
+  }
+  let mut v = x;
+  if x < 0.0f64 {
+    print!("-");
+    v = 0.0f64 - x;
+  }
+  let scaled = (v * fl(scale) + 0.5f64) as i64;
+  let whole = scaled / (scale as i64);
+  let mut frac = scaled % (scale as i64);
+  print!(whole);
+  if d > 0 {
+    print!(".");
+    let mut div = scale / 10;
+    while div >= 1 {
+      let digit = frac / (div as i64);
+      print!(digit);
+      frac = frac % (div as i64);
+      div = div / 10;
+    }
+  }
+  return;
+}
+
+// A rate in requests a second, with enough decimals for a small one to show.
+fn print_rate(x : f64) -> void {
+  if x < 0.1f64 {
+    print_f(x, 4);
+  } else {
+    print_f(x, 2);
+  }
+  return;
+}
+
+fn role_name(role : i32) -> *const i8 {
+  if role == 1 {
+    return "prefill";
+  }
+  if role == 2 {
+    return "decode ";
+  }
+  return "both   ";
+}
+
+// One line for each service: what was asked, what was placed, and what it costs.
+fn print_services(svcs : &Vec<Service>, p : &Plan) -> void {
+  print!("services (requests a second; cost in units an hour)\n");
+  for k in 0..svcs.len() {
+    let s = svcs.get(k);
+    let mut cost_hr = 0.0f64;
+    let mut gpus_used = 0;
+    for i in 0..p.places.len() {
+      let pl = p.places.get(i);
+      if pl.svc == k {
+        cost_hr = cost_hr + pl.cand.cost_hr;
+        gpus_used = gpus_used + gpus(pl.cand.dep);
+      }
+    }
+    print!("  ");
+    print!(s.name);
+    print!(": ");
+    print!(s.model.name);
+    print!(", ");
+    print!(s.prompt);
+    print!(" + ");
+    print!(s.out);
+    print!(" tokens, ");
+    print_rate(s.qps);
+    print!(" asked, ");
+    print_rate(s.qps - p.unmet.get(k));
+    print!(" served (");
+    print_f(100.0f64 * p.unmet.get(k) / s.qps, 0);
+    print!("% unmet), ");
+    print!(gpus_used);
+    print!(" GPUs, ");
+    print_f(cost_hr, 0);
+    print!("\n");
+  }
+  return;
+}
+
+// One line for each placement: where, how it is split, and how it performs.
+fn print_placements(f : &Fleet, svcs : &Vec<Service>, p : &Plan) -> void {
+  print!("placements\n");
+  for i in 0..p.places.len() {
+    let pl = p.places.get(i);
+    let c = pl.cand;
+    let s = svcs.get(pl.svc);
+    let d = c.dep;
+    print!("  ");
+    print!(s.name);
+    print!(" ");
+    print!(role_name(pl.role));
+    print!(" ");
+    print!(d.sku.name);
+    print!(" x");
+    print!(pl.mcount);
+    print!(" of ");
+    print!(d.gpd);
+    print!(" (domains");
+    for x in 0..pl.mcount {
+      print!(" ");
+      print!(p.members.get(pl.mstart + x));
+    }
+    print!("), attention ");
+    if d.dp == 1 {
+      print!("data parallel");
+    } else {
+      print!("tensor parallel");
+    }
+    print!(", context split ");
+    print!(d.cp);
+    print!(", weights ");
+    print_f(d.wb, 0);
+    print!("B, cache ");
+    print_f(d.kb, 0);
+    print!("B");
+    if pl.role != 1 {
+      print!(", batch ");
+      print!(c.batch);
+      print!(", ");
+      print_f(c.step * 1000.0f64, 1);
+      print!(" ms a token");
+    }
+    if pl.role != 2 {
+      print!(", first token ");
+      print_f(c.ttft, 2);
+      print!(" s");
+    }
+    let mut ctx = s.prompt + s.out;
+    let mut b = c.batch;
+    if pl.role == 1 {
+      ctx = s.prompt;
+      b = 1;
+    }
+    print!(", HBM ");
+    print_f(100.0f64 * (weight_bytes(s.model, d) + kv_bytes(s.model, d, b, ctx)) / d.sku.hbm, 0);
+    print!("%, ");
+    print_rate(pl.served);
+    print!(" of ");
+    print_rate(c.rate);
+    print!(" a second\n");
+  }
+  return;
+}
+
+// What is in the fleet and how much of it the plan uses: one line for each class of domain.
+fn print_fleet(f : &Fleet, p : &Plan) -> void {
+  print!("fleet\n");
+  for i in 0..count(f) {
+    if class_number(f, i) == i {
+      let d = domain(f, i);
+      let mut n = 0;
+      let mut free = 0;
+      for j in 0..count(f) {
+        if class_number(f, j) == i {
+          n += 1;
+          free += p.free.get(j);
+        }
+      }
+      print!("  ");
+      print!(d.sku.name);
+      print!(" x");
+      print!(d.gpus);
+      print!(": ");
+      print!(n);
+      print!(" domains (");
+      print!(n * d.gpus);
+      print!(" GPUs), ");
+      print!(n - free);
+      print!(" in use, ");
+      print!(free);
+      print!(" free\n");
+    }
+  }
+  print!("  spend ");
+  print_f(spend(p), 0);
+  print!(" an hour\n");
+  return;
+}
+
+pub fn print_report(f : &Fleet, svcs : &Vec<Service>, p : &Plan) -> void {
+  print_services(svcs, p);
+  print_placements(f, svcs, p);
+  print_fleet(f, p);
+  return;
+}
+
+// One line for a set of domains lost: the services are placed again in the same order on the fleet
+// without them, and the unmet share and the cost are compared with the plan's.
+fn print_loss_line(f : &Fleet, svcs : &Vec<Service>, base : &Plan, order : &Vec<i32>, down : &Vec<i32>) -> f64 {
+  let q = schedule_down_in_order(f, svcs, order, down);
+  let sh = shortfall(svcs, &q);
+  print!("    ");
+  if sh > shortfall(svcs, base) + 0.000000001f64 {
+    print_f(sh - shortfall(svcs, base), 2);
+    print!(" of a service more unmet");
+  } else {
+    print!("everything is still served");
+  }
+  print!(", ");
+  if spend(&q) >= spend(base) {
+    print_f(spend(&q) - spend(base), 0);
+    print!(" an hour more\n");
+  } else {
+    print_f(spend(base) - spend(&q), 0);
+    print!(" an hour less\n");
+  }
+  return sh;
+}
+
+// What the plan becomes if a part of the fleet is lost, one domain at a time (only those in use matter)
+// and one leaf switch at a time. The worst of each is shown.
+pub fn print_losses(f : &Fleet, svcs : &Vec<Service>, base : &Plan) -> void {
+  let order = demand_order(f, svcs);
+  print!("losses (the services placed again, in the same order)\n");
+  let mut worst = 0 - 1;
+  let mut worst_short = 0.0f64 - 1.0f64;
+  let mut hurt = 0;
+  let mut tried = 0;
+  for i in 0..count(f) {
+    if base.free.get(i) == 0 {
+      let mut down = Vec<i32>::with_capacity(1);
+      down.push(i);
+      let q = schedule_down_in_order(f, svcs, &order, &down);
+      let sh = shortfall(svcs, &q);
+      tried += 1;
+      if sh > shortfall(svcs, base) + 0.000000001f64 {
+        hurt += 1;
+      }
+      if sh > worst_short {
+        worst_short = sh;
+        worst = i;
+      }
+    }
+  }
+  print!("  a domain in use (");
+  print!(tried);
+  print!(" tried): ");
+  print!(hurt);
+  print!(" leave something unmet\n");
+  if worst >= 0 {
+    let mut down = Vec<i32>::with_capacity(1);
+    down.push(worst);
+    print!("  the worst, domain ");
+    print!(worst);
+    print!(" (");
+    print!(domain(f, worst).sku.name);
+    print!(" x");
+    print!(domain(f, worst).gpus);
+    print!("):\n");
+    print_loss_line(f, svcs, base, &order, &down);
+  }
+  let mut worst_leaf = 0 - 1;
+  let mut worst_leaf_short = 0.0f64 - 1.0f64;
+  for l in 0..f.leaves {
+    let mut down = Vec<i32>::with_capacity(8);
+    for i in 0..count(f) {
+      if f.leaf.get(i) == l {
+        down.push(i);
+      }
+    }
+    let q = schedule_down_in_order(f, svcs, &order, &down);
+    let sh = shortfall(svcs, &q);
+    if sh > worst_leaf_short {
+      worst_leaf_short = sh;
+      worst_leaf = l;
+    }
+  }
+  let mut down = Vec<i32>::with_capacity(8);
+  for i in 0..count(f) {
+    if f.leaf.get(i) == worst_leaf {
+      down.push(i);
+    }
+  }
+  print!("  the worst leaf switch, ");
+  print!(worst_leaf);
+  print!(" (");
+  print!(down.len());
+  print!(" domains):\n");
+  print_loss_line(f, svcs, base, &order, &down);
+  return;
+}
+
+// How much more load the fleet carries before something goes unmet (or how much of it, below 1).
+pub fn print_headroom(f : &Fleet, svcs : &Vec<Service>) -> void {
+  let order = demand_order(f, svcs);
+  let h = headroom(f, svcs, &order);
+  print!("headroom: ");
+  print_f(h, 2);
+  if h >= 1.0f64 {
+    print!(" times this load before something goes unmet\n");
+  } else {
+    print!(" of this load is met; above that something goes unmet\n");
+  }
+  return;
+}
+
+// The traffic of the leaf switches to the spine, against the capacity of each link.
+pub fn print_network(f : &Fleet, svcs : &Vec<Service>, p : &Plan) -> void {
+  let mut eg = Vec<f64>::with_capacity(f.leaves);
+  let mut ing = Vec<f64>::with_capacity(f.leaves);
+  leaf_traffic(f, svcs, p, &mut eg, &mut ing);
+  print!("network (GB a second between a leaf switch and the spine)\n");
+  let mut busiest = 0.0f64;
+  for l in 0..f.leaves {
+    let cap = leaf_capacity(f, l);
+    let load = eg.get(l).max(ing.get(l));
+    if load > 0.0f64 {
+      print!("  leaf ");
+      print!(l);
+      print!(": ");
+      print_f(eg.get(l) / 1000000000.0f64, 2);
+      print!(" out, ");
+      print_f(ing.get(l) / 1000000000.0f64, 2);
+      print!(" in, of ");
+      print_f(cap / 1000000000.0f64, 0);
+      print!(" (");
+      print_f(100.0f64 * load / cap, 0);
+      print!("%)\n");
+    }
+    if load / cap > busiest {
+      busiest = load / cap;
+    }
+  }
+  if busiest == 0.0f64 {
+    print!("  nothing crosses to the spine\n");
+  }
+  return;
+}
