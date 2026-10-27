@@ -218,11 +218,14 @@ monotone, so this is the boundary of one search, not a promise for every placeme
 ### What to buy
 
 `examples/procure.vx` runs the planner over a grid of fleets (0 to 2 NVL72 racks, 0 to 12 H200 nodes,
-0 to 24 A100 nodes) for four services (the chat services, the long documents, the agents) and prints a
-line for each: the price (the hourly cost of all its GPUs, used or not) and the unmet share. Of the 26
-fleets, six carry the load. The cheapest is one rack, twelve H200 nodes and twenty-four A100 nodes, 720 an hour. Before speculation
-and the prefix cache were in the model the cheapest was two racks and twelve H200 nodes, 816 an hour, and
-the A100 nodes were of no use; with them, the A100 nodes carry the chat decode and a rack is saved.
+0 to 12 H100 nodes, 0 to 24 A100 nodes) for four services (the chat services, the long documents, the
+agents) and prints a line for each: the price (the hourly cost of all its GPUs, used or not) and the
+unmet share. The cheapest fleet that carries the load is one rack, twelve H200 nodes and six H100
+nodes, 624 an hour. Without H100 in the grid it was one rack, twelve H200 nodes and twenty-four A100
+nodes, 720; before speculation and the prefix cache were in the model, two racks and twelve H200
+nodes, 816. The H100 cost (2.0, against 2.5 for an H200 and 1.0 for an A100) is a placeholder, so the
+choice of H100 over A100 here is the answer to that number as much as to the planner: put your own
+prices in before reading it as advice.
 `check_procure.py` works the prices out again and
 checks that no cheaper fleet of the table carries the load. The grid is coarse and the services are
 placed in one order; it is a way to see where the money goes, not an optimizer.
