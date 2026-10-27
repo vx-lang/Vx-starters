@@ -1,0 +1,122 @@
+// Does pipeline parallelism help decode? The same DeepSeek-V3 on N nodes of one SKU, two ways:
+//
+//   ep    experts spread over all 8N GPUs; the all-to-all crosses the network (cost.vx);
+//   pipe  N stages of one node each; the all-to-all stays on NVLink, hidden states cross the
+//         network between stages (pipeline.vx), the batch cut into microbatches.
+//
+// For each, the batch (a multiple of 16 up to 8192) that gives the most tokens a second while a
+// token takes at most the SLO. Weights and cache are fp8 (int8 on A100).
+//
+//   vxc -a run-jit examples/pipeline.vx
+//
+// Nothing is measured: the efficiency factors of cost.vx are guesses (see the README).
+
+import core::convert;
+import core::num;
+import cost;
+import hw;
+import model;
+import pipeline;
+import report;
+
+fn node(sku : Sku, nodes : i32) -> Deploy {
+  let mut cross = 0.0f64;
+  let mut lat = 0.0f64;
+  if nodes > 1 {
+    cross = sku.nic;
+    lat = 0.000006f64;
+  }
+  return Deploy { sku: sku, domains: nodes, gpd: 8, dp: 1, cp: 1, wb: 1.0f64, kb: 1.0f64, cross: cross, lat: lat };
+}
+
+fn with_nic(s : Sku, nic : f64) -> Sku {
+  return Sku { name: s.name, hbm: s.hbm, hbm_bw: s.hbm_bw, bf16: s.bf16, fp8: s.fp8, nvlink: s.nvlink, nic: nic, cost: s.cost };
+}
+
+fn run(sku : Sku, nodes : i32, ctx : i32, slo : f64) -> void {
+  let m = deepseek_v3();
+  let ep = node(sku, nodes);
+  let stage = node(sku, 1);
+  // The cross link of a stage's send is the node's NIC.
+  let link = Deploy { sku: sku, domains: 1, gpd: 8, dp: 1, cp: 1, wb: 1.0f64, kb: 1.0f64, cross: sku.nic, lat: 0.000006f64 };
+  let mut ep_b = 0;
+  let mut ep_tps = 0.0f64;
+  let mut ep_t = 0.0f64;
+  let mut pp_b = 0;
+  let mut pp_m = 0;
+  let mut pp_tps = 0.0f64;
+  let mut pp_t = 0.0f64;
+  for i in 1..513 {
+    let b = i * 16;
+    if fits(m, ep, b, ctx) {
+      let t = decode_step(m, ep, b, ctx);
+      if t <= slo && f64::from(b) / t > ep_tps {
+        ep_b = b;
+        ep_tps = f64::from(b) / t;
+        ep_t = t;
+      }
+    }
+    if pp_fits(m, stage, nodes, b, ctx) {
+      for k in 0..7 {
+        let micro = 1 << k;
+        if micro <= b {
+          let t = pp_tpot(m, link, nodes, micro, b, ctx, 1.0f64);
+          if t <= slo && f64::from(b) / t > pp_tps {
+            pp_b = b;
+            pp_m = micro;
+            pp_tps = f64::from(b) / t;
+            pp_t = t;
+          }
+        }
+      }
+    }
+  }
+  print!("pp ");
+  print!(sku.name);
+  print!(" ");
+  print_f(sku.nic / 1000000000.0f64, 1);
+  print!(" ");
+  print!(nodes);
+  print!(" ");
+  print!(ctx);
+  print!(" ep ");
+  print!(ep_b);
+  print!(" ");
+  print_f(ep_t, 5);
+  print!(" ");
+  print_f(ep_tps, 1);
+  print!(" pipe ");
+  print!(pp_b);
+  print!(" ");
+  print!(pp_m);
+  print!(" ");
+  print_f(pp_t, 5);
+  print!(" ");
+  print_f(pp_tps, 1);
+  print!("\n");
+  return;
+}
+
+fn main() -> i32 {
+  print!("pp <sku> <nic GB/s> <nodes> <context> ep <batch> <token s> <tokens/s> pipe <batch> <microbatches> <token s> <tokens/s>\n");
+  let slo = 0.05f64;
+  for n in 2..5 {
+    if n != 3 {
+      run(h100(), n, 8192, slo);
+      run(h100(), n, 32768, slo);
+      run(h200(), n, 8192, slo);
+      run(h200(), n, 32768, slo);
+      run(a100_80(), n, 8192, slo);
+      run(a100_80(), n, 32768, slo);
+    }
+  }
+  // How much the answer depends on the network: two nodes, 8k context, the NIC of a GPU from
+  // 100 Gb/s to 1.6 Tb/s.
+  print!("network sweep\n");
+  for k in 0..5 {
+    let nic = 12500000000.0f64 * f64::from(1 << k);
+    run(with_nic(h100(), nic), 2, 8192, slo);
+    run(with_nic(h200(), nic), 2, 8192, slo);
+  }
+  return 0;
+}

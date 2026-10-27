@@ -13,6 +13,7 @@ TERA, GIGA = 1e12, 1e9
 # name: (hbm, hbm_bw, bf16, fp8, nvlink, nic)
 SKU = {
     "A100-80": (80 * GIB, 2.039 * TERA, 312 * TERA, 0.0, 300 * GIGA, 25 * GIGA),
+    "H100": (80 * GIB, 3.35 * TERA, 989 * TERA, 1979 * TERA, 450 * GIGA, 50 * GIGA),
     "H200": (141 * GIB, 4.8 * TERA, 989 * TERA, 1979 * TERA, 450 * GIGA, 50 * GIGA),
     "B200": (183359 * 1048576.0, 7.7 * TERA, 2250 * TERA, 4500 * TERA, 900 * GIGA, 50 * GIGA),
     "toy": (1e30, 1e12, 1e30, 0.0, 1e30, 1e30),
@@ -201,6 +202,20 @@ want["cost_cp8"] = [kv_bytes(DS, cut, 18, 1000000), decode_step(DS, cut, 18, 200
 
 
 want["cost_spec"] = [decode_step(GLM, tg, 32, 8192, 2.0), decode_step(DS, cut, 18, 200000, 2.0), prefill_time(GLM, tg, 8192, 0.25)]
+
+
+def pp_send(m, d, mb, t):
+    return mb * t * m.hidden * 2.0 / d.g / (d.cross * COMM_EFF) + d.lat
+
+
+def pp_tpot(m, d, pp, micro, b, s, t=1.0):
+    mb = -(-b // micro)
+    return max(micro, pp) * (decode_step(m, d, mb, s, t) / pp + pp_send(m, d, mb, t))
+
+
+h200n = Dep("H200", 1, 8, 1, 1, 1.0, 1.0, 50e9, 6e-6)
+h100n = Dep("H100", 1, 8, 1, 1, 1.0, 1.0, 50e9, 6e-6)
+want["pipeline"] = [pp_tpot(DS, h200n, 2, 4, 1024, 8192), pp_tpot(DS, h100n, 4, 2, 512, 32768, 2.0), pp_send(DS, h100n, 33, 2.0)]
 
 
 def close(a, b):
