@@ -23,11 +23,13 @@ Plain host code: no GPU and no CUDA. Every figure is an estimate (see *What it i
 
 | File | What it holds |
 | --- | --- |
-| `hw.vx` | `Sku` (A100-40, A100-80, H200, B200: HBM size and bandwidth, bf16 and fp8 FLOP/s, NVLink and NIC rate per GPU, a relative cost) and `Domain` (a node or rack on one NVLink fabric: `hgx8(sku)`, `nvl72(sku)`) |
+| `hw.vx` | `Sku` (A100-40, A100-80, H100, H200, B200: HBM size and bandwidth, bf16 and fp8 FLOP/s, NVLink and NIC rate per GPU, a relative cost) and `Domain` (a node or rack on one NVLink fabric: `hgx8(sku)`, `nvl72(sku)`) |
 | `graph.vx` | An undirected graph with a bandwidth and a latency on each edge; `widest` (the largest bottleneck over all paths) and `fastest` (least total latency), both Floyd-Warshall |
 | `fleet.vx` | A fleet: a vertex for each domain, one leaf switch for each group of domains, one spine, with the leaf-to-spine links cut by an oversubscription factor. `group_bandwidth` and `group_latency` of a set of domains read off the graph, with a leaf link shared by the members under it; `pick_group` chooses domains of one class that are as close as the graph allows |
 | `model.vx` | `Model`: layers, dense layers, hidden size, MLA or GQA attention, experts. Parameter counts, KV size of a token, and the attention FLOPs of a query-key pair all follow from those fields. `deepseek_v3()` and `glm_4_5()` |
 | `cost.vx` | `Deploy`: a group of whole domains, attention data or tensor parallel, a context-parallel degree, number formats. `fits`, `decode_step` and `prefill_time` |
+| `pipeline.vx`, `examples/pipeline.vx` | Decode with pipeline parallelism, as an experiment next to `cost.vx` (below): stages of one node each, microbatches, the send between stages; the table of tokens a second against experts spread across the network |
+| `measure/` | `measure.py` times the primitives `cost.vx` prices (HBM copy, matmul, all-to-all, point to point) on real GPUs; `calibrate.py` turns its lines into the factors to change. Not yet run on a GPU |
 | `network.vx` | The traffic a plan puts on the links between the leaf switches and the spine, which all services share: the all-to-all, the cache gather and the cache handoff, against each leaf link's capacity |
 | `report.vx`, `examples/datacenter.vx`, `examples/procure.vx` | A plan as text (services, placements, fleet use) and what losing a domain or a leaf switch does to it, and the headroom; a whole datacenter in one program, and the cheapest fleet that carries a load (below) |
 | `emit.vx`, `admit.py` | The bridge to the compiler (below): what the planner believes, printed as lines, and a Vx program for each, compiled against the machine files of the toolchain |
@@ -230,6 +232,36 @@ prices in before reading it as advice.
 checks that no cheaper fleet of the table carries the load. The grid is coarse and the services are
 placed in one order; it is a way to see where the money goes, not an optimizer.
 
+## Does pipeline parallelism help decode?
+
+`pipeline.vx` prices the other way to use two or more nodes: `pp` stages, each a node with the experts
+of its layers spread inside it (so the all-to-all stays on NVLink), the hidden states crossing the
+network between stages, and the batch cut into `m` microbatches that follow each other. A stage reads
+its weights again for each microbatch, which is what costs in a step bound by memory, and a sequence
+gets a token after `max(m, pp)` rounds of a stage and a send. Pipelining never shortens a token. What
+can change is the tokens a second at a given target for the token.
+
+`examples/pipeline.vx` takes DeepSeek-V3 in fp8 on 2 and 4 nodes, a target of 50 ms a token, and
+finds the batch that gives the most tokens a second for each way. What the model says (nothing here
+is measured; cost.vx's factors are guesses):
+
+* **H100, 50 GB/s of NIC for a GPU (400 Gb/s): experts across the network win**, by 23% at 8k context and
+  by 20% at 32k, on 2 nodes. The pipeline wins only below about 25 GB/s a GPU, where the all-to-all
+  becomes the bottleneck (by 75% at 12.5 GB/s).
+* **H200: the pipeline wins at every network speed of the sweep**, by 40% at 8k and 15% at 32k on 2
+  nodes, and by 4% even at 200 GB/s. Part of the win has nothing to do with the network: with
+  data-parallel attention every GPU reads the same attention weights each step, and a stage reads half
+  of them.
+* **A100: the pipeline loses** (a 5-times lower rate), the weights being read again for each microbatch
+  against 2 TB/s of HBM.
+
+So on H100 the model's answer is "no, unless the network is slow", and the question for hardware is
+the number it cannot know: the effective rate of an all-to-all across nodes. `measure/` measures it
+(`a2a_world`), and `calibrate.py` turns it into the `comm_eff` for the network. If the measured rate is
+below the crossover, pipeline parallelism is worth building in the planner; if not, it is not. The
+planner does not use `pipeline.vx` yet, and prefill is not modelled (it pipelines without the
+re-read of weights, so it favors the pipeline more).
+
 ## What the tests check
 
 `test.vx` returns the number of failed checks and prints `ok` when there are none.
@@ -335,8 +367,7 @@ less sensitive to them than the throughput of either.
   (with a conversion), or a rebalance after the fact. The transfer is priced as the cache over the
   NICs of one replica; the spine, shared by all the services at once, is not.
 * **No queueing.** A service is a steady rate, with no bursts and no waiting.
-* **Missing:** pipeline parallelism, speculative
-  decoding and prefix caching.
+* **Missing:** pipeline parallelism in the planner (only the experiment above).
 
 ## Toolchain
 

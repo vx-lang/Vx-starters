@@ -204,6 +204,20 @@ want["cost_cp8"] = [kv_bytes(DS, cut, 18, 1000000), decode_step(DS, cut, 18, 200
 want["cost_spec"] = [decode_step(GLM, tg, 32, 8192, 2.0), decode_step(DS, cut, 18, 200000, 2.0), prefill_time(GLM, tg, 8192, 0.25)]
 
 
+def pp_send(m, d, mb, t):
+    return mb * t * m.hidden * 2.0 / d.g / (d.cross * COMM_EFF) + d.lat
+
+
+def pp_tpot(m, d, pp, micro, b, s, t=1.0):
+    mb = -(-b // micro)
+    return max(micro, pp) * (decode_step(m, d, mb, s, t) / pp + pp_send(m, d, mb, t))
+
+
+h200n = Dep("H200", 1, 8, 1, 1, 1.0, 1.0, 50e9, 6e-6)
+h100n = Dep("H100", 1, 8, 1, 1, 1.0, 1.0, 50e9, 6e-6)
+want["pipeline"] = [pp_tpot(DS, h200n, 2, 4, 1024, 8192), pp_tpot(DS, h100n, 4, 2, 512, 32768, 2.0), pp_send(DS, h100n, 33, 2.0)]
+
+
 def close(a, b):
     return abs(a - b) <= 1e-9 * max(abs(a), abs(b), 1e-300)
 
