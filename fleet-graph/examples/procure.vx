@@ -17,7 +17,7 @@ import plan;
 import report;
 import std::vec;
 
-fn build(racks : i32, h200s : i32, a100s : i32) -> Fleet {
+fn build(racks : i32, h200s : i32, h100s : i32, a100s : i32) -> Fleet {
   let mut f = new_fleet();
   let mut leaf = 0;
   for i in 0..racks {
@@ -28,6 +28,10 @@ fn build(racks : i32, h200s : i32, a100s : i32) -> Fleet {
     add_domain(&mut f, hgx8(h200()), leaf + i / 6);
   }
   leaf += (h200s + 5) / 6;
+  for i in 0..h100s {
+    add_domain(&mut f, hgx8(h100()), leaf + i / 6);
+  }
+  leaf += (h100s + 5) / 6;
   for i in 0..a100s {
     add_domain(&mut f, hgx8(a100_80()), leaf + i / 8);
   }
@@ -35,8 +39,8 @@ fn build(racks : i32, h200s : i32, a100s : i32) -> Fleet {
   return f;
 }
 
-fn price(racks : i32, h200s : i32, a100s : i32) -> f64 {
-  return f64::from(racks) * 72.0f64 * b200().cost + f64::from(h200s) * 8.0f64 * h200().cost + f64::from(a100s) * 8.0f64 * a100_80().cost;
+fn price(racks : i32, h200s : i32, h100s : i32, a100s : i32) -> f64 {
+  return f64::from(racks) * 72.0f64 * b200().cost + f64::from(h200s) * 8.0f64 * h200().cost + f64::from(h100s) * 8.0f64 * h100().cost + f64::from(a100s) * 8.0f64 * a100_80().cost;
 }
 
 fn main() -> i32 {
@@ -50,15 +54,18 @@ fn main() -> i32 {
   let mut best_price = 1000000000.0f64;
   let mut best_racks = 0 - 1;
   let mut best_h = 0;
+  let mut best_g = 0;
   let mut best_a = 0;
   for r in 0..3 {
     for hi in 0..3 {
+     for gi in 0..3 {
       for ai in 0..3 {
         let racks = r;
         let h200s = hi * 6;
+        let h100s = gi * 6;
         let a100s = ai * 12;
-        if racks + h200s + a100s > 0 {
-          let f = build(racks, h200s, a100s);
+        if racks + h200s + h100s + a100s > 0 {
+          let f = build(racks, h200s, h100s, a100s);
           let order = demand_order(&f, &svcs);
           let p = schedule_in_order(&f, &svcs, &order);
           let sh = shortfall(&svcs, &p);
@@ -67,20 +74,24 @@ fn main() -> i32 {
           print!(" racks, ");
           print!(h200s);
           print!(" H200 nodes, ");
+          print!(h100s);
+          print!(" H100 nodes, ");
           print!(a100s);
           print!(" A100 nodes: ");
-          print_f(price(racks, h200s, a100s), 0);
+          print_f(price(racks, h200s, h100s, a100s), 0);
           print!(", unmet ");
           print_f(sh, 2);
           print!("\n");
-          if sh < 0.000000001f64 && price(racks, h200s, a100s) < best_price {
-            best_price = price(racks, h200s, a100s);
+          if sh < 0.000000001f64 && price(racks, h200s, h100s, a100s) < best_price {
+            best_price = price(racks, h200s, h100s, a100s);
             best_racks = racks;
             best_h = h200s;
+            best_g = h100s;
             best_a = a100s;
           }
         }
       }
+     }
     }
   }
   if best_racks < 0 {
@@ -92,11 +103,13 @@ fn main() -> i32 {
   print!(" racks, ");
   print!(best_h);
   print!(" H200 nodes, ");
+  print!(best_g);
+  print!(" H100 nodes, ");
   print!(best_a);
   print!(" A100 nodes, ");
   print_f(best_price, 0);
   print!(" an hour\n");
-  let f = build(best_racks, best_h, best_a);
+  let f = build(best_racks, best_h, best_g, best_a);
   let plan = schedule(&f, &svcs);
   print_report(&f, &svcs, &plan);
   print_headroom(&f, &svcs);
