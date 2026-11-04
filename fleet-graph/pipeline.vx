@@ -1,0 +1,61 @@
+// fleet-graph, pipeline: decode with pipeline parallelism, as an experiment next to cost.vx.
+//
+// A pipeline is `pp` stages, each a deployment `d` of its own (whole domains, experts spread over
+// the stage's GPUs, so the all-to-all stays inside the stage's domains). Stage i holds 1/pp of the
+// layers: 1/pp of the weights and 1/pp of every sequence's cache. Every token passes through all
+// stages one after the other, and between two stages the hidden states cross the network.
+//
+// A batch of b sequences is cut into `m` microbatches that follow each other through the stages.
+// A stage works on one microbatch at a time, and reads its weights again for each one, which is
+// the cost of pipelining a step that is bound by memory. With a stage time T (for a microbatch of
+// b / m sequences, one pass over the stage's share of the layers) and a send time S between stages,
+// a sequence gets its next token after
+//
+//   max(m, pp) * (T + S)
+//
+// seconds: with m < pp the pipeline is not full and the time is that of one microbatch crossing
+// all stages; with m >= pp the slowest stage is busy all the time and each of the m microbatches
+// waits for the others. Pipelining never shortens the time of a token. What it can do is let a
+// batch that fits keep the all-to-all on the fast links, and the throughput b / tpot is what to
+// compare.
+//
+// The stage time is `decode_step_spec` of the stage's deployment for the microbatch, divided by
+// pp: every part of it (layers' weights read, arithmetic, communication, overhead) is for all
+// layers, and a stage has 1/pp of them. The embedding and the head are taken as spread evenly.
+
+import core::convert;
+import core::num;
+import cost;
+import hw;
+import model;
+
+fn flp(x : i32) -> f64 {
+  return f64::from(x);
+}
+
+// Seconds for one microbatch of `mb` sequences through one stage.
+pub fn stage_time(m : Model, d : Deploy, pp : i32, mb : i32, s : i32, t : f64) -> f64 {
+  return decode_step_spec(m, d, mb, s, t) / flp(pp);
+}
+
+// Seconds to send the hidden states of a microbatch (mb sequences of t tokens, bf16) from one stage
+// to the next: each GPU of the stage sends its share over `cross`.
+pub fn send_time(m : Model, d : Deploy, mb : i32, t : f64) -> f64 {
+  let bytes = flp(mb) * t * flp(m.hidden) * 2.0f64 / flp(gpus(d));
+  return bytes / (d.cross * 0.7f64) + d.lat;
+}
+
+// Seconds between two tokens of a sequence for a batch of b cut into m microbatches (b / m rounded up).
+pub fn pp_tpot(m : Model, d : Deploy, pp : i32, micro : i32, b : i32, s : i32, t : f64) -> f64 {
+  let mb = (b + micro - 1) / micro;
+  let mut rounds = micro;
+  if pp > rounds {
+    rounds = pp;
+  }
+  return flp(rounds) * (stage_time(m, d, pp, mb, s, t) + send_time(m, d, mb, t));
+}
+
+// Weights and cache per GPU: 1/pp of the stage deployment's own.
+pub fn pp_fits(m : Model, d : Deploy, pp : i32, b : i32, s : i32) -> bool {
+  return (weight_bytes(m, d) + kv_bytes(m, d, b, s)) / flp(pp) <= usable() * d.sku.hbm;
+}

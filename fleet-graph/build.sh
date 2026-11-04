@@ -41,3 +41,9 @@ python3 -I check_example.py < "$scratch/report"
 "$VX_HOME/bin/vxc" -a run-jit examples/procure.vx 2> /dev/null | grep -v '^\[' > "$scratch/procure"
 grep -E '^(fleets|  [0-9]+ racks|cheapest)' "$scratch/procure"
 python3 -I check_procure.py < "$scratch/procure"
+
+# 6. Does pipeline parallelism help decode? DeepSeek-V3 on 2 and 4 nodes, experts across the
+#    network or one stage a node, and a sweep of the network. The table must be consistent.
+"$VX_HOME/bin/vxc" -a run-jit examples/pipeline.vx 2> /dev/null | grep -v '^\[' > "$scratch/pipeline"
+cat "$scratch/pipeline"
+python3 -I check_pipeline.py < "$scratch/pipeline"

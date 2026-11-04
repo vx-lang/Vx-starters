@@ -5,7 +5,7 @@ against a machine file with `vxc --machine ... -a print-ast --diagnostics-json`:
 
   hw    writes the machine file of a node (admit.py's `node` files): the SKU's own file from the
         toolchain, with the node's links added at the rates of hw.vx. Also checks that the SKU
-        file declares the HBM size hw.vx has.
+        file declares the HBM size and bandwidth hw.vx has.
   fit   the resident set of one GPU: weights, cache, and a reserve for the part of HBM that a
         deployment does not use (the `policy` line, cost.vx's `usable`; the machine files leave
         it to the admission program). The compiler must admit it exactly when `fits` said so, and
@@ -32,7 +32,7 @@ vxc = os.path.join(vx_home, "bin", "vxc")
 host = os.path.join(fleet, "host-x86-e5-2666v3.vx")
 ROW = 8192  # numbers in a row of every tensor written here
 
-FILE = {"A100-80": "a100-80.vx", "H200": "h200.vx", "B200": "b200.vx"}
+FILE = {"A100-80": "a100-80.vx", "H100": "h100-sxm.vx", "H200": "h200.vx", "B200": "b200.vx"}
 failed = []
 checked = {"fit": 0, "fit-admitted": 0, "fit-rejected": 0, "wire": 0, "skipped": 0}
 
@@ -119,6 +119,7 @@ Topology Node {{
 
 def run_hw(parts):
     name, hbm, nic, nvlink, gpus, fp8 = parts[0], int(float(parts[1])), float(parts[2]), float(parts[3]), int(parts[4]), int(parts[5])
+    bw = float(parts[6])
     HW[name] = (hbm, nic, nvlink, fp8)
     path = os.path.join(scratch, f"node-{name}-{gpus}.vx")
     with open(path, "w") as f:
@@ -129,6 +130,13 @@ def run_hw(parts):
     cap = doc["resident_sets"][0]["capacity_bytes"] if doc["resident_sets"] else None
     if cap != hbm:
         fail(f"{name}: hw.vx has {hbm} bytes of HBM, the machine file {cap}")
+    # ... and the HBM bandwidth hw.vx has, which the planner's roofline reads.
+    with open(os.path.join(fleet, FILE[name])) as f:
+        m = re.search(r"Memory HBM \{[^}]*bandwidth:\s*([0-9.]+)\s*(GB|TB)/s", f.read())
+    file_bw = float(m.group(1)) * (1e12 if m.group(2) == "TB" else 1e9) if m else None
+    if file_bw is None or abs(file_bw - bw) > 1e-6 * bw:
+        fail(f"{name}: hw.vx has {bw:g} bytes/s of HBM bandwidth, the machine file {file_bw}")
+    checked["bandwidth"] = checked.get("bandwidth", 0) + 1
     if doc["verdict"] != "admitted":
         fail(f"{name}: the node machine file does not admit a small program: {doc['diagnostics']}")
 
@@ -227,7 +235,7 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
 refused_facts()
 
 print(f"fit: {checked['fit']} cells ({checked['fit-admitted']} admitted, {checked['fit-rejected']} rejected), "
-      f"{checked['skipped']} on the edge skipped; wire: {checked['wire']} cells")
+      f"{checked['skipped']} on the edge skipped; wire: {checked['wire']} cells; hbm bandwidth: {checked['bandwidth']} SKUs")
 if failed:
     sys.exit(1)
 print("ok: the compiler agrees with the planner on memory, formats and the wire")

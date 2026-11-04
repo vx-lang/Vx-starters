@@ -26,6 +26,7 @@ import graph;
 import hw;
 import model;
 import network;
+import pipeline;
 import plan;
 import report;
 import std::vec;
@@ -1240,6 +1241,37 @@ fn hand_plan(f : &Fleet, svcs : &Vec<Service>, role : i32, dep : Deploy, batch :
   return p;
 }
 
+fn test_pipeline() -> i32 {
+  let mut failed = 0;
+  let d = deepseek_v3();
+  let link = Deploy { sku: h200(), domains: 1, gpd: 8, dp: 1, cp: 1, wb: 1.0f64, kb: 1.0f64, cross: 50000000000.0f64, lat: 0.000006f64 };
+  // One stage is the plain step; the send is the hidden states of the microbatch over the link.
+  failed += expect(stage_time(d, link, 1, 64, 8192, 1.0f64) == decode_step_spec(d, link, 64, 8192, 1.0f64), "one stage is the plain decode step");
+  failed += expect(stage_time(d, link, 4, 64, 8192, 1.0f64) == decode_step_spec(d, link, 64, 8192, 1.0f64) / 4.0f64, "a stage has 1/pp of the layers");
+  let want_send = 16.0f64 * 7168.0f64 * 2.0f64 / 8.0f64 / (50000000000.0f64 * 0.7f64) + 0.000006f64;
+  failed += expect(close(send_time(d, link, 16, 1.0f64), want_send, 0.000000001f64), "the send is the hidden states of 16 tokens, a share from each GPU");
+  failed += expect(close(send_time(d, link, 32, 2.0f64), 4.0f64 * (want_send - 0.000006f64) + 0.000006f64, 0.000000001f64), "four times the tokens, four times the bytes");
+  // max(micro, pp) rounds of a stage and a send.
+  let one = stage_time(d, link, 2, 128, 8192, 1.0f64) + send_time(d, link, 128, 1.0f64);
+  failed += expect(close(pp_tpot(d, link, 2, 1, 128, 8192, 1.0f64), 2.0f64 * one, 0.000000001f64), "one microbatch crosses both stages: pp rounds");
+  let half = stage_time(d, link, 2, 32, 8192, 1.0f64) + send_time(d, link, 32, 1.0f64);
+  failed += expect(close(pp_tpot(d, link, 2, 4, 128, 8192, 1.0f64), 4.0f64 * half, 0.000000001f64), "four microbatches of 32 behind each other: micro rounds");
+  failed += expect(close(pp_tpot(d, link, 2, 2, 128, 8192, 1.0f64), 2.0f64 * (stage_time(d, link, 2, 64, 8192, 1.0f64) + send_time(d, link, 64, 1.0f64)), 0.000000001f64), "micro = pp is the same count from either side");
+  // Odd batch: the microbatch is rounded up.
+  failed += expect(close(pp_tpot(d, link, 2, 4, 130, 8192, 1.0f64), 4.0f64 * (stage_time(d, link, 2, 33, 8192, 1.0f64) + send_time(d, link, 33, 1.0f64)), 0.000000001f64), "130 in 4 microbatches are 33 each");
+  // Fit: DeepSeek-V3 in fp8 does not fit one node of H100 (81.7 GB of experts a GPU), two stages do.
+  let h100n = Deploy { sku: h100(), domains: 1, gpd: 8, dp: 1, cp: 1, wb: 1.0f64, kb: 1.0f64, cross: 50000000000.0f64, lat: 0.000006f64 };
+  failed += expect(!pp_fits(d, h100n, 1, 1, 1024), "one H100 node cannot hold DeepSeek-V3 in fp8");
+  failed += expect(pp_fits(d, h100n, 2, 1, 1024), "two stages of H100 nodes can");
+  failed += expect(pp_fits(d, h100n, 2, 64, 8192) && !pp_fits(d, h100n, 2, 4096, 131072), "...for a small batch of short sequences, not a huge one of long ones");
+  // The cache is in the stages' share too: 1024 sequences of 32k need four stages, not two.
+  failed += expect(!pp_fits(d, h100n, 2, 1024, 32768) && pp_fits(d, h100n, 4, 1024, 32768), "four stages hold a longer context than two");
+  // The Python port prices these again.
+  let h200n = Deploy { sku: h200(), domains: 1, gpd: 8, dp: 1, cp: 1, wb: 1.0f64, kb: 1.0f64, cross: 50000000000.0f64, lat: 0.000006f64 };
+  show("pipeline", pp_tpot(d, h200n, 2, 4, 1024, 8192, 1.0f64), pp_tpot(d, h100n, 4, 2, 512, 32768, 2.0f64), send_time(d, h100n, 33, 2.0f64));
+  return failed;
+}
+
 fn test_network() -> i32 {
   let mut failed = 0;
   let mut f = new_fleet();
@@ -1378,6 +1410,7 @@ fn main() -> i32 {
   failed += test_headroom();
   failed += test_spec();
   failed += test_network();
+  failed += test_pipeline();
   if failed == 0 {
     print!("ok\n");
   }
