@@ -17,6 +17,7 @@ software around machine learning. They have two jobs:
 | [`wordcount`](wordcount) | Files, structs, loops, raw buffers | One package, one binary: how to build, run and test it |
 | [`textkit`](textkit) + [`textstat`](textstat) | Modules, traits, generics | A local library dependency; two packages with the same function name |
 | [`bigint`](bigint), [`rational`](rational), [`interval`](interval) | Operators on user types, `Vec`, exact arithmetic | A chain of libraries: `interval` needs `rational`, which needs `bigint` |
+| [`parallel-batch`](parallel-batch) | Worker tasks, an atomic counter and a channel run a batch of transfers in parallel, with the same balances as running them in order; a C program calls the same code | One source as both a program and a library that C or Rust links, with the task runtime |
 
 ### Re-checking published proofs
 

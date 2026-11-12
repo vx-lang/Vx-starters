@@ -1,0 +1,31 @@
+// Run batches of transfers with 1, 2, 4 and 8 worker tasks, and check each against the same
+// batch run in order. Prints "ok" when every check passes.
+
+import batch::batch;
+
+fn main() -> i32 {
+  let mut failed = 0;
+  // 8 accounts: most transfers in a block share an account. 1000 accounts: few do.
+  let mut sizes : Tensor<i32, [2]> = Tensor<i32, [2]>::new();
+  sizes[0] = 8;
+  sizes[1] = 1000;
+  for s in 0..2 {
+    let accounts = sizes[s];
+    let one = parallel_batch_check(2000, accounts, 50, 1, 7);
+    print!("2000 transfers in blocks of 50, {} accounts: reruns", accounts);
+    for k in 0..4 {
+      let workers = 1 << k;
+      let reruns = parallel_batch_check(2000, accounts, 50, workers, 7);
+      print!(" {}", reruns);
+      // A wrong balance gives -1. The reruns depend on the batch only, not on the workers.
+      if reruns < 0 || reruns != one {
+        failed = failed + 1;
+      }
+    }
+    print!("\n");
+  }
+  if failed == 0 {
+    println!("ok");
+  }
+  return failed;
+}

@@ -10,6 +10,12 @@ Format: the project, the toolchain version, what happened, and what we did inste
 
 ## Building
 
+- **parallel-batch, main 22a0a84f: what a library with tasks must link is not written down.** A
+  `pub fn` that starts tasks works when C calls it, but the object needs `libvx_std_core`. The
+  book does not say so. A user who wrote a Vx library for Rust noted "a library needs no Vx
+  runtime unless it uses `println!`", and started the worker threads in Rust instead.
+  `build.sh` links `-lvx_std_core -lpthread -lm`.
+
 - **ffi-zlib, main 39a12e0a: no way to link a C library.** `vxc -a run-jit` links a fixed list of
   libraries and has no flag, environment variable or `extern` attribute to add `-lz`, so calls
   to zlib fail with `undefined reference to 'crc32'`
