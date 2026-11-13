@@ -8,10 +8,15 @@ int64_t parallel_batch_check(int32_t n, int32_t accounts, int32_t block, int32_t
 
 int main(void) {
   int failed = 0;
+  int64_t first = 0;
   for (int workers = 1; workers <= 8; workers *= 2) {
     int64_t reruns = parallel_batch_check(2000, 1000, 50, workers, 7);
     printf("from C, %d workers: reruns %lld\n", workers, (long long)reruns);
-    if (reruns < 0) {
+    if (workers == 1) {
+      first = reruns;
+    }
+    // A wrong balance gives -1. The reruns depend on the batch only, not on the workers.
+    if (reruns < 0 || reruns != first) {
       failed++;
     }
   }

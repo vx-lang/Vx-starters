@@ -29,14 +29,15 @@ mkdir -p build
 "$CLANG" host/host.c build/batch.o "${LINK[@]}" -o build/host
 
 fail=0
+# A run passes when it prints "ok" and exits with status 0.
 check() {
   local name="$1"
   shift
-  local out
-  out="$("$@" || true)"
+  local out status=0
+  out="$("$@")" || status=$?
   echo "$out"
-  if ! echo "$out" | grep -qx 'ok'; then
-    echo "FAIL: $name" >&2
+  if [ "$status" -ne 0 ] || ! echo "$out" | grep -qx 'ok'; then
+    echo "FAIL: $name (exit status $status)" >&2
     fail=1
   fi
 }
@@ -44,9 +45,13 @@ check() {
 # Each task on an OS thread of its own (the default), then many tasks on a few threads.
 check "threads" build/parallel-batch
 check "shared runtime" env VX_TASK_RUNTIME=shared VX_TASK_WORKERS=2 build/parallel-batch
-# One thread, with the seed choosing the next task: the same seed gives the same order.
+# One thread, with the seed choosing the next task: the same seed gives the same order. A seed
+# cannot go with VX_TASK_WORKERS or VX_TASK_MAX_WORKERS, so unset them.
 for seed in 1 2 3; do
-  check "seed $seed" env VX_TASK_RUNTIME=shared VX_TASK_SEED="$seed" build/parallel-batch
+  check "seed $seed" env -u VX_TASK_WORKERS -u VX_TASK_MAX_WORKERS \
+    VX_TASK_RUNTIME=shared VX_TASK_SEED="$seed" build/parallel-batch
 done
+# The C program's thread is not a Vx task. Check that it can start tasks on both runtimes.
 check "from C" build/host
+check "from C, shared runtime" env VX_TASK_RUNTIME=shared VX_TASK_WORKERS=2 build/host
 exit "$fail"

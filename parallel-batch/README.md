@@ -37,15 +37,19 @@ because a `tasks` block ends only after its tasks end.
 - `build.sh` runs the program with each task on an OS thread (the default), on the shared
   runtime (`VX_TASK_RUNTIME=shared`), and with three seeds (`VX_TASK_SEED`), which fix the order
   of the tasks on one thread.
-- `host/host.c` calls `parallel_batch_check` from C. The Vx code starts its own tasks, so the C
-  program starts no threads.
+- `host/host.c` calls `parallel_batch_check` from C, on both runtimes, with the same checks. The
+  Vx code starts its own tasks, so the C program starts no threads.
+- After each block, an assert checks that each transfer of the block has a result.
+- `parallel_batch_check` asserts that each argument is in range, because C can pass any value.
+- A run passes only when it prints `ok` and exits with status 0.
 
 Each of these changes makes it fail:
 
 - checking only the `from` account for a stale transfer (wrong balances);
 - `fetch_add(2, ..)` in place of `fetch_add(1, ..)`, so that half of the transfers never run
-  (wrong balances);
-- counting a rerun when results arrive out of order (the reruns differ between worker counts).
+  (the assert on the results stops the program);
+- counting a rerun when results arrive out of order (the reruns differ between worker counts);
+- a worker that returns before it sends each result (the assert stops the program).
 
 `vxc --sanitize=thread` reports no data race.
 

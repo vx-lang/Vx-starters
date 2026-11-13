@@ -65,7 +65,9 @@ fn copy_of(v : &Vec<i64>) -> Vec<i64> {
 
 // A random batch with a fixed seed. Each account starts with 100, and an amount is 1 to 150, so
 // some transfers fail for lack of money. Fewer accounts give more transfers that share one.
+// `seed` must be in 0..2^31, so that `x * 1103515245` cannot overflow.
 fn make_batch(n : i32, accounts : i32, seed : i64) -> Vec<Transfer> {
+  assert(seed >= 0 && seed < 2147483648, "the seed must be in 0..2^31");
   let mut out = Vec<Transfer>::new();
   let mut x : i64 = seed;
   for _i in 0..n {
@@ -130,6 +132,7 @@ fn run_block(batch : &Vec<Transfer>, lo : i32, hi : i32, balances : &mut Vec<i64
   let before = copy_of(balances);
   let next = AtomicI64::new(i64::from(lo));
   let (tx, rx) = channel<Outcome>(64);
+  let mut arrived = 0;
   tasks {
     for _w in 0..workers {
       let mine = tx.clone();
@@ -144,6 +147,7 @@ fn run_block(batch : &Vec<Transfer>, lo : i32, hi : i32, balances : &mut Vec<i64
       match rx.recv() {
         Result<Outcome, RecvError>::Ok(o) => {
           first.set(o.index - lo, o);
+          arrived = arrived + 1;
         }
         Result<Outcome, RecvError>::Err(_e) => {
           open = false;
@@ -151,6 +155,8 @@ fn run_block(batch : &Vec<Transfer>, lo : i32, hi : i32, balances : &mut Vec<i64
       }
     }
   };
+  // A transfer with no result would look like one that failed. So each must have a result.
+  assert(arrived == hi - lo, "a worker stopped before it sent each result");
 
   // In order: a transfer is stale when an earlier transfer of the block changed one of its two
   // accounts. Only then did its first run see a balance that is now different.
@@ -190,9 +196,19 @@ fn run_in_parallel(batch : &Vec<Transfer>, start : &Vec<i64>, block : i32, worke
 
 // Run one batch both ways, the parallel way in blocks of `block` transfers. Returns the number of
 // transfers that ran again, or -1 when the two ways end with different balances. C and Rust can
-// call this function: `pub` exports it.
+// call this function: `pub` exports it. A negative seed, or one of 2^31 or more, is reduced into
+// 0..2^31.
 pub fn parallel_batch_check(n : i32, accounts : i32, block : i32, workers : i32, seed : i64) -> i64 {
-  let batch = make_batch(n, accounts, seed);
+  // C can pass any values, so check each one.
+  assert(n >= 0, "n must not be negative");
+  assert(accounts >= 1, "accounts must be 1 or more");
+  assert(block >= 1, "block must be 1 or more");
+  assert(workers >= 1, "workers must be 1 or more");
+  let mut s = seed % 2147483648;
+  if s < 0 {
+    s = s + 2147483648;
+  }
+  let batch = make_batch(n, accounts, s);
   let start = start_balances(accounts);
   let want = run_in_order(&batch, &start);
   let mut reruns : i64 = 0;
