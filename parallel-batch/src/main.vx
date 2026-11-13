@@ -1,0 +1,34 @@
+// Run batches of transfers with 1, 2, 4 and 8 worker tasks, and check each against the same
+// batch run in order. Prints "ok" when every check passes.
+
+import batch::batch;
+
+// Returns the number of failed checks for one batch.
+fn check(accounts : i32) -> i32 {
+  let mut failed = 0;
+  let mut first : i64 = 0;
+  print!("2000 transfers in blocks of 50, {} accounts: reruns", accounts);
+  for k in 0..4 {
+    let workers = 1 << k;
+    let reruns = parallel_batch_check(2000, accounts, 50, workers, 7);
+    print!(" {}", reruns);
+    if k == 0 {
+      first = reruns;
+    }
+    // A wrong balance gives -1. The reruns depend on the batch only, not on the workers.
+    if reruns < 0 || reruns != first {
+      failed = failed + 1;
+    }
+  }
+  print!("\n");
+  return failed;
+}
+
+fn main() -> i32 {
+  // 8 accounts: most transfers in a block share an account. 1000 accounts: few do.
+  let failed = check(8) + check(1000);
+  if failed == 0 {
+    println!("ok");
+  }
+  return failed;
+}

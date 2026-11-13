@@ -1,0 +1,222 @@
+// A batch of transfers between accounts, run two ways: in order, and by worker tasks in
+// parallel. Both ways must end with the same balances.
+//
+// The parallel way runs the batch in blocks, and is optimistic. In a block, each worker runs a
+// transfer on the balances from before the block, and records what it would change. Then one
+// loop goes through the block in order. A transfer whose accounts an earlier transfer of the
+// block changed runs again, on the current balances. The others keep their first result.
+
+import core::convert;
+import core::sync::atomic;
+import std::sync::channel;
+import std::vec;
+
+struct Transfer {
+  from : i32,
+  to : i32,
+  amount : i64,
+}
+
+impl Copy for Transfer {}
+
+// What one transfer does when it runs on some balances: whether it goes through, and the
+// balances of its two accounts after it.
+struct Outcome {
+  index : i32,
+  ok : bool,
+  from_after : i64,
+  to_after : i64,
+}
+
+impl Copy for Outcome {}
+
+// Run one transfer on `balances`, and say what it changes. It changes nothing itself, so many
+// tasks can call it on the same balances at the same time.
+fn run_one(t : Transfer, index : i32, balances : &Vec<i64>) -> Outcome {
+  let from_before = balances.get(t.from);
+  let to_before = balances.get(t.to);
+  if t.from == t.to || from_before < t.amount {
+    return Outcome {
+      index : index, ok : false, from_after : from_before, to_after : to_before
+    };
+  }
+  return Outcome {
+    index : index,
+    ok : true,
+    from_after : from_before - t.amount,
+    to_after : to_before + t.amount,
+  };
+}
+
+fn apply(o : Outcome, t : Transfer, balances : &mut Vec<i64>) -> void {
+  if o.ok {
+    balances.set(t.from, o.from_after);
+    balances.set(t.to, o.to_after);
+  }
+}
+
+fn copy_of(v : &Vec<i64>) -> Vec<i64> {
+  let mut out = Vec<i64>::new();
+  for i in 0..v.len() {
+    out.push(v.get(i));
+  }
+  return out;
+}
+
+// A random batch with a fixed seed. Each account starts with 100, and an amount is 1 to 150, so
+// some transfers fail for lack of money. Fewer accounts give more transfers that share one.
+// `seed` must be in 0..2^31, so that `x * 1103515245` cannot overflow.
+fn make_batch(n : i32, accounts : i32, seed : i64) -> Vec<Transfer> {
+  assert(seed >= 0 && seed < 2147483648, "the seed must be in 0..2^31");
+  let mut out = Vec<Transfer>::new();
+  let mut x : i64 = seed;
+  for _i in 0..n {
+    x = (x * 1103515245 + 12345) % 2147483648;
+    let from = ((x / 65536) % i64::from(accounts)) as i32;
+    x = (x * 1103515245 + 12345) % 2147483648;
+    let to = ((x / 65536) % i64::from(accounts)) as i32;
+    x = (x * 1103515245 + 12345) % 2147483648;
+    let amount = 1 + (x / 65536) % 150;
+    out.push(Transfer {
+      from : from, to : to, amount : amount
+    });
+  }
+  return out;
+}
+
+fn start_balances(accounts : i32) -> Vec<i64> {
+  let mut out = Vec<i64>::new();
+  for _i in 0..accounts {
+    out.push(100);
+  }
+  return out;
+}
+
+fn run_in_order(batch : &Vec<Transfer>, start : &Vec<i64>) -> Vec<i64> {
+  let mut balances = copy_of(start);
+  for i in 0..batch.len() {
+    let t = batch.get(i);
+    let o = run_one(t, i, &balances);
+    apply(o, t, &mut balances);
+  }
+  return balances;
+}
+
+// One worker: take the next transfer of the block that no worker took yet, run it on the
+// balances from before the block, and send the result. The counter hands out each index once.
+fn work(batch : &Vec<Transfer>, hi : i32, before : &Vec<i64>, next : &AtomicI64, tx : Sender<Outcome>) -> void {
+  loop {
+    let i = next.fetch_add(1, AtomicOrdering::Relaxed);
+    if i >= i64::from(hi) {
+      return;
+    }
+    let o = run_one(batch.get(i as i32), i as i32, before);
+    match tx.send(o) {
+      Result<void, SendError<Outcome>>::Ok() => {}
+      Result<void, SendError<Outcome>>::Err(_e) => {
+        return;
+      }
+    }
+  }
+}
+
+// Run the transfers lo..hi with `workers` tasks, and change `balances` as they do. Adds to
+// `reruns` the number of transfers that ran a second time.
+fn run_block(batch : &Vec<Transfer>, lo : i32, hi : i32, balances : &mut Vec<i64>, workers : i32, reruns : &mut i64) -> void {
+  let mut first = Vec<Outcome>::new();
+  for i in lo..hi {
+    first.push(Outcome {
+      index : i, ok : false, from_after : 0, to_after : 0
+    });
+  }
+  let before = copy_of(balances);
+  let next = AtomicI64::new(i64::from(lo));
+  let (tx, rx) = channel<Outcome>(64);
+  let mut arrived = 0;
+  tasks {
+    for _w in 0..workers {
+      let mine = tx.clone();
+      spawn {
+        work(batch, hi, &before, &next, mine);
+      };
+    }
+    // The channel closes when the last `Sender` is dropped, that is, when each worker ends.
+    drop(tx);
+    let mut open = true;
+    while open {
+      match rx.recv() {
+        Result<Outcome, RecvError>::Ok(o) => {
+          first.set(o.index - lo, o);
+          arrived = arrived + 1;
+        }
+        Result<Outcome, RecvError>::Err(_e) => {
+          open = false;
+        }
+      }
+    }
+  };
+  // A transfer with no result would look like one that failed. So each must have a result.
+  assert(arrived == hi - lo, "a worker stopped before it sent each result");
+
+  // In order: a transfer is stale when an earlier transfer of the block changed one of its two
+  // accounts. Only then did its first run see a balance that is now different.
+  let mut changed = Vec<bool>::new();
+  for _a in 0..balances.len() {
+    changed.push(false);
+  }
+  for i in lo..hi {
+    let t = batch.get(i);
+    let mut o = first.get(i - lo);
+    if changed.get(t.from) || changed.get(t.to) {
+      o = run_one(t, i, balances);
+      *reruns = *reruns + 1;
+    }
+    apply(o, t, balances);
+    if o.ok {
+      changed.set(t.from, true);
+      changed.set(t.to, true);
+    }
+  }
+}
+
+fn run_in_parallel(batch : &Vec<Transfer>, start : &Vec<i64>, block : i32, workers : i32, reruns : &mut i64) -> Vec<i64> {
+  let mut balances = copy_of(start);
+  let n = batch.len();
+  let mut lo = 0;
+  while lo < n {
+    let mut hi = lo + block;
+    if hi > n {
+      hi = n;
+    }
+    run_block(batch, lo, hi, &mut balances, workers, reruns);
+    lo = hi;
+  }
+  return balances;
+}
+
+// Run one batch both ways, the parallel way in blocks of `block` transfers. Returns the number of
+// transfers that ran again, or -1 when the two ways end with different balances. C and Rust can
+// call this function: `pub` exports it. A negative seed, or one of 2^31 or more, is reduced into
+// 0..2^31.
+pub fn parallel_batch_check(n : i32, accounts : i32, block : i32, workers : i32, seed : i64) -> i64 {
+  // C can pass any values, so check each one.
+  assert(n >= 0, "n must not be negative");
+  assert(accounts >= 1, "accounts must be 1 or more");
+  assert(block >= 1, "block must be 1 or more");
+  assert(workers >= 1, "workers must be 1 or more");
+  let mut s = seed % 2147483648;
+  if s < 0 {
+    s = s + 2147483648;
+  }
+  let batch = make_batch(n, accounts, s);
+  let start = start_balances(accounts);
+  let want = run_in_order(&batch, &start);
+  let mut reruns : i64 = 0;
+  let got = run_in_parallel(&batch, &start, block, workers, &mut reruns);
+  for a in 0..accounts {
+    if got.get(a) != want.get(a) {
+      return -1;
+    }
+  }
+  return reruns;
+}
