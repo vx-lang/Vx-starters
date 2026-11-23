@@ -86,6 +86,12 @@ first such checks ([vx-lang/Vx#1489](https://github.com/vx-lang/Vx/issues/1489))
 | [`gpu-stencil`](gpu-stencil) | Jacobi and HotSpot grid steps as `across` kernels: a launch for each step, and two steps inside a shared-memory tile | A host loop that launches kernels: the build must count launches, not functions |
 | [`gpu-inference-ops`](gpu-inference-ops) | The kernels of one decode step as `across` kernels: RoPE, SwiGLU, two matvecs (one with `lanes::sum`), a top-2 expert router, attention over a KV cache; each checked against host code and Python | Checker limits as a build input: two forms the race proof refuses (vx-lang/Vx#2220, #2221) |
 
+### GPU algorithms
+
+| Project | Shows | Build-system question |
+| --- | --- | --- |
+| [`gpu-convex-hull`](gpu-convex-hull) | The convex hull of up to 1,000,000 points: extreme points with atomic min and max, a filter that copies the points outside an octagon to a short list, `radix_sort` from `gpu-scan-sort`, and Andrew's monotone chain on the host; each step checked against host code and Python, and drawn as an SVG | One source, a machine file for each host (`m4-uma` on a Mac), the kernels run on the Apple GPU and compared with their CPU copy; a GPU library imported from another project with `--package` |
+
 ## Getting the toolchain
 
 ```sh

@@ -10,6 +10,18 @@ Format: the project, the toolchain version, what happened, and what we did inste
 
 ## Building
 
+- **gpu-convex-hull, main a488cc3d: `VX_STD_PATH` is gone, and `--package NAME=DIR` replaces
+  it.** Since vx-lang/Vx#2255, `vxc` finds imports only beside the file, in the standard library,
+  and in the directories that `--package` names. `textstat/build.sh` sets `VX_STD_PATH`, so it
+  no longer builds on `main`: `Could not resolve import 'textkit::classes'`. The new flag also
+  solves the hyphen problem of `gpu-llm-ops`: `--package scan_sort=../gpu-scan-sort` lets
+  `hull.vx` say `import scan_sort::ops;`. The name of the package and its place are now a
+  command-line argument, which is what a manifest would hold.
+- **gpu-convex-hull, main a488cc3d: building Vx on an Apple Silicon Mac fails in an x86_64
+  shell.** The editor's shell ran under Rosetta (`uname -m` gave `x86_64`). `cargo build` then
+  failed to link (`libxcrun.dylib ... need 'x86_64'`), and `package.sh` stopped with `no release
+  target defined for Darwin/x86_64`. `arch -arm64 /bin/bash -c '...'` built and packaged it.
+
 - **parallel-batch, main 22a0a84f: what a library with tasks must link is not written down.** A
   `pub fn` that starts tasks works when C calls it, but the object needs `libvx_std_core`. The
   book does not say so. A user who wrote a Vx library for Rust noted "a library needs no Vx
@@ -130,6 +142,12 @@ Format: the project, the toolchain version, what happened, and what we did inste
 
 ## Libraries
 
+- **gpu-convex-hull, main a488cc3d: one GPU library used from another worked at once.**
+  `hull.vx` imports `radix_sort` from `gpu-scan-sort` with `--package`, and nothing else was
+  needed. The limit of that library (65536 numbers, from its scan) is a fact that the caller
+  must know and handle: `convex_hull` sorts on the host above it. A package would want to state
+  such a limit where a caller can see it.
+
 - **textkit, v0.0.3: a library is found only through `VX_STD_PATH`.** `import textkit::runs`
   looks for `textkit/runs.vx` under the stdlib paths and the current directory. To use a library
   in a sibling directory, textstat's `build.sh` sets `VX_STD_PATH` to the repository root, and
@@ -233,6 +251,16 @@ fail in another.
 
 ## Running
 
+- **gpu-convex-hull, main a488cc3d: the first kernels that ran on a GPU.** On the Apple GPU,
+  with `fleet/m4-uma.vx`, every one of the 2451 launches ran there, and `VX_METAL=0` printed the
+  same output. To check "every launch ran on the GPU", `build.sh` counts two kinds of debug
+  lines of `VX_DISPATCH_VERBOSE=1` and compares them. `VX_ENABLE_CPU_FALLBACK=0` is the stronger
+  check: it stops the program when a kernel would run on the CPU. A test runner would want
+  either one as a documented setting, not as text to count.
+- **gpu-convex-hull, main a488cc3d: one warning for each tensor of unknown size.** Each
+  `Tensor<i32, [?], Memory::HBM>` parameter and transfer gives `W1029 capacity of 'HBM' not
+  verified`, 46 of them on each run of `test.vx`. `build.sh` sends them to `build/gpu.log`.
+
 - **wordcount, v0.0.3: `run-jit` and a built binary see different arguments.** Under `run-jit`
   the program's first argument is the `.vx` source path, then the user's arguments; a built
   binary sees only the user's ([vx-lang/Vx#1454](https://github.com/vx-lang/Vx/issues/1454)).
@@ -252,6 +280,16 @@ fail in another.
   `self.count = self.count + 1`.
 
 ## Language
+
+- **gpu-convex-hull, main a488cc3d: `xs[i] = rng.next()` is refused.** With `xs` a `&mut`
+  tensor parameter and `rng` a local struct with a `&mut self` method, the store gives `E4004
+  Cannot borrow 'rng' because it is already borrowed as mutable`. `let x = rng.next(); xs[i] = x;`
+  compiles. No issue was found for it, and none was filed yet.
+- **gpu-convex-hull, main a488cc3d: a kernel can call a function now, with two additions.** The
+  function must be `fn f<D : Topology>(..) on Topology::D`, and it needs `ensures writes_only()`,
+  even when it takes only `i32` numbers (E6032: "the call may write through an argument").
+  `gpu-quant-ops` had to use macros for this. With `<M : Memory>` too, one `strictly_inside`
+  runs in the kernel and on the host.
 
 - **fleet-graph, main d25deea9: every call of `Vec::get` costs about 55 ms of compile time.**
   `v.get(..)` repeated 50, 200 and 800 times takes 2.4, 11.7 and 44 s to compile
@@ -409,6 +447,12 @@ fail in another.
   Both are worked around with a `let`.
 
 ## Standard library
+
+- **gpu-convex-hull, main a488cc3d: no sort on the host, and no text output to a file.**
+  `hull.vx` has its own heap sort for the reference hull and for a list too long for
+  `radix_sort`. The SVG drawing is built byte by byte in a `Vec<u8>`, with a function that
+  writes the digits of a number, because `std::fs` writes only bytes and there is no `format!`
+  into a buffer.
 
 - **ring-allreduce, main 39a12e0a: no threads, so ranks are simulated.** `core::sync::atomic`
   says "Vx has no threads yet", and `spawn on` is device dispatch. The ranks are rows of one

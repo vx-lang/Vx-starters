@@ -1,0 +1,462 @@
+// Tests for gpu-convex-hull. Returns the number of failed checks, and prints "ok" when there
+// are none.
+//
+// - Small cases that a reader can check by hand, with the hull written out.
+// - Larger inputs from a fixed random generator. For each one, the extreme points, the points
+//   that the filter kept, the sort and the hull of the GPU are compared with host code. The
+//   program prints the extreme points and the hull, and check.py computes them again in Python.
+// - The input square_2000 is drawn to build/hull.svg.
+//
+//   ./build.sh
+
+import core::convert;
+import core::num;
+import std::fs;
+import std::string;
+import std::vec;
+import hull;
+
+// The generator of the inputs: a linear congruential generator, the same as in check.py.
+// Each call gives a number in 0..32768.
+struct Lcg {
+  state : i64,
+}
+
+impl Lcg {
+  fn next(self : &mut Lcg) -> i32 {
+    let s = (self.state * 1103515245 + 12345) % 2147483648;
+    self.state = s;
+    return (s / 65536) as i32;
+  }
+}
+
+// The largest r with r * r <= v, for v below 2^30.
+fn isqrt(v : i64) -> i64 {
+  let mut lo : i64 = 0;
+  let mut hi : i64 = 32768;
+  while hi - lo > 1 {
+    let mid = (lo + hi) / 2;
+    if mid * mid <= v {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
+const SQUARE : i32 = 0;
+const DISC : i32 = 1;
+const CIRCLE : i32 = 2;
+const LINES : i32 = 3;
+const COPIES : i32 = 4;
+const ONE_LINE : i32 = 5;
+const CORNERS : i32 = 6;
+
+// Fills xs[0..n] and ys[0..n] with the points of one kind of input. check.py has the same code.
+fn make_points(kind : i32, n : i32, seed : i64, xs : &mut Tensor<i32, [?]>, ys : &mut Tensor<i32, [?]>) -> void {
+  let mut rng = Lcg {
+    state : seed
+  };
+  for i in 0..n {
+    // `xs[i] = rng.next()` is refused (E4004), so each number goes through a `let` first.
+    if kind == SQUARE {
+      let x = rng.next();
+      let y = rng.next();
+      xs[i] = x;
+      ys[i] = y;
+    } else if kind == DISC {
+      // Points uniform in a disc of radius 16000 around the middle: draw in the square until
+      // a point falls in the disc.
+      loop {
+        let x = rng.next();
+        let y = rng.next();
+        let dx = i64::from(x - 16384);
+        let dy = i64::from(y - 16384);
+        if dx * dx + dy * dy <= 16000 * 16000 {
+          xs[i] = x;
+          ys[i] = y;
+          break;
+        }
+      }
+    } else if kind == CIRCLE {
+      // The lattice points just inside a circle of radius 16383 around the middle: for each
+      // whole number a in 1..32768, the points at a on the top, the bottom, the right and the
+      // left. n is 4 * 32767.
+      let a = i / 4 + 1;
+      let da = i64::from(a - 16384);
+      let h = isqrt(16383 * 16383 - da * da) as i32;
+      let q = i % 4;
+      if q == 0 {
+        xs[i] = a;
+        ys[i] = 16384 + h;
+      } else if q == 1 {
+        xs[i] = a;
+        ys[i] = 16384 - h;
+      } else if q == 2 {
+        xs[i] = 16384 + h;
+        ys[i] = a;
+      } else {
+        xs[i] = 16384 - h;
+        ys[i] = a;
+      }
+    } else if kind == LINES {
+      // 5 vertical lines: many points with the same x.
+      let line = rng.next() % 5;
+      let y = rng.next();
+      xs[i] = 3000 + 6000 * line;
+      ys[i] = y;
+    } else if kind == COPIES {
+      // Each point is one of 6 fixed points. (15000, 12000) is inside the triangle of the others.
+      let r = rng.next() % 6;
+      if r == 0 || r == 3 {
+        xs[i] = 100;
+        ys[i] = 100;
+      } else if r == 1 {
+        xs[i] = 30000;
+        ys[i] = 200;
+      } else if r == 2 || r == 5 {
+        xs[i] = 16000;
+        ys[i] = 31000;
+      } else {
+        xs[i] = 15000;
+        ys[i] = 12000;
+      }
+    } else if kind == ONE_LINE {
+      let x = rng.next() % 16000;
+      xs[i] = x;
+      ys[i] = 2 * x + 7;
+    } else {
+      // Only the coordinates 0 and 32767: the 4 corners, and the largest cross products.
+      let r = rng.next();
+      xs[i] = (r % 2) * 32767;
+      ys[i] = (r / 2 % 2) * 32767;
+    }
+  }
+  return;
+}
+
+// The extreme point in direction j, found again by a loop on the host: the lowest index of a
+// point with the largest score.
+fn extreme_on_host(j : i32, xs : &Tensor<i32, [?]>, ys : &Tensor<i32, [?]>, n : i32) -> i32 {
+  let mut best = 0;
+  for i in 1..n {
+    if score(j, xs[i], ys[i]) > score(j, xs[best], ys[best]) {
+      best = i;
+    }
+  }
+  return best;
+}
+
+// The rule of `filter_points`, written again for the host: strictly on the left of each edge
+// of the octagon that has a length.
+fn inside_on_host(at : &Tensor<i32, [?]>, xs : &Tensor<i32, [?]>, ys : &Tensor<i32, [?]>, i : i32) -> bool {
+  let mut edges = 0;
+  for j in 0..8 {
+    let a = at[j];
+    let b = at[(j + 1) % 8];
+    if xs[a] != xs[b] || ys[a] != ys[b] {
+      edges += 1;
+      if cross(xs[a], ys[a], xs[b], ys[b], xs[i], ys[i]) <= 0 {
+        return false;
+      }
+    }
+  }
+  return edges > 0;
+}
+
+fn fail(name : *const i8, what : *const i8) -> i32 {
+  print!("  FAIL ");
+  print!(name);
+  print!(": ");
+  print!(what);
+  print!("\n");
+  return 1;
+}
+
+// Prints "hull <name>: h x0 y0 x1 y1 ..." for the keys hull[0..h].
+fn print_hull(name : *const i8, hull : &Tensor<i32, [?]>, h : i32) -> void {
+  print!("hull ");
+  print!(name);
+  print!(": ");
+  print!(h);
+  for k in 0..h {
+    print!(" ");
+    print!(hull[k] / 32768);
+    print!(" ");
+    print!(hull[k] % 32768);
+  }
+  print!("\n");
+  return;
+}
+
+// --- The drawing -------------------------------------------------------------------------
+
+fn put(buf : &mut Vec<u8>, text : *const i8) -> void {
+  let len = unsafe { string_length(text) };
+  for i in 0..len {
+    buf.push(unsafe { text[i] } as u8);
+  }
+  return;
+}
+
+fn put_int(buf : &mut Vec<u8>, v : i32) -> void {
+  if v < 0 {
+    buf.push(45u8);
+    put_int(buf, 0 - v);
+    return;
+  }
+  if v >= 10 {
+    put_int(buf, v / 10);
+  }
+  buf.push((48 + v % 10) as u8);
+  return;
+}
+
+fn put_dot(buf : &mut Vec<u8>, x : i32, y : i32, r : *const i8, colour : *const i8) -> void {
+  put(buf, "<circle cx=\"");
+  put_int(buf, x);
+  put(buf, "\" cy=\"");
+  put_int(buf, y);
+  put(buf, "\" r=\"");
+  put(buf, r);
+  put(buf, "\" fill=\"");
+  put(buf, colour);
+  put(buf, "\"/>\n");
+  return;
+}
+
+fn put_xy(buf : &mut Vec<u8>, x : i32, y : i32) -> void {
+  put_int(buf, x);
+  put(buf, ",");
+  put_int(buf, y);
+  put(buf, " ");
+  return;
+}
+
+// Writes the steps of the method as an SVG file: the points that the filter removed in light
+// grey, the octagon as a dashed line, the points that it kept in orange, and the hull.
+fn draw(path : *const i8, xs : &Tensor<i32, [?]>, ys : &Tensor<i32, [?]>, n : i32, at : &Tensor<i32, [?]>, vals : &Tensor<i32, [?]>, kept : i32, hull : &Tensor<i32, [?]>, h : i32) -> void {
+  let mut is_kept = Tensor<i32, [?]>::new([n]);
+  for k in 0..kept {
+    is_kept[vals[k]] = 1;
+  }
+  let mut buf = Vec<u8>::new();
+  put(&mut buf, "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"-600 -600 33968 33968\" width=\"800\" height=\"800\">\n");
+  put(&mut buf, "<rect x=\"-600\" y=\"-600\" width=\"33968\" height=\"33968\" fill=\"white\"/>\n");
+  // SVG puts y = 0 at the top. This turns it over, so y grows upwards.
+  put(&mut buf, "<g transform=\"matrix(1 0 0 -1 0 32767)\">\n");
+  for i in 0..n {
+    if is_kept[i] == 0 {
+      put_dot(&mut buf, xs[i], ys[i], "90", "#c8c8c8");
+    }
+  }
+  put(&mut buf, "<polygon fill=\"none\" stroke=\"#3060c0\" stroke-width=\"70\" stroke-dasharray=\"400 250\" points=\"");
+  for j in 0..8 {
+    put_xy(&mut buf, xs[at[j]], ys[at[j]]);
+  }
+  put(&mut buf, "\"/>\n");
+  for k in 0..kept {
+    put_dot(&mut buf, xs[vals[k]], ys[vals[k]], "150", "#e07020");
+  }
+  put(&mut buf, "<polygon fill=\"none\" stroke=\"#202020\" stroke-width=\"90\" points=\"");
+  for k in 0..h {
+    put_xy(&mut buf, hull[k] / 32768, hull[k] % 32768);
+  }
+  put(&mut buf, "\"/>\n</g>\n</svg>\n");
+  let mut out = unsafe { File::open(path, OpenMode::Write()) };
+  let len = buf.len();
+  let written = unsafe {
+    out.write(buf.as_mut_ptr() as *const u8, len as u64)
+  };
+  if written != len as u64 {
+    print!("  could not write the drawing\n");
+  }
+  return;
+}
+
+// --- The checks --------------------------------------------------------------------------
+
+// Runs the GPU method on the points xs[0..n], ys[0..n] and checks each step against the host.
+// Prints the extremes and the hull. Returns the number of failed checks.
+fn run_points(name : *const i8, xs : &Tensor<i32, [?]>, ys : &Tensor<i32, [?]>, n : i32, drawn : bool) -> i32 {
+  let mut failed = 0;
+  let mut xs_h = Tensor<i32, [?]>::new([n + 1]);
+  let mut ys_h = Tensor<i32, [?]>::new([n + 1]);
+  for i in 0..n {
+    xs_h[i] = xs[i];
+    ys_h[i] = ys[i];
+  }
+  let xs_d = transfer(xs_h, Memory::HBM);
+  let ys_d = transfer(ys_h, Memory::HBM);
+  let mut at = Tensor<i32, [?]>::new([8]);
+  let mut keys = Tensor<i32, [?]>::new([n + 1]);
+  let mut vals = Tensor<i32, [?]>::new([n + 1]);
+  let mut hull = Tensor<i32, [?]>::new([n + 1]);
+  let (kept, h) = convex_hull(&xs_d, &ys_d, n, &mut at, &mut keys, &mut vals, &mut hull);
+
+  print!("input ");
+  print!(name);
+  print!(": points ");
+  print!(n);
+  print!(" kept ");
+  print!(kept);
+  print!("\n");
+  if n == 0 {
+    if h != 0 {
+      failed += fail(name, "0 points must give a hull of 0 vertices");
+    }
+    print_hull(name, &hull, h);
+    return failed;
+  }
+
+  // 1. The extreme points.
+  print!("extremes ");
+  print!(name);
+  print!(":");
+  let mut wrong_extremes = 0;
+  for j in 0..8 {
+    print!(" ");
+    print!(at[j]);
+    if at[j] != extreme_on_host(j, xs, ys, n) {
+      wrong_extremes += 1;
+    }
+  }
+  print!("\n");
+  if wrong_extremes > 0 {
+    failed += fail(name, "an extreme point is not the one that the host finds");
+  }
+
+  // 2. The filter: the kept points are exactly the points that the host keeps.
+  let mut host_kept = 0;
+  let mut seen = Tensor<i32, [?]>::new([n]);
+  for i in 0..n {
+    if !inside_on_host(&at, xs, ys, i) {
+      host_kept += 1;
+    }
+  }
+  if kept != host_kept {
+    failed += fail(name, "the GPU kept a different number of points than the host");
+  }
+  let mut wrong = 0;
+  for k in 0..kept {
+    let i = vals[k];
+    if i < 0 || i >= n {
+      wrong += 1;
+    } else {
+      if seen[i] != 0 || inside_on_host(&at, xs, ys, i) {
+        wrong += 1;
+      }
+      seen[i] = 1;
+      // 3. The sort: each key belongs to its point, and the keys go up.
+      if keys[k] != xs[i] * 32768 + ys[i] {
+        wrong += 1;
+      }
+    }
+    if k > 0 && keys[k - 1] > keys[k] {
+      wrong += 1;
+    }
+  }
+  if wrong > 0 {
+    failed += fail(name, "the sorted list of kept points is wrong");
+  }
+
+  // 4. The hull of the kept points equals the hull of all the points.
+  let mut want = Tensor<i32, [?]>::new([n + 1]);
+  let hw = hull_on_host(xs, ys, n, &mut want);
+  if h != hw {
+    failed += fail(name, "the hull has a different number of vertices than the host hull");
+  } else {
+    for k in 0..h {
+      if hull[k] != want[k] {
+        wrong += 1;
+      }
+    }
+    if wrong > 0 {
+      failed += fail(name, "a vertex of the hull differs from the host hull");
+    }
+  }
+  print_hull(name, &hull, h);
+  if drawn {
+    draw("build/hull.svg", xs, ys, n, &at, &vals, kept, &hull, h);
+  }
+  return failed;
+}
+
+fn run_input(name : *const i8, kind : i32, n : i32, seed : i64, drawn : bool) -> i32 {
+  let mut xs = Tensor<i32, [?]>::new([n + 1]);
+  let mut ys = Tensor<i32, [?]>::new([n + 1]);
+  make_points(kind, n, seed, &mut xs, &mut ys);
+  return run_points(name, &xs, &ys, n, drawn);
+}
+
+// A small case: the points pts = [x0, y0, x1, y1, ..] and the hull that a reader expects,
+// want = [x0, y0, ..] counter-clockwise from the lowest x, then the lowest y. Checks
+// `hull_on_host` against want, then runs the GPU method on it.
+fn by_hand(name : *const i8, pts : &Tensor<i32, [?]>, np : i32, want : &Tensor<i32, [?]>, nw : i32) -> i32 {
+  let mut xs = Tensor<i32, [?]>::new([np + 1]);
+  let mut ys = Tensor<i32, [?]>::new([np + 1]);
+  for i in 0..np {
+    xs[i] = pts[2 * i];
+    ys[i] = pts[2 * i + 1];
+  }
+  let mut got = Tensor<i32, [?]>::new([np + 1]);
+  let h = hull_on_host(&xs, &ys, np, &mut got);
+  let mut failed = 0;
+  if h != nw {
+    failed += fail(name, "the host hull has a different number of vertices than the one written out");
+  } else {
+    for k in 0..h {
+      if got[k] / 32768 != want[2 * k] || got[k] % 32768 != want[2 * k + 1] {
+        failed += fail(name, "a vertex of the host hull differs from the one written out");
+      }
+    }
+  }
+  return failed + run_points(name, &xs, &ys, np, false);
+}
+
+fn main() -> i32 {
+  let mut failed = 0;
+
+  // Cases to check by hand.
+  let none : Tensor<i32, [?]> = Tensor<i32, [?]>::new([1]);
+  failed += by_hand("no_points", &none, 0, &none, 0);
+  let one : Tensor<i32, [2]> = [4, 4];
+  failed += by_hand("one_point", &one, 1, &one, 1);
+  let two : Tensor<i32, [4]> = [7, 1, 3, 4];
+  let two_hull : Tensor<i32, [4]> = [3, 4, 7, 1];
+  failed += by_hand("two_points", &two, 2, &two_hull, 2);
+  let three : Tensor<i32, [6]> = [0, 10, 10, 0, 0, 0];
+  let three_hull : Tensor<i32, [6]> = [0, 0, 10, 0, 0, 10];
+  failed += by_hand("triangle", &three, 3, &three_hull, 3);
+  let square : Tensor<i32, [10]> = [5, 5, 10, 10, 0, 0, 0, 10, 10, 0];
+  let square_hull : Tensor<i32, [8]> = [0, 0, 10, 0, 10, 10, 0, 10];
+  failed += by_hand("square_and_middle", &square, 5, &square_hull, 4);
+  let on_edge : Tensor<i32, [10]> = [0, 0, 5, 0, 10, 0, 10, 10, 0, 10];
+  failed += by_hand("point_on_an_edge", &on_edge, 5, &square_hull, 4);
+  let collinear : Tensor<i32, [8]> = [3, 3, 10, 10, 0, 0, 5, 5];
+  let collinear_hull : Tensor<i32, [4]> = [0, 0, 10, 10];
+  failed += by_hand("collinear", &collinear, 4, &collinear_hull, 2);
+  let copies : Tensor<i32, [12]> = [2, 2, 8, 2, 2, 2, 5, 9, 8, 2, 2, 2];
+  let copies_hull : Tensor<i32, [6]> = [2, 2, 8, 2, 5, 9];
+  failed += by_hand("copies", &copies, 6, &copies_hull, 3);
+  let same : Tensor<i32, [6]> = [6, 6, 6, 6, 6, 6];
+  let same_hull : Tensor<i32, [2]> = [6, 6];
+  failed += by_hand("one_point_three_times", &same, 3, &same_hull, 1);
+
+  // Larger inputs.
+  failed += run_input("square_1000", SQUARE, 1000, 1, false);
+  failed += run_input("square_2000", SQUARE, 2000, 2, true);
+  failed += run_input("square_1000000", SQUARE, 1000000, 3, false);
+  failed += run_input("disc_100000", DISC, 100000, 4, false);
+  failed += run_input("circle_131068", CIRCLE, 131068, 0, false);
+  failed += run_input("lines_20000", LINES, 20000, 6, false);
+  failed += run_input("copies_5000", COPIES, 5000, 7, false);
+  failed += run_input("one_line_3000", ONE_LINE, 3000, 8, false);
+  failed += run_input("corners_4000", CORNERS, 4000, 9, false);
+
+  if failed == 0 {
+    print!("ok\n");
+  }
+  return failed;
+}
