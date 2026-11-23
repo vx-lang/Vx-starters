@@ -38,11 +38,12 @@ O(h log h) work on the h points that the filter keeps.
    short list. A point strictly inside cannot be a vertex of the hull.
 3. **Sort (GPU).** Sort the list by x, then by y, with `radix_sort` from
    [`gpu-scan-sort`](../gpu-scan-sort).
-4. **Hull (CPU).** Run Andrew's monotone chain over the sorted list.
+4. **Hull (CPU).** Run Andrew's monotone chain [2] over the sorted list.
 
-With only 4 directions (the classic Akl–Toussaint filter), the extremes of points spread evenly
-over a square are near the middles of the sides, and about half of the points survive. The
-diagonals reach into the corners: of 1,000,000 such points, 869 survive.
+Steps 1 and 2 are the Akl–Toussaint heuristic [1], with 8 directions in place of 4. With only
+4 directions, the extremes of points spread evenly over a square are near the middles of the
+sides, and about half of the points survive. The diagonals reach into the corners: of 1,000,000
+such points, 869 survive.
 
 | Function | What it does |
 | --- | --- |
@@ -111,6 +112,24 @@ The points come from a linear congruential generator, which `check.py` has too:
 state = (state * 1103515245 + 12345) mod 2^31
 next  = state / 65536          (a number in 0..32768)
 ```
+
+## References
+
+The Wikipedia article [Convex hull algorithms](https://en.wikipedia.org/wiki/Convex_hull_algorithms)
+describes both methods. Its section
+[Akl–Toussaint heuristic](https://en.wikipedia.org/wiki/Convex_hull_algorithms#Akl–Toussaint_heuristic)
+covers the filter, and it lists Andrew's algorithm with the other O(n log n) methods.
+
+1. S. G. Akl and G. T. Toussaint, "A fast convex hull algorithm", *Information Processing
+   Letters* 7(5), 1978, pages 219–222. The filter of steps 1 and 2.
+2. A. M. Andrew, "Another efficient algorithm for convex hulls in two dimensions", *Information
+   Processing Letters* 9(5), 1979, pages 216–219. The monotone chain of step 4.
+   [Wikibooks](https://en.wikibooks.org/wiki/Algorithm_Implementation/Geometry/Convex_hull/Monotone_chain)
+   has short versions of it in many languages.
+3. [Convex hull](https://en.wikipedia.org/wiki/Convex_hull) on Wikipedia: what the hull is.
+4. [Radix sort](https://en.wikipedia.org/wiki/Radix_sort) and
+   [Prefix sum](https://en.wikipedia.org/wiki/Prefix_sum) on Wikipedia: the sort of step 3, and
+   the scan that it uses (see [`gpu-scan-sort`](../gpu-scan-sort)).
 
 ## Toolchain
 
