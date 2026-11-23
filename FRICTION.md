@@ -281,10 +281,11 @@ fail in another.
 
 ## Language
 
-- **gpu-convex-hull, main a488cc3d: `xs[i] = rng.next()` is refused.** With `xs` a `&mut`
-  tensor parameter and `rng` a local struct with a `&mut self` method, the store gives `E4004
-  Cannot borrow 'rng' because it is already borrowed as mutable`. `let x = rng.next(); xs[i] = x;`
-  compiles. No issue was found for it, and none was filed yet.
+- **gpu-convex-hull, main a488cc3d: `xs[i] = rng.next()` in a loop is refused.** With `xs` a
+  `&mut` tensor parameter and `rng` a local struct with a `&mut self` method, the store gives
+  `E4004 Cannot borrow 'rng' because it is already borrowed as mutable`. It happens only inside
+  a loop, even a loop of one pass. `let x = rng.next(); xs[i] = x;` compiles, and `test.vx` uses
+  that ([vx-lang/Vx#3839](https://github.com/vx-lang/Vx/issues/3839)).
 - **gpu-convex-hull, main a488cc3d: a kernel can call a function now, with two additions.** The
   function must be `fn f<D : Topology>(..) on Topology::D`, and it needs `ensures writes_only()`,
   even when it takes only `i32` numbers (E6032: "the call may write through an argument").
