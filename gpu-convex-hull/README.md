@@ -28,10 +28,9 @@ that the filter kept, and the black line is the hull. `open build/hull.svg` show
 
 ## The method
 
-This project began as a CUDA exercise from 2011
-([gagan405/ConvexEnvelop2D](https://github.com/gagan405/ConvexEnvelop2D)). That code tests each
-pair of points against every other point, so it does O(n³) work. Here the GPU does O(n) work, and
-the CPU does O(h log h) work on the h points that the filter keeps.
+This project began as a CUDA exercise from 2011. That code tests each pair of points against
+every other point, so it does O(n³) work. Here the GPU does O(n) work, and the CPU does
+O(h log h) work on the h points that the filter keeps.
 
 1. **Extremes (GPU).** Find the point that goes furthest in each of 8 directions: down, the
    4 diagonals, and the other 3 sides. These points are on the hull and make an octagon.

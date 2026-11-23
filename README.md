@@ -86,7 +86,7 @@ first such checks ([vx-lang/Vx#1489](https://github.com/vx-lang/Vx/issues/1489))
 | [`gpu-stencil`](gpu-stencil) | Jacobi and HotSpot grid steps as `across` kernels: a launch for each step, and two steps inside a shared-memory tile | A host loop that launches kernels: the build must count launches, not functions |
 | [`gpu-inference-ops`](gpu-inference-ops) | The kernels of one decode step as `across` kernels: RoPE, SwiGLU, two matvecs (one with `lanes::sum`), a top-2 expert router, attention over a KV cache; each checked against host code and Python | Checker limits as a build input: two forms the race proof refuses (vx-lang/Vx#2220, #2221) |
 
-### GPU algorithms
+### Computational Geometry
 
 | Project | Shows | Build-system question |
 | --- | --- | --- |
