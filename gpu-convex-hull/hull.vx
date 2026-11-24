@@ -1,0 +1,335 @@
+// gpu-convex-hull: the convex hull of many 2D points, with the heavy work on the GPU.
+//
+// The hull is the smallest convex polygon that holds every point. The steps:
+//
+// 1. `extreme_scores` and `extreme_points` (GPU) find the extreme point in each of 8 directions:
+//    down, down-right, right, up-right, up, up-left, left, down-left. These 8 points are on the
+//    hull, and in this order they go around it counter-clockwise. They make an octagon.
+// 2. `filter_points` (GPU) keeps each point that is not strictly inside the octagon, and copies it
+//    to a short list. A point strictly inside the octagon cannot be a vertex of the hull.
+// 3. `radix_sort` from `gpu-scan-sort` (GPU) sorts the short list by x, then by y.
+// 4. `chain` (CPU) runs Andrew's monotone chain over the sorted list.
+//
+// Coordinates are in 0..32768, so the key x * 32768 + y of a point fits in 30 bits, and the
+// sort can use it. The 8 directions, and not only 4, reach into the corners of a square: for
+// points spread evenly over a square, the octagon covers most of it and few points survive.
+//
+// The filter may keep too many points, but it never drops a vertex of the hull. It keeps a
+// point on an edge of the octagon. When two extreme points are at the same place, the edge
+// between them has length 0, and the filter leaves it out: the other edges still make a convex
+// polygon inside the hull. When no edge is left, the filter keeps every point.
+
+import core::num;
+import core::sync::atomic;
+import scan_sort::ops;
+
+// A key is x * SIDE + y.
+const SIDE : i32 = 32768;
+
+// The most points that `radix_sort` takes: the limit of `scan_exclusive`.
+const SORT_LIMIT : i32 = 65536;
+
+// The 8 directions, counter-clockwise from straight down: (0, -1), (1, -1), (1, 0), (1, 1),
+// (0, 1), (-1, 1), (-1, 0), (-1, -1).
+fn dir_x<D : Topology>(j : i32) on Topology::D -> i32
+ensures writes_only()
+{
+  if j == 0 || j == 4 {
+    return 0;
+  }
+  if j < 4 {
+    return 1;
+  }
+  return -1;
+}
+
+fn dir_y<D : Topology>(j : i32) on Topology::D -> i32
+ensures writes_only()
+{
+  if j == 2 || j == 6 {
+    return 0;
+  }
+  if j < 2 || j == 7 {
+    return -1;
+  }
+  return 1;
+}
+
+// How far the point (x, y) goes in direction j. It fits in i32: at most 2 * 32767.
+fn score<D : Topology>(j : i32, x : i32, y : i32) on Topology::D -> i32
+ensures writes_only()
+{
+  return dir_x(j) * x + dir_y(j) * y;
+}
+
+// Twice the signed area of the triangle a, b, p. It is positive when p is on the left of the
+// line from a to b. Each difference is below 2^15, so the result is below 2 * 32767^2, which
+// still fits in i32. It is i64 so that a wider range of coordinates cannot overflow it.
+fn cross<D : Topology>(ax : i32, ay : i32, bx : i32, by : i32, px : i32, py : i32) on Topology::D -> i64
+ensures writes_only()
+{
+  return ((bx - ax) as i64) * ((py - ay) as i64) - ((by - ay) as i64) * ((px - ax) as i64);
+}
+
+// best[j] = the largest score of a point in direction j. Set each best[j] to -1000000 before.
+pub fn extreme_scores(best : &Tensor<i32, [?], Memory::HBM>, xs : &Tensor<i32, [?], Memory::HBM>, ys : &Tensor<i32, [?], Memory::HBM>, n : i32) -> void {
+  spawn on(Topology::Device) {
+    for t in 0..(n + 255) / 256 across blocks {
+      for l in 0..256 across lanes {
+        let i = t * 256 + l;
+        if i < n {
+          for j in 0..8 {
+            let _old = atomic_fetch_max_i32(best, j, score(j, xs[i], ys[i]), AtomicOrdering::Relaxed);
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+// at[j] = the lowest index of a point with the score best[j]. Set each at[j] to n before. The
+// lowest index, and not the first lane to get there, makes the result the same on every run.
+pub fn extreme_points(at : &Tensor<i32, [?], Memory::HBM>, best : &Tensor<i32, [?], Memory::HBM>, xs : &Tensor<i32, [?], Memory::HBM>, ys : &Tensor<i32, [?], Memory::HBM>, n : i32) -> void {
+  spawn on(Topology::Device) {
+    for t in 0..(n + 255) / 256 across blocks {
+      for l in 0..256 across lanes {
+        let i = t * 256 + l;
+        if i < n {
+          for j in 0..8 {
+            if score(j, xs[i], ys[i]) == best[j] {
+              let _old = atomic_fetch_min_i32(at, j, i, AtomicOrdering::Relaxed);
+            }
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+// Whether point i is strictly inside the octagon of the points at[0..8]: strictly on the left
+// of each of its edges, leaving out the edges of length 0. It runs on the GPU and on the host.
+fn strictly_inside<M : Memory, D : Topology>(at : &Tensor<i32, [?], Memory::M>, xs : &Tensor<i32, [?], Memory::M>, ys : &Tensor<i32, [?], Memory::M>, i : i32) on Topology::D -> bool
+ensures writes_only()
+{
+  let mut inside = true;
+  let mut edges = 0;
+  for j in 0..8 {
+    let a = at[j];
+    let b = at[(j + 1) % 8];
+    if xs[a] != xs[b] || ys[a] != ys[b] {
+      edges = edges + 1;
+      if cross(xs[a], ys[a], xs[b], ys[b], xs[i], ys[i]) <= 0 {
+        inside = false;
+      }
+    }
+  }
+  return inside && edges > 0;
+}
+
+// Copies each point that is not strictly inside the octagon to the list: its key to keys, its
+// index to vals. count[0] is the length of the list; set it to 0 before. A lane takes its slot
+// with an atomic add, so the order of the list changes from run to run. The slot is known only
+// from the data, so the writes are atomic stores: the race proof refuses a plain write there.
+pub fn filter_points(keys : &Tensor<i32, [?], Memory::HBM>, vals : &Tensor<i32, [?], Memory::HBM>, count : &Tensor<i32, [?], Memory::HBM>, at : &Tensor<i32, [?], Memory::HBM>, xs : &Tensor<i32, [?], Memory::HBM>, ys : &Tensor<i32, [?], Memory::HBM>, n : i32) -> void {
+  spawn on(Topology::Device) {
+    for t in 0..(n + 255) / 256 across blocks {
+      for l in 0..256 across lanes {
+        let i = t * 256 + l;
+        if i < n {
+          if !strictly_inside(at, xs, ys, i) {
+            let slot = atomic_fetch_add_i32(count, 0, 1, AtomicOrdering::Relaxed);
+            atomic_store_i32(keys, slot, xs[i] * SIDE + ys[i], AtomicOrdering::Relaxed);
+            atomic_store_i32(vals, slot, i, AtomicOrdering::Relaxed);
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+// The x and the y of a key.
+fn key_x(k : i32) -> i32 {
+  return k / SIDE;
+}
+
+fn key_y(k : i32) -> i32 {
+  return k % SIDE;
+}
+
+// Sorts a[0..n] on the host, smallest first: a heap sort, so it needs no extra memory.
+fn sift_down(a : &mut Tensor<i64, [?]>, start : i32, end : i32) -> void {
+  let mut root = start;
+  loop {
+    let mut child = 2 * root + 1;
+    if child >= end {
+      break;
+    }
+    if child + 1 < end && a[child + 1] > a[child] {
+      child = child + 1;
+    }
+    if a[root] >= a[child] {
+      break;
+    }
+    let tmp = a[root];
+    a[root] = a[child];
+    a[child] = tmp;
+    root = child;
+  }
+  return;
+}
+
+pub fn sort_on_host(a : &mut Tensor<i64, [?]>, n : i32) -> void {
+  let mut start = n / 2;
+  while start > 0 {
+    start = start - 1;
+    sift_down(a, start, n);
+  }
+  let mut end = n;
+  while end > 1 {
+    end = end - 1;
+    let tmp = a[0];
+    a[0] = a[end];
+    a[end] = tmp;
+    sift_down(a, 0, end);
+  }
+  return;
+}
+
+// Andrew's monotone chain over keys[0..m], which must be sorted. Writes the keys of the hull
+// vertices to out, counter-clockwise from the point with the lowest x, then the lowest y, and
+// returns how many there are. out needs room for m + 1 keys.
+//
+// A copy of a point, and a point on the line between its two neighbours, is not a vertex.
+// `cross(..) <= 0` drops both. All points on one line give the 2 ends of the line.
+pub fn chain(keys : &Tensor<i32, [?]>, m : i32, out : &mut Tensor<i32, [?]>) -> i32 {
+  // The distinct keys, in order.
+  let mut pts = Tensor<i32, [?]>::new([m + 1]);
+  let mut d = 0;
+  for k in 0..m {
+    if k == 0 || keys[k] != keys[k - 1] {
+      pts[d] = keys[k];
+      d = d + 1;
+    }
+  }
+  if d <= 1 {
+    for k in 0..d {
+      out[k] = pts[k];
+    }
+    return d;
+  }
+  let mut h = 0;
+  // The lower hull, from left to right.
+  for k in 0..d {
+    let p = pts[k];
+    while h >= 2 && cross(key_x(out[h - 2]), key_y(out[h - 2]), key_x(out[h - 1]), key_y(out[h - 1]), key_x(p), key_y(p)) <= 0 {
+      h = h - 1;
+    }
+    out[h] = p;
+    h = h + 1;
+  }
+  // The upper hull, from right to left. It must not pop the vertices of the lower hull.
+  let lower = h + 1;
+  let mut k = d - 2;
+  while k >= 0 {
+    let p = pts[k];
+    while h >= lower && cross(key_x(out[h - 2]), key_y(out[h - 2]), key_x(out[h - 1]), key_y(out[h - 1]), key_x(p), key_y(p)) <= 0 {
+      h = h - 1;
+    }
+    out[h] = p;
+    h = h + 1;
+    k = k - 1;
+  }
+  // The last vertex is the first one again.
+  return h - 1;
+}
+
+// The hull of all n points, on the host only: the reference for the GPU. out needs room for
+// n + 1 keys.
+pub fn hull_on_host(xs : &Tensor<i32, [?]>, ys : &Tensor<i32, [?]>, n : i32, out : &mut Tensor<i32, [?]>) -> i32 {
+  let mut sorted = Tensor<i64, [?]>::new([n + 1]);
+  for i in 0..n {
+    sorted[i] = (xs[i] * SIDE + ys[i]) as i64;
+  }
+  sort_on_host(&mut sorted, n);
+  let mut keys = Tensor<i32, [?]>::new([n + 1]);
+  for i in 0..n {
+    keys[i] = sorted[i] as i32;
+  }
+  return chain(&keys, n, out);
+}
+
+// The whole method. xs and ys hold n points, in GPU memory. Writes, on the host:
+// - at[0..8]: the index of the extreme point in each of the 8 directions,
+// - keys[0..kept] and vals[0..kept]: the keys of the points that the filter kept, sorted, and the
+//   index of each one,
+// - hull[0..h]: the keys of the hull vertices, as `chain` gives them.
+// Returns (kept, h). keys and vals need room for n keys, hull for n + 1.
+//
+// When more than 65536 points survive the filter, `radix_sort` cannot take them. The host sorts
+// them, and the function prints a line that says so.
+pub fn convex_hull(xs : &Tensor<i32, [?], Memory::HBM>, ys : &Tensor<i32, [?], Memory::HBM>, n : i32, at : &mut Tensor<i32, [?]>, keys : &mut Tensor<i32, [?]>, vals : &mut Tensor<i32, [?]>, hull : &mut Tensor<i32, [?]>) -> (i32, i32) {
+  // A launch of 0 blocks is not useful, and 0 points have no hull.
+  if n == 0 {
+    return (0, 0);
+  }
+  let mut best_h = Tensor<i32, [?]>::new([8]);
+  let mut at_h = Tensor<i32, [?]>::new([8]);
+  for j in 0..8 {
+    best_h[j] = -1000000;
+    at_h[j] = n;
+  }
+  let best_d = transfer(best_h, Memory::HBM);
+  let at_d = transfer(at_h, Memory::HBM);
+  extreme_scores(&best_d, xs, ys, n);
+  extreme_points(&at_d, &best_d, xs, ys, n);
+
+  let count_d = transfer(Tensor<i32, [?]>::new([1]), Memory::HBM);
+  let mut keys_d = transfer(Tensor<i32, [?]>::new([n]), Memory::HBM);
+  let mut vals_d = transfer(Tensor<i32, [?]>::new([n]), Memory::HBM);
+  filter_points(&keys_d, &vals_d, &count_d, &at_d, xs, ys, n);
+  let count_h = transfer(count_d, Memory::CPU_DRAM);
+  let kept = count_h[0];
+
+  if kept <= SORT_LIMIT {
+    let mut tk = transfer(Tensor<i32, [?]>::new([kept]), Memory::HBM);
+    let mut tv = transfer(Tensor<i32, [?]>::new([kept]), Memory::HBM);
+    let mut zeros = transfer(Tensor<i32, [?]>::new([kept]), Memory::HBM);
+    let mut before = transfer(Tensor<i32, [?]>::new([kept]), Memory::HBM);
+    let mut sums = transfer(Tensor<i32, [?]>::new([256]), Memory::HBM);
+    let mut offs = transfer(Tensor<i32, [?]>::new([256]), Memory::HBM);
+    let mut top = transfer(Tensor<i32, [?]>::new([1]), Memory::HBM);
+    radix_sort(&mut keys_d, &mut vals_d, &mut tk, &mut tv, &mut zeros, &mut before, &mut sums, &mut offs, &mut top, kept, 30);
+    let kh = transfer(keys_d, Memory::CPU_DRAM);
+    let vh = transfer(vals_d, Memory::CPU_DRAM);
+    for k in 0..kept {
+      keys[k] = kh[k];
+      vals[k] = vh[k];
+    }
+  } else {
+    println!("sort: the filter kept {} points, more than the {} that radix_sort takes, so the host sorts them", kept, SORT_LIMIT);
+    let kh = transfer(keys_d, Memory::CPU_DRAM);
+    for k in 0..kept {
+      keys[k] = kh[k];
+    }
+    let vh = transfer(vals_d, Memory::CPU_DRAM);
+    // The host sort moves one number for each point, so it sorts key * 2^31 + index.
+    let mut both = Tensor<i64, [?]>::new([kept]);
+    for k in 0..kept {
+      both[k] = (keys[k] as i64) * 2147483648 + (vh[k] as i64);
+    }
+    sort_on_host(&mut both, kept);
+    for k in 0..kept {
+      keys[k] = (both[k] / 2147483648) as i32;
+      vals[k] = (both[k] % 2147483648) as i32;
+    }
+  }
+  let ah = transfer(at_d, Memory::CPU_DRAM);
+  for j in 0..8 {
+    at[j] = ah[j];
+  }
+  let h = chain(keys, kept, hull);
+  return (kept, h);
+}
